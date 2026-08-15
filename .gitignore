@@ -17,6 +17,7 @@ wheels/
 .osgrep
 # Virtual environments
 .venv
+/agent-memory-eval
 
 # Node
 node_modules/
