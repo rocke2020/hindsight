@@ -36,6 +36,19 @@ class _NonSqlStore:
         self.capability_calls.append(bank_id)
         return False
 
+    # This fake is duck-typed rather than a MemoriesExtension subclass, so it answers only what the
+    # paths under test reach. Bank DELETION also counts what it removed through the store now (the
+    # SQL tables are empty for such a bank, so COUNT(*) reported 0 while dropping everything), and
+    # the fixture's teardown deletes the bank — hence these three.
+    def owns_document_store_for(self, bank_id: str) -> bool:
+        return False
+
+    async def count_documents(self, *, bank_id: str) -> int:
+        return 0
+
+    async def list_entities(self, *, conn, fq_table, bank_id: str, search=None, limit=100, offset=0) -> dict:
+        return {"items": [], "total": 0, "limit": limit, "offset": offset}
+
     async def count_memories(self, *, conn, fq_table, bank_id: str) -> dict:
         self.count_calls.append(bank_id)
         return {"world": 7}
@@ -57,9 +70,9 @@ async def test_list_banks_counts_via_store_for_non_sql_bank(memory, monkeypatch)
         await memory.get_bank_profile(bank_id, request_context=request_context)
 
         # Must not raise NameError; must reach the store's non-SQL count path.
-        banks = await memory.list_banks(request_context=request_context)
+        page = await memory.list_banks(search_query=bank_id, request_context=request_context)
 
-        entry = next((b for b in banks if b["bank_id"] == bank_id), None)
+        entry = next((b for b in page["banks"] if b["bank_id"] == bank_id), None)
         assert entry is not None, f"bank {bank_id!r} not present in list_banks output"
 
         # The capability + count were consulted with the row's real bank id.

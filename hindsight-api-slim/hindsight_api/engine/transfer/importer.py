@@ -566,6 +566,10 @@ async def import_bank(
         # exists, so it takes the SELECT branch and skips index creation —
         # leaving the restored bank falling back to the global index +
         # post-filter (slower, under-returning recall). See #2645.
+        #
+        # A no-op when a size threshold is set: entitlement is by size then, and
+        # the restored rows land through the normal import path, where the
+        # maintenance operation picks them up (#3485).
         internal_id = await conn.fetchval(f"SELECT internal_id FROM {fq_table('banks')} WHERE bank_id = $1", bank_id)
         if internal_id is not None:
             await bank_utils.create_bank_vector_indexes(conn, bank_id, str(internal_id), ops=ops)
@@ -670,12 +674,23 @@ async def _resolve_target_id(backend: Any, bank_id: str, document_id: str, on_co
     ``new-id``, the original id under ``replace`` (the insert path cascades the
     old data away), or ``None`` under ``skip`` when the document already exists.
     """
-    async with acquire_with_retry(backend) as conn:
-        exists = await conn.fetchval(
-            f"SELECT 1 FROM {fq_table('documents')} WHERE id = $1 AND bank_id = $2",
-            document_id,
-            bank_id,
-        )
+    # Ask whichever store actually holds the document. A bank whose document store is external
+    # leaves the SQL `documents` table empty, so the query below finds nothing and EVERY conflict
+    # mode goes inert: `skip` re-imports the document it was asked to leave alone, `new-id` keeps
+    # the original id instead of duplicating under a fresh one, and `replace` degenerates to a
+    # plain insert. Silent in all three cases — the import reports success either way.
+    from ..memories import get_memories
+
+    _store = get_memories()
+    if _store.owns_document_store_for(bank_id):
+        exists = await _store.get_document_record(bank_id=bank_id, document_id=document_id) is not None
+    else:
+        async with acquire_with_retry(backend) as conn:
+            exists = await conn.fetchval(
+                f"SELECT 1 FROM {fq_table('documents')} WHERE id = $1 AND bank_id = $2",
+                document_id,
+                bank_id,
+            )
     if not exists:
         return document_id
     if on_conflict == "skip":
@@ -731,6 +746,24 @@ async def _import_one_document(
         ChunkMetadata(chunk_text=chunk.chunk_text, fact_count=0, content_index=0, chunk_index=chunk.chunk_index)
         for chunk in document.chunks
     ]
+
+    # Put the document itself where the store expects it. Retain does this via
+    # `_store_document_bodies`; the importer never did, so for a bank whose document store is
+    # external the import wrote the SQL metadata row and the chunk rows and NOTHING to the store —
+    # the restored bank listed no documents at all, because that listing reads the store. A no-op
+    # for Postgres, which keeps the body in the `documents` row written below.
+    #
+    # Before the connection is taken, like the retain path: this is the slow object-store write and
+    # it has no business inside the write transaction.
+    await orchestrator._store_document_bodies(
+        bank_id=bank_id,
+        document_id=target_id,
+        combined_content=document.original_text or "",
+        chunk_texts=[c.chunk_text for c in sorted(document.chunks, key=lambda c: c.chunk_index)],
+        merged_tags=list(document.tags or []),
+        config=config,
+        retain_params=document.retain_params,
+    )
 
     # Phase 1 (entity resolution + semantic ANN) on its own connection, outside
     # the write transaction — mirrors the retain pipeline.
@@ -865,6 +898,11 @@ async def _restore_fact_lifecycle(
     when present (mirroring the document-row handling); ``consolidated_at`` /
     ``consolidation_failed_at`` are set verbatim — a source-``NULL`` (unconsolidated)
     fact stays eligible, which is correct.
+
+    No ``updated_at`` stamp (see :data:`~..memories.base.META_UPDATED_AT`): this fixup
+    runs in the same transaction as the insert that created the row, so the column
+    already carries this transaction's timestamp. The same holds for the observation
+    fixups below.
     """
     rows: list[tuple[uuid.UUID, datetime | None, datetime | None, datetime | None]] = []
     for original_index, fact in enumerate(facts):

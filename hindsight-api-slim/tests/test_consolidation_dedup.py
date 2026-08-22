@@ -10,6 +10,7 @@ import types
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from unittest.mock import DEFAULT, AsyncMock, patch
 
 import pytest
@@ -23,9 +24,18 @@ from hindsight_api.engine.consolidation.consolidator import (
     _DedupDecision,
     _duplicate_create_target,
     _norm_obs_text,
+    _TemporalBounds,
 )
 from hindsight_api.engine.memories import RecallArms
 from hindsight_api.engine.search.types import RetrievalResult
+
+#: Dates the skipped CREATE would have been stamped with; the fold must carry them onto the twin.
+_SOURCE_BOUNDS = _TemporalBounds(
+    event_date=datetime(2024, 1, 2, tzinfo=timezone.utc),
+    occurred_start=datetime(2023, 1, 2, tzinfo=timezone.utc),
+    occurred_end=datetime(2024, 1, 3, tzinfo=timezone.utc),
+    mentioned_at=datetime(2024, 1, 4, tzinfo=timezone.utc),
+)
 
 
 @dataclass
@@ -188,6 +198,7 @@ def _ctx(threshold: float = 0.97):
         # config, so these must be present (production defaults: native/english).
         config=types.SimpleNamespace(
             consolidation_dedup_threshold=threshold,
+            llm_temperature_consolidation=0.0,
             text_search_extension="native",
             text_search_extension_native_language="english",
         ),
@@ -195,6 +206,7 @@ def _ctx(threshold: float = 0.97):
         create_text="YouTube content in Uzbek is very rich.",
         create_source_ids=[uuid.uuid4()],
         tags=["t1"],
+        source_bounds=_SOURCE_BOUNDS,
     )
     return kwargs, conn, llm
 
@@ -229,6 +241,7 @@ async def test_dedup_llm_keep_does_not_merge() -> None:
         result = await _dedup_reconcile_create(**kwargs)
     assert result is None
     llm.call.assert_awaited_once()
+    assert llm.call.await_args.kwargs["temperature"] == 0.0
     conn.fetchval.assert_not_called()  # kept distinct → no merge
 
 
@@ -321,6 +334,9 @@ def test_dedup_prompt_contract_requests_json_not_key_value() -> None:
     assert "{existing}" not in prompt
 
 
+# Seeds source liveness through a mocked `conn`, which a store-owned bank never reads: the
+# preflight asks the store, finds nothing, and short-circuits before the behaviour under test.
+@pytest.mark.memory_backend_incompatible
 async def test_dedup_llm_merge_folds_into_twin() -> None:
     kwargs, conn, llm = _ctx()
     kwargs["create_source_ids"] = [uuid.uuid4(), uuid.uuid4()]
@@ -335,8 +351,20 @@ async def test_dedup_llm_merge_folds_into_twin() -> None:
     assert args[1] == "Uzbek content on YouTube is very rich."  # merged text persisted
     assert args[2] == kwargs["create_source_ids"]  # new (live) source facts folded in
     assert args[3] == uuid.UUID(_TWIN_ID)  # onto the twin row
+    # ...along with the dates the skipped CREATE carried, so the twin's interval widens (#3477).
+    # What the SQL *does* with them is covered against a real database in
+    # test_consolidation_temporal_merge.py — a mocked connection cannot check that.
+    assert args[5:] == (
+        _SOURCE_BOUNDS.event_date,
+        _SOURCE_BOUNDS.occurred_start,
+        _SOURCE_BOUNDS.occurred_end,
+        _SOURCE_BOUNDS.mentioned_at,
+    )
 
 
+# Seeds source liveness through a mocked `conn`, which a store-owned bank never reads: the
+# preflight asks the store, finds nothing, and short-circuits before the behaviour under test.
+@pytest.mark.memory_backend_incompatible
 async def test_dedup_llm_merge_sanitizes_text_before_write() -> None:
     # The merge path writes the LLM's synthesized text straight to the fold UPDATE, so it needs
     # the same character-safety scrub _CreateAction/_UpdateAction already apply via field_validator.
@@ -389,6 +417,7 @@ def _update_ctx(threshold: float = 0.97):
         # config, so these must be present (production defaults: native/english).
         config=types.SimpleNamespace(
             consolidation_dedup_threshold=threshold,
+            llm_temperature_consolidation=0.0,
             text_search_extension="native",
             text_search_extension_native_language="english",
         ),
@@ -401,6 +430,7 @@ def _update_ctx(threshold: float = 0.97):
     return kwargs, conn, llm
 
 
+@pytest.mark.memory_backend_incompatible
 async def test_dedup_update_merge_folds_into_twin_and_deletes_updated() -> None:
     kwargs, conn, llm = _update_ctx()
     llm.call.return_value = _DedupDecision(action="merge", text="Uzbek YouTube content is very rich and growing.")
@@ -498,6 +528,9 @@ def test_dedup_active_none_config() -> None:
 # source deleted) during the connection-free window can't drop a CREATE or fold a dead id.
 
 
+# Seeds source liveness through a mocked `conn`, which a store-owned bank never reads: the
+# preflight asks the store, finds nothing, and short-circuits before the behaviour under test.
+@pytest.mark.memory_backend_incompatible
 async def test_dedup_create_twin_vanished_returns_none_so_caller_creates() -> None:
     # If the twin is deleted during the (connection-free) LLM window, the fold UPDATE matches
     # no row (fetchval -> None); the helper must return None so the caller still CREATEs.
@@ -513,6 +546,9 @@ async def test_dedup_create_twin_vanished_returns_none_so_caller_creates() -> No
     conn.fetchval.assert_awaited_once()
 
 
+# Seeds source liveness through a mocked `conn`, which a store-owned bank never reads: the
+# preflight asks the store, finds nothing, and short-circuits before the behaviour under test.
+@pytest.mark.memory_backend_incompatible
 async def test_dedup_create_fold_uses_only_live_new_sources() -> None:
     kwargs, conn, llm = _ctx()
     live_source_id = uuid.uuid4()
@@ -544,6 +580,9 @@ async def test_dedup_create_all_new_sources_deleted_returns_none() -> None:
     conn.fetchval.assert_not_called()
 
 
+# Seeds source liveness through a mocked `conn`, which a store-owned bank never reads: the
+# preflight asks the store, finds nothing, and short-circuits before the behaviour under test.
+@pytest.mark.memory_backend_incompatible
 async def test_dedup_update_twin_vanished_does_not_delete_updated() -> None:
     # If the fold matches no row (twin vanished mid-window), the updated row must NOT be deleted.
     kwargs, conn, llm = _update_ctx()
@@ -555,6 +594,9 @@ async def test_dedup_update_twin_vanished_does_not_delete_updated() -> None:
     conn.execute.assert_not_called()  # but no delete, since the fold touched nothing
 
 
+# Seeds source liveness through a mocked `conn`, which a store-owned bank never reads: the
+# preflight asks the store, finds nothing, and short-circuits before the behaviour under test.
+@pytest.mark.memory_backend_incompatible
 async def test_dedup_update_fold_uses_only_live_updated_sources() -> None:
     kwargs, conn, llm = _update_ctx()
     live_source_id = uuid.uuid4()

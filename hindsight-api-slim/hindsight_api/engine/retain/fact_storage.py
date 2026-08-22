@@ -12,6 +12,7 @@ from typing import Any
 
 from ...config import _get_raw_config
 from ..memory_engine import fq_table
+from ..metadata_utils import drop_null_values
 from .bank_utils import DEFAULT_DISPOSITION, create_bank_vector_indexes
 from .fact_extraction import _sanitize_text
 from .types import ProcessedFact
@@ -109,19 +110,24 @@ async def index_facts(
     facts: list[ProcessedFact],
     document_id: str | None = None,
     unit_entity_ids: dict[str, list[str]] | None = None,
+    txn=None,
 ) -> None:
     """Complete a deferred `insert_facts_batch`, now that the edges are known.
 
     ``unit_entity_ids`` is the unit→entity posting and each fact's causal
     relations are its edges; both travel with the memory for a store that owns
     them. A no-op for the Postgres store, which wrote all of it already.
+
+    ``txn`` rides a cross-store write-group handle so this single, entity-bearing
+    write commits (and becomes visible) atomically with the rest of the group —
+    the store-owned retain path writes facts ONCE here rather than write-then-reattach.
     """
     from ..memories import get_memories
 
-    await get_memories().index_facts(bank_id, unit_ids, facts, document_id, unit_entity_ids)
+    await get_memories().index_facts(bank_id, unit_ids, facts, document_id, unit_entity_ids, txn=txn)
 
 
-async def ensure_bank_exists(conn, bank_id: str, ops=None) -> None:
+async def ensure_bank_exists(conn, bank_id: str, *, ops) -> None:
     """
     Ensure bank exists in the database.
 
@@ -130,9 +136,14 @@ async def ensure_bank_exists(conn, bank_id: str, ops=None) -> None:
     Args:
         conn: Database connection
         bank_id: Bank identifier
+        ops: Backend ``DataAccessOps``, needed for the per-bank vector index DDL
+            a fresh bank gets while the size threshold is off. Required rather
+            than defaulting to None, because it is dereferenced only in that
+            branch — a caller that omitted it worked until the threshold was off.
     """
-    # Generate internal_id here so we control the value and can use it
-    # immediately for HNSW index creation without a RETURNING round-trip.
+    # internal_id is generated here rather than defaulted server-side so the
+    # value is known without a RETURNING round-trip: the index names derive
+    # from it.
     internal_id = uuid.uuid4()
     inserted = await conn.fetchval(
         f"""
@@ -148,7 +159,9 @@ async def ensure_bank_exists(conn, bank_id: str, ops=None) -> None:
         internal_id,
     )
     if inserted:
-        # Fresh insert — create per-bank vector indexes
+        # Fresh insert — create per-bank vector indexes. A no-op unless the size
+        # threshold is off, in which case the maintenance operation owns them;
+        # see create_bank_vector_indexes.
         await create_bank_vector_indexes(conn, bank_id, str(internal_id), ops=ops)
 
 
@@ -423,19 +436,48 @@ async def update_memory_units_metadata_and_tags(
     current document tags and metadata so its optimized result matches a full
     replace.
 
+    ``metadata`` arrives as the raw retain_params bag (the document row keeps
+    the caller's input verbatim), so null-valued keys are dropped here — the
+    same normalization ``RetainContent`` applies to freshly extracted facts
+    (issue #3209). Without it a re-retain would leave surviving units carrying
+    nulls while the units around them do not.
+
     Returns:
         Number of memory units updated.
     """
     from ..memories import MemoryPatch, get_memories
+    from ..memories.base import META_METADATA_JSON
 
     store = get_memories()
     if not store.writes_memory_rows_in_sql_for(bank_id):
         # A store that keeps memories outside SQL: page the document's memories and patch each
-        # one's tags through the store — the UPDATE below is a no-op on its empty memory_units.
+        # one's tags and metadata through the store — the UPDATE below is a no-op on its empty
+        # memory_units.
         page = await store.scan_memories(
             conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id, limit=1_000_000
         )
-        patches = [MemoryPatch(unit_id=m.unit_id, tags=list(tags or [])) for m in page.memories]
+        # Metadata too, not just tags: the SQL branch below sets both, and a survivor left carrying
+        # the PREVIOUS retain's metadata is exactly what this function exists to prevent — measured
+        # on an append, older units still read {"source": "email"} after a retain carrying
+        # {"source": "crm"}.
+        #
+        # Written under META_METADATA_JSON as one JSON value, which is where the bag contract puts a
+        # memory's user metadata and what every read reconstructs it from. A flat {"source": "crm"}
+        # would merge a stray top-level key into the record's own bag instead: applied, reported as
+        # applied, and invisible to every reader. The bag's other keys are internal (context,
+        # chunk_id, consolidation_failed_at, …) and a patch that carried user keys loose among them
+        # could not be told apart from one setting an internal field.
+        #
+        # Set unconditionally, mirroring `SET metadata = $4`: a document whose metadata was cleared
+        # must clear on its survivors too, which an absent key would not do.
+        patches = [
+            MemoryPatch(
+                unit_id=m.unit_id,
+                tags=list(tags or []),
+                metadata={META_METADATA_JSON: json.dumps(drop_null_values(metadata or {}))},
+            )
+            for m in page.memories
+        ]
         if patches:
             await store.update_memories(bank_id, patches)
         return len(patches)
@@ -449,7 +491,7 @@ async def update_memory_units_metadata_and_tags(
         bank_id,
         document_id,
         tags or [],
-        json.dumps(metadata or {}),
+        json.dumps(drop_null_values(metadata)),
     )
     # result is a status string like "UPDATE 5"
     try:

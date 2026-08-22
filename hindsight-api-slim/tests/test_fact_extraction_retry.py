@@ -9,6 +9,7 @@ BaseException'), which happened when last_error was only set in the
 BadRequestError handler and not for non-dict JSON responses.
 """
 
+import dataclasses
 import json
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -134,22 +135,23 @@ async def test_output_too_long_drops_unsplittable_subchunk_without_recursing():
 
 def _make_config(llm_max_retries: int = 3, retain_llm_max_retries: int | None = None):
     """Build a minimal HindsightConfig for fact extraction tests."""
-    from hindsight_api.config import HindsightConfig
+    from hindsight_api.config import _get_raw_config
 
-    cfg = MagicMock(spec=HindsightConfig)
-    cfg.retain_llm_max_retries = retain_llm_max_retries
-    cfg.llm_max_retries = llm_max_retries
-    cfg.retain_llm_initial_backoff = None
-    cfg.llm_initial_backoff = 0.0
-    cfg.retain_llm_max_backoff = None
-    cfg.llm_max_backoff = 0.0
-    cfg.retain_max_completion_tokens = 8192
-    cfg.retain_extraction_mode = "concise"
-    cfg.retain_extract_causal_links = False
-    cfg.retain_mission = None
-    cfg.llm_temperature_retain = 0.1
-    cfg.llm_strict_schema_retain = False
-    return cfg
+    return dataclasses.replace(
+        _get_raw_config(),
+        retain_llm_max_retries=retain_llm_max_retries,
+        llm_max_retries=llm_max_retries,
+        retain_llm_initial_backoff=None,
+        llm_initial_backoff=0.0,
+        retain_llm_max_backoff=None,
+        llm_max_backoff=0.0,
+        retain_max_completion_tokens=8192,
+        retain_extraction_mode="concise",
+        retain_extract_causal_links=False,
+        retain_mission=None,
+        llm_temperature_retain=0.1,
+        llm_strict_schema_retain=False,
+    )
 
 
 def _make_llm_config(mock_response):
@@ -468,6 +470,7 @@ def _make_batch_temp_config(temperature):
     cfg.llm_temperature_retain = temperature
     cfg.retain_max_completion_tokens = None
     cfg.llm_strict_schema = False
+    cfg.llm_strict_schema_retain = False
     return cfg
 
 
@@ -498,6 +501,45 @@ def test_build_request_body_omits_temperature_when_none():
 
     body = _build_request_body(_make_batch_llm_config(), _make_batch_temp_config(None), "sys", "user", dict)
     assert "temperature" not in body
+
+
+def test_build_request_body_uses_retain_strict_schema_flag_for_schema_and_request():
+    """The batch retain path must use one resolved strict-schema flag consistently."""
+    from hindsight_api.engine.retain.fact_extraction import _build_request_body
+
+    config = _make_batch_temp_config(None)
+    config.llm_strict_schema = False
+    config.llm_strict_schema_retain = True
+    response_schema = MagicMock()
+    response_schema.model_json_schema.return_value = {"schema": "non-strict"}
+
+    with patch(
+        "hindsight_api.engine.retain.fact_extraction.strict_json_schema",
+        return_value={"schema": "strict"},
+    ) as strict_schema:
+        body = _build_request_body(_make_batch_llm_config(), config, "sys", "user", response_schema)
+
+    strict_schema.assert_called_once_with(response_schema)
+    assert body["response_format"]["json_schema"]["schema"] == {"schema": "strict"}
+    assert body["response_format"]["json_schema"]["strict"] is True
+
+
+def test_build_request_body_retain_strict_false_overrides_global_true():
+    """The retain opt-out must disable strict schema in the batch request body."""
+    from hindsight_api.engine.retain.fact_extraction import _build_request_body
+
+    config = _make_batch_temp_config(None)
+    config.llm_strict_schema = True
+    config.llm_strict_schema_retain = False
+    response_schema = MagicMock()
+    response_schema.model_json_schema.return_value = {"schema": "non-strict"}
+
+    with patch("hindsight_api.engine.retain.fact_extraction.strict_json_schema") as strict_schema:
+        body = _build_request_body(_make_batch_llm_config(), config, "sys", "user", response_schema)
+
+    strict_schema.assert_not_called()
+    assert body["response_format"]["json_schema"]["schema"] == {"schema": "non-strict"}
+    assert body["response_format"]["json_schema"]["strict"] is False
 
 
 # --- Retry budget semantics (issue #2731) -----------------------------------

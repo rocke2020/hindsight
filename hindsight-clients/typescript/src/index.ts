@@ -52,6 +52,7 @@ import type {
   TagGroupOrInput,
   TagGroupNotInput,
   MinScores,
+  TemporalWindow,
   AsyncOperationSubmitResponse,
   CreateKnowledgePageResponse,
   CreateMentalModelResponse,
@@ -66,6 +67,7 @@ import type {
   ListDocumentsResponse,
   MentalModelListResponse,
   MentalModelResponse,
+  MentalModelTriggerInput,
   MentalModelDryRunRefreshResult,
   UpdateDocumentResponse,
   VersionResponse,
@@ -124,6 +126,8 @@ export interface MemoryItemInput {
   metadata?: Record<string, string>;
   document_id?: string;
   entities?: EntityInput[];
+  /** Resolve the supplied `entities` against existing ones (default true); false stores them as written */
+  resolve_entities?: boolean;
   tags?: string[];
   observation_scopes?: "per_tag" | "combined" | "all_combinations" | "shared" | string[][];
   strategy?: string;
@@ -220,6 +224,8 @@ export class HindsightClient {
       /** Optional caller-supplied UUID for idempotent async retries */
       operationId?: string;
       entities?: EntityInput[];
+      /** Resolve the supplied `entities` against existing ones (default true); false stores them as written */
+      resolveEntities?: boolean;
       /** Optional list of tags for this memory */
       tags?: string[];
       /** How to handle existing documents: 'replace' (default) or 'append' */
@@ -242,6 +248,7 @@ export class HindsightClient {
           metadata: options?.metadata,
           document_id: options?.documentId,
           entities: options?.entities,
+          resolve_entities: options?.resolveEntities,
           tags: options?.tags,
           update_mode: options?.updateMode,
           observation_scopes: options?.observationScopes,
@@ -280,6 +287,7 @@ export class HindsightClient {
       metadata: item.metadata,
       document_id: item.document_id,
       entities: item.entities,
+      resolve_entities: item.resolve_entities,
       tags: item.tags,
       observation_scopes: item.observation_scopes,
       strategy: item.strategy,
@@ -383,6 +391,8 @@ export class HindsightClient {
       tagGroups?: Array<TagGroupLeaf | TagGroupAndInput | TagGroupOrInput | TagGroupNotInput>;
       /** Optional per-stage score floors, e.g. {semantic: 0.2, final: 0.5}. 'semantic' and 'keyword' are retrieval-level cutoffs; 'reranker' and 'final' are applied to the scored results after reranking. Any omitted stage imposes no floor. */
       minScores?: MinScores;
+      /** Window for the temporal retrieval arm, supplied instead of extracting dates from the query text. Ranks memories dated inside the window higher; it does NOT drop memories dated outside it, so it is not a way to restrict results to a period. Ignored when the bank has temporal retrieval disabled. */
+      temporalWindow?: TemporalWindow;
       signal?: AbortSignal;
     }
   ): Promise<RecallResponse> {
@@ -415,6 +425,7 @@ export class HindsightClient {
         tags_match: options?.tagsMatch,
         tag_groups: options?.tagGroups,
         min_scores: options?.minScores,
+        temporal_window: options?.temporalWindow,
       },
       signal: options?.signal,
     });
@@ -780,12 +791,16 @@ export class HindsightClient {
    */
   async listDirectives(
     bankId: string,
-    options?: { tags?: string[]; signal?: AbortSignal }
+    options?: { tags?: string[]; limit?: number; offset?: number; signal?: AbortSignal }
   ): Promise<DirectiveListResponse> {
     const response = await sdk.listDirectives({
       client: this.client,
       path: { bank_id: bankId },
-      query: { tags: options?.tags },
+      query: {
+        tags: options?.tags,
+        ...(options?.limit !== undefined ? { limit: options.limit } : {}),
+        ...(options?.offset !== undefined ? { offset: options.offset } : {}),
+      },
       signal: options?.signal,
     });
 
@@ -873,6 +888,8 @@ export class HindsightClient {
       maxTokens?: number;
       trigger?: {
         refreshAfterConsolidation?: boolean;
+        /** Floor, in seconds, on how often an automatic refresh of this model may run. A trigger firing sooner is queued and parked until the window closes, and further triggers fold into it, so a burst of retains costs one refresh. Explicit refreshes ignore it. 0 disables the floor for this model; omit to inherit the bank/global default. */
+        minRefreshIntervalSeconds?: number;
         /** How this model's tags filter source memories on refresh. If omitted, a tagged model defaults to 'all_strict' (a memory must carry every one of the model's tags), which silently drops memories that only carry a subset. Set 'any' to match memories carrying any of the tags — the same default recall/reflect use. */
         tagsMatch?: "any" | "all" | "any_strict" | "all_strict" | "exact";
         /** Compound tag filter using boolean groups; overrides the model's flat tags/tagsMatch during refresh. */
@@ -893,6 +910,7 @@ export class HindsightClient {
         trigger: options?.trigger
           ? {
               refresh_after_consolidation: options.trigger.refreshAfterConsolidation,
+              min_refresh_interval_seconds: options.trigger.minRefreshIntervalSeconds,
               tags_match: options.trigger.tagsMatch,
               tag_groups: options.trigger.tagGroups,
             }
@@ -1026,7 +1044,7 @@ export class HindsightClient {
       sourceQuery?: string;
       tags?: string[];
       maxTokens?: number;
-      trigger?: { refreshAfterConsolidation?: boolean };
+      trigger?: { refreshAfterConsolidation?: boolean; minRefreshIntervalSeconds?: number };
       signal?: AbortSignal;
     }
   ): Promise<MentalModelResponse> {
@@ -1039,7 +1057,10 @@ export class HindsightClient {
         tags: options.tags,
         max_tokens: options.maxTokens,
         trigger: options.trigger
-          ? { refresh_after_consolidation: options.trigger.refreshAfterConsolidation }
+          ? {
+              refresh_after_consolidation: options.trigger.refreshAfterConsolidation,
+              min_refresh_interval_seconds: options.trigger.minRefreshIntervalSeconds,
+            }
           : undefined,
       },
       signal: options.signal,
@@ -1238,6 +1259,9 @@ export class HindsightClient {
       /** Pages only — replaces the page's tags (pass [] to clear). */
       tags?: string[];
       maxTokens?: number;
+      /** Pages only — refresh settings to change. Applied as a patch: the fields you send are
+       *  updated and the rest keep the page's current values. */
+      trigger?: MentalModelTriggerInput;
       signal?: AbortSignal;
     }
   ): Promise<KnowledgeNode> {
@@ -1250,6 +1274,7 @@ export class HindsightClient {
         ...(options.sourceQuery !== undefined ? { source_query: options.sourceQuery } : {}),
         ...(options.tags !== undefined ? { tags: options.tags } : {}),
         ...(options.maxTokens !== undefined ? { max_tokens: options.maxTokens } : {}),
+        ...(options.trigger !== undefined ? { trigger: options.trigger } : {}),
       },
       signal: options.signal,
     });
@@ -1516,6 +1541,7 @@ export type {
   TagGroupOrInput,
   TagGroupNotInput,
   MinScores,
+  TemporalWindow,
   AsyncOperationSubmitResponse,
   CreateKnowledgePageResponse,
   CreateMentalModelResponse,
@@ -1530,6 +1556,7 @@ export type {
   ListDocumentsResponse,
   MentalModelListResponse,
   MentalModelResponse,
+  MentalModelTriggerInput,
   MentalModelDryRunRefreshResult,
   UpdateDocumentResponse,
   VersionResponse,

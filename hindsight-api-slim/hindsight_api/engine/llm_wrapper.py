@@ -32,6 +32,7 @@ from ..config import (
 from .cache_affinity import parse_cache_affinity
 from .llm_interface import (
     LLM_TOOL_CHOICE_AUTO,
+    LLMInterface,
     LLMToolChoice,
     LLMToolChoiceMode,
 )
@@ -200,14 +201,60 @@ sanitize_llm_output = sanitize_text
 # real provider path (see issue #3172).
 
 
+_JSON_CONTROL_ESCAPES = {"\n": "\\n", "\r": "\\r", "\t": "\\t", "\b": "\\b", "\f": "\\f"}
+
+
+def _escape_control_chars_in_json(text: str) -> str:
+    """Make raw control characters inside JSON string values parseable.
+
+    ``json.loads`` rejects an unescaped control character in a string. Models
+    hit this whenever they write a multi-line value (a markdown table, a list,
+    a code fence) without escaping the line breaks.
+
+    A line break, tab or form feed inside a string is *content*: it is escaped
+    so it survives. Blanking it out instead welds a markdown table onto one
+    line, and the damage is invisible downstream (#3361). Every other control
+    character carries no meaning in text, so it keeps the historical treatment
+    of becoming a space.
+
+    The scan tracks string state because only characters inside a string need
+    escaping; the same byte between tokens is junk either way.
+    """
+    out: list[str] = []
+    in_string = False
+    escape = False
+    for ch in text:
+        if in_string and escape:
+            escape = False
+            out.append(ch)
+            continue
+        if in_string and ch == "\\":
+            escape = True
+            out.append(ch)
+            continue
+        if ch == '"':
+            in_string = not in_string
+            out.append(ch)
+            continue
+        if in_string and ch in _JSON_CONTROL_ESCAPES:
+            out.append(_JSON_CONTROL_ESCAPES[ch])
+            continue
+        if ch <= "\x1f" or ch == "\x7f":
+            out.append(" ")
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
 def parse_llm_json(raw: str) -> Any:
     """
     Robustly parse JSON returned by an LLM.
 
     Handles common LLM output quirks:
     1. Markdown code fences (```json ... ```) — strip them before parsing.
-    2. Embedded control characters (\\x00-\\x1f, \\x7f) — replace with space
-       and retry if the initial parse fails.
+    2. Embedded control characters (\\x00-\\x1f, \\x7f) — escape the ones inside
+       string values (so a raw newline stays a line break), drop the ones
+       between tokens, and retry if the initial parse fails.
     3. Structural malformation (trailing commas, unterminated strings, single
        quotes, invalid ``\\escape`` sequences) — repaired as a last resort via
        ``json_repair`` (#2547/#2544).
@@ -240,8 +287,12 @@ def parse_llm_json(raw: str) -> Any:
         return json.loads(text)
     except json.JSONDecodeError:
         # Some models (e.g. Gemini) embed raw control characters inside JSON
-        # string values. Replacing them with a space usually produces valid JSON.
-        cleaned = re.sub(r"[\x00-\x1f\x7f]", " ", text)
+        # string values. Escape them rather than blank them out: a raw newline
+        # in a string is the model writing a real line break, and replacing it
+        # with a space silently welds a markdown table or list onto one line
+        # (#3361). Control characters *outside* a string are noise and are
+        # dropped, since nothing meaningful can sit between JSON tokens.
+        cleaned = _escape_control_chars_in_json(text)
 
     try:
         return json.loads(cleaned)
@@ -264,6 +315,7 @@ _PROVIDERS_WITHOUT_API_KEY = frozenset(
         "llamacpp",
         "openai-codex",
         "claude-code",
+        "github-copilot",
         "mock",
         "none",
         "vertexai",
@@ -374,6 +426,7 @@ def create_llm_provider(
         CodexLLM,
         FireworksLLM,
         GeminiLLM,
+        GitHubCopilotLLM,
         LiteLLMLLM,
         LiteLLMRouterLLM,
         LlamaCppLLM,
@@ -408,6 +461,16 @@ def create_llm_provider(
             base_url=base_url,
             model=model,
             reasoning_effort=reasoning_effort,
+        )
+
+    elif provider_lower == "github-copilot":
+        return GitHubCopilotLLM(
+            provider=provider,
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            timeout=timeout,
         )
 
     elif provider_lower == "mock":
@@ -774,6 +837,7 @@ class LLMProvider:
             "vertexai",
             "openai-codex",
             "claude-code",
+            "github-copilot",
             "mock",
             "none",
             "minimax",
@@ -944,6 +1008,31 @@ class LLMProvider:
             RuntimeError: If the connection test fails.
         """
         await self._provider_impl.verify_connection()
+
+    async def supports_batch_api(self) -> bool:
+        """Whether the underlying provider supports the OpenAI/Groq Batch API."""
+        return await self._provider_impl.supports_batch_api()
+
+    async def batch_provider_impl(self, account_key: str | None = None) -> LLMInterface | None:
+        """The implementation serving batch, or ``None`` when it cannot serve one.
+
+        Exists so the batch path (``extract_facts_from_contents_batch_api``) can
+        target the implementation through the same interface as a multi-LLM chain:
+        ``MultiLLMProvider`` returns the first batch-capable member's impl here,
+        while a single provider returns its own. Returning ``None`` rather than a
+        provider that would reject every batch call keeps the "can it serve one?"
+        answer in one place — the caller raises on ``None``.
+
+        ``account_key`` is a :attr:`LLMInterface.batch_account_key` persisted when
+        an in-flight batch was submitted. Passing it restricts the answer to the
+        account that actually owns that batch, so a same-provider lookalike is
+        rejected (``None``) instead of being handed the wrong credentials.
+        """
+        if not await self._provider_impl.supports_batch_api():
+            return None
+        if account_key is not None and self._provider_impl.batch_account_key != account_key:
+            return None
+        return self._provider_impl
 
     async def call(
         self,
@@ -1476,9 +1565,7 @@ class LLMProvider:
         if not api_key and not requires_api_key(provider):
             pass  # Provider handles its own auth
         elif not api_key:
-            raise ValueError(
-                f"{ENV_LLM_API_KEY} environment variable is required (unless using openai-codex, claude-code, or litellm)"
-            )
+            raise ValueError(f"{ENV_LLM_API_KEY} environment variable is required for provider '{provider}'")
 
         base_url = os.getenv(ENV_LLM_BASE_URL, "")
         model = os.getenv(ENV_LLM_MODEL) or _get_default_model_for_provider(provider)

@@ -115,6 +115,7 @@ async def _export_async(memory, bank_id, request_context, **kwargs):
 
 
 @pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
 async def test_import_filters_degenerate_fact_without_shifting_archive_ordinals(memory, request_context):
     """A rejected archive fact must not shift chunks, causal links, or observation sources."""
     dst = _unique_bank("transfer_degenerate_alignment")
@@ -392,6 +393,37 @@ async def test_export_bank_contents(memory, request_context):
         await memory.delete_bank(bank, request_context=request_context)
 
 
+@pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
+async def test_export_tolerates_legacy_null_and_numeric_fact_metadata(memory, request_context):
+    """A bank holding legacy metadata must still be exportable (issue #3209).
+
+    Rows written before retain normalized its input can hold a JSON null or a
+    raw integer in memory_units.metadata. TransferFact.metadata is dict[str, str],
+    so exporting such a bank used to fail validation — locking an operator out of
+    the one operation (backup / move) that gets them off the bad data. Export
+    applies the same read contract as recall: nulls dropped, the rest stringified.
+    """
+    bank = _unique_bank("export_legacy_metadata")
+    try:
+        await _retain(memory, bank, "Carol lives in Paris.", request_context, "doc-1")
+        backend = await memory._get_backend()
+        async with acquire_with_retry(backend) as conn:
+            updated = await conn.execute(
+                f"UPDATE {fq_table('memory_units')} SET metadata = $2::jsonb WHERE bank_id = $1",
+                bank,
+                json.dumps({"ocr_engine": None, "original_id": 348}),
+            )
+        assert updated != "UPDATE 0"
+
+        parsed = parse_archive(await memory.export_documents_async(bank, request_context))
+        exported = [fact.metadata for doc in parsed.documents for fact in doc.facts]
+        assert exported
+        assert all(metadata == {"original_id": "348"} for metadata in exported)
+    finally:
+        await memory.delete_bank(bank, request_context=request_context)
+
+
 def _as_json(value):
     """Normalize a jsonb column value (str or already-decoded) to a Python object."""
     return json.loads(value) if isinstance(value, str) else value
@@ -492,6 +524,7 @@ async def _observation_count(memory, bank_id):
 
 
 @pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
 async def test_bank_import_preserves_consolidation_lifecycle(memory, request_context):
     """Whole-bank import restores each fact's consolidation lifecycle verbatim, so
     previously-consolidated and previously-failed facts are never re-consolidated
@@ -592,6 +625,7 @@ async def test_bank_import_preserves_consolidation_lifecycle(memory, request_con
 
 
 @pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
 async def test_bank_export_import_exact_roundtrip(memory, request_context):
     """A whole-bank archive restores EXACT bank content (config, docs, facts,
     observations, entities, links, webhooks, directives, mental models) with facts
@@ -745,7 +779,7 @@ async def test_bank_roundtrip_carries_mental_model_history(memory, request_conte
         await memory.update_mental_model(bank, mental_model_id="mm-1", content="v3", request_context=request_context)
         # Two refreshes → two snapshots (previous content v1 then v2), newest-first.
         before = await memory.get_mental_model_history(bank, "mm-1", request_context=request_context)
-        assert [h["previous_content"] for h in before] == ["v2", "v1"]
+        assert [h["previous_content"] for h in before] == ["v2\n", "v1\n"]
 
         from hindsight_api.engine.transfer import export_bank
 
@@ -757,12 +791,13 @@ async def test_bank_roundtrip_carries_mental_model_history(memory, request_conte
         assert result.mental_model_history_imported == 2
 
         after = await memory.get_mental_model_history(bank, "mm-1", request_context=request_context)
-        assert [h["previous_content"] for h in after] == ["v2", "v1"]
+        assert [h["previous_content"] for h in after] == ["v2\n", "v1\n"]
     finally:
         await memory.delete_bank(bank, request_context=request_context)
 
 
 @pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
 async def test_bank_roundtrip_carries_knowledge_pages(memory, request_context):
     """A whole-bank archive restores the Knowledge Pages tree — nested folders +
     pages, parent_id / mental_model_id / managed / sort_order preserved — and
@@ -866,6 +901,7 @@ async def test_import_bank_refuses_existing_bank(memory, request_context):
 
 
 @pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
 async def test_export_import_roundtrip_without_llm(memory, request_context, monkeypatch):
     """Export from one bank and import into another without re-running the LLM."""
     src = _unique_bank("transfer_src")
@@ -989,6 +1025,7 @@ async def _bank_snapshot(memory, bank_id):
 
 
 @pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
 async def test_full_roundtrip_integrity(memory, request_context):
     """Full export → import must reproduce every persisted artifact (counts + sizes)."""
     src = _unique_bank("transfer_integ_src")
@@ -1042,6 +1079,7 @@ async def test_full_roundtrip_integrity(memory, request_context):
 
 
 @pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
 async def test_transfer_preserves_legacy_causal_links(memory, request_context):
     """Legacy causal edges survive export/import without becoming retain inputs."""
     src = _unique_bank("transfer_legacy_causal_src")
@@ -1093,6 +1131,7 @@ async def test_transfer_preserves_legacy_causal_links(memory, request_context):
 
 
 @pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
 async def test_export_import_observations(memory, request_context):
     """With include_observations, observations transfer and their sources re-link."""
     src = _unique_bank("transfer_obs_src")
@@ -1173,6 +1212,7 @@ async def test_export_import_observations(memory, request_context):
 
 
 @pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
 async def test_import_triggers_consolidation(memory, request_context):
     """Importing (without observations) triggers consolidation in the target bank,
     so observations get generated there — same as a normal retain."""
@@ -1336,6 +1376,7 @@ async def test_import_on_conflict_modes(memory, request_context):
 
 
 @pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
 async def test_http_export_import_endpoints(api_client, memory, request_context):
     """Round trip through the async HTTP export (POST + poll + download) and import endpoints."""
     src = _unique_bank("transfer_http_src")
@@ -1517,6 +1558,7 @@ async def test_import_rejects_invalid_on_conflict(memory, request_context):
 
 
 @pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
 async def test_bank_import_classifies_label_entities(memory, request_context):
     """An imported bank's label entities are stored with entity_kind='label'.
 
@@ -1594,6 +1636,7 @@ async def test_bank_import_classifies_label_entities(memory, request_context):
 
 
 @pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
 async def test_async_export_roundtrip(memory, request_context):
     """The async export operation stashes a real archive that re-imports cleanly.
 
@@ -1639,6 +1682,7 @@ async def test_async_export_include_observations_subset_rejected(memory, request
 
 
 @pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
 async def test_export_attach_batching_preserves_entities_and_causal_links(memory, request_context, monkeypatch):
     """Batched attach queries carry every fact's entities and cross-batch causal edges.
 
@@ -1738,10 +1782,56 @@ async def test_purge_expired_export_archives(memory, request_context):
                 old,
                 uuid.UUID(op_id),
             )
-            purged = await memory.purge_expired_export_archives(conn, fq_table("async_operations"), cutoff)
+            purged = await memory.purge_expired_export_archives(
+                conn, fq_table("async_operations"), cutoff, batch_size=100
+            )
         assert purged >= 1
         with pytest.raises(FileNotFoundError):
             await memory._file_storage.retrieve(storage_key)
+    finally:
+        await memory.delete_bank(bank, request_context=request_context)
+
+
+@pytest.mark.asyncio
+async def test_purge_expired_export_archives_honours_the_batch_bound(memory, request_context):
+    """The purge deletes at most ``batch_size`` archives per call.
+
+    Unbounded, it re-selected every expired export on every cleanup cycle and
+    re-issued a blob delete for each — ``storage_key`` stays in the row until the
+    row itself is pruned, so nothing marks an archive as already handled. The
+    prune next to it is batched, so the purge shares that bound and the two walk
+    the same ``ORDER BY updated_at, operation_id`` window together.
+    """
+    from datetime import timedelta
+
+    bank = _unique_bank("export_purge_bound")
+    try:
+        await memory.get_bank_profile(bank_id=bank, request_context=request_context)
+        backend = await memory._get_backend()
+        # Fabricated rows rather than real exports: the purge counts rows carrying a
+        # storage_key and swallows the blob delete, so no archive needs to exist for
+        # the bound to be observable. Backdated far past any other test's rows so the
+        # ORDER BY puts these first on the shared pg0 database.
+        old = datetime.now(timezone.utc) - timedelta(days=500)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=1)
+        async with acquire_with_retry(backend) as conn:
+            for i in range(2):
+                await conn.execute(
+                    f"""INSERT INTO {fq_table("async_operations")}
+                        (operation_id, bank_id, operation_type, status, task_payload,
+                         result_metadata, updated_at)
+                        VALUES ($1, $2, 'export_documents', 'completed', '{{}}'::jsonb, $3::jsonb, $4)""",
+                    uuid.uuid4(),
+                    bank,
+                    json.dumps({"storage_key": f"banks/{bank}/exports/absent-{i}.zip"}),
+                    old,
+                )
+            # LIMIT 1 caps the result at one row regardless of which expired export
+            # sorts first, so this holds even with other tests' rows in the schema.
+            purged = await memory.purge_expired_export_archives(
+                conn, fq_table("async_operations"), cutoff, batch_size=1
+            )
+        assert purged == 1
     finally:
         await memory.delete_bank(bank, request_context=request_context)
 
@@ -1767,3 +1857,247 @@ async def test_download_route_rejects_unauthorized_keys(api_client, memory, requ
         assert r.status_code == 404
     finally:
         await memory.delete_bank(bank, request_context=request_context)
+
+
+# --------------------------------------------------------------------------- store-owned refusal
+
+
+class _StoreOwnedMemories:
+    """A memories store that keeps memories outside SQL, like an external store extension."""
+
+    def writes_memory_rows_in_sql_for(self, bank_id: str) -> bool:
+        return False
+
+
+@pytest.mark.asyncio
+async def test_export_bank_asks_for_the_store_when_the_caller_did_not_pass_one(monkeypatch):
+    """`memories=None` must not be read as "SQL-backed".
+
+    The loaders read `documents` / `memory_units` directly, which a store-owned bank leaves empty,
+    so treating an absent store as SQL produced a VALID, EMPTY archive with a success status. That
+    already happened once and was fixed at the two call sites while the default that causes it
+    stayed. Asserted on archive contents, because an empty archive is exactly what the broken
+    version returned successfully.
+    """
+    from hindsight_api.engine.transfer import export as export_mod
+    import hindsight_api.engine.memories as memories_mod
+
+    # Patch the lookup, not `_resolve_memories` itself — the resolution is what is under test, and
+    # `_resolve_memories` imports `get_memories` at call time.
+    monkeypatch.setattr(memories_mod, "get_memories", lambda: _FakeStoreOwned())
+
+    conn = _BankRowsOnlyConn()
+    archive = await export_mod.export_bank(conn, "bank-x")  # note: no memories= argument
+
+    with zipfile.ZipFile(io.BytesIO(archive)) as zf:
+        manifest = json.loads(zf.read("manifest.json"))
+        doc_names = [n for n in zf.namelist() if n.startswith("documents/")]
+    assert manifest["document_count"] == 1, f"empty archive from the default path: {manifest}"
+    assert doc_names, "the archive carried no document files"
+
+
+@pytest.mark.asyncio
+async def test_resolve_target_id_asks_the_store_that_holds_the_document(monkeypatch):
+    """Every `on_conflict` mode depends on the existence check, and it was SQL-only.
+
+    For a bank whose document store is external the SQL row is absent, so the check always said "no
+    conflict": `skip` re-imported the document it was told to leave alone, `new-id` kept the original
+    id, and `replace` degenerated to a plain insert — all reported as success.
+    """
+    from hindsight_api.engine.transfer import importer as importer_mod
+
+    store = _RecordingStoreOwned()
+    await store.put_document(bank_id="bank-x", document_id="doc-1", content_hash="h")
+    monkeypatch.setattr(importer_mod, "get_memories", lambda: store, raising=False)
+    import hindsight_api.engine.memories as memories_mod
+
+    monkeypatch.setattr(memories_mod, "get_memories", lambda: store)
+
+    # Present in the store: skip declines, new-id remaps, replace keeps the id.
+    assert await importer_mod._resolve_target_id(None, "bank-x", "doc-1", "skip") is None
+    remapped = await importer_mod._resolve_target_id(None, "bank-x", "doc-1", "new-id")
+    assert remapped not in (None, "doc-1")
+    assert await importer_mod._resolve_target_id(None, "bank-x", "doc-1", "replace") == "doc-1"
+
+    # Absent from the store: no conflict, the original id is used.
+    assert await importer_mod._resolve_target_id(None, "bank-x", "doc-absent", "skip") == "doc-absent"
+
+
+class _RecordingStoreOwned(_StoreOwnedMemories):
+    """A store-owned bank that records the writes an import makes against it.
+
+    The importer's document write is what the live suite exercises; this covers the same call
+    without a server, so it runs on Postgres CI too — which is where a regression would otherwise
+    only show up as a store-owned bank that restores with no documents.
+    """
+
+    def __init__(self):
+        self.documents: dict[str, dict] = {}
+
+    def owns_document_store_for(self, bank_id: str) -> bool:
+        return True
+
+    async def get_document_record(self, *, bank_id, document_id, include_text=False):
+        return self.documents.get(document_id)
+
+    async def put_document(self, *, bank_id, document_id, **kw):
+        self.documents[document_id] = {"content_hash": kw.get("content_hash", ""), **kw}
+
+
+class _BankRowsOnlyConn:
+    """A connection that answers the bank-config queries and nothing else.
+
+    Returns no rows for everything, which is a legitimate state (a bank with no mental models or
+    webhooks) and lets the test assert that Postgres was consulted at all — the half of
+    `export_bank` that must NOT move to the store.
+    """
+
+    def __init__(self):
+        self.fetched: list[str] = []
+
+    async def fetch(self, sql: str, *args):
+        self.fetched.append(sql)
+        return []
+
+    async def fetchrow(self, sql: str, *args):
+        self.fetched.append(sql)
+        return None
+
+    async def fetchval(self, sql: str, *args):
+        self.fetched.append(sql)
+        return None
+
+
+class _FakeStoreOwned(_StoreOwnedMemories):
+    """A minimal store-owned bank: one document, two chunks, two causally-linked facts.
+
+    Hand-built rather than driven through a real store so the export's assembly is what is under
+    test — ordering, ordinals, entity resolution — without a server in the loop.
+    """
+
+    _DOC_ID = "doc-1"
+
+    def __init__(self):
+        from datetime import datetime, timezone
+
+        from hindsight_api.engine.memories.base import CausalEdgeRecord, ScanPage, StoredMemory
+
+        t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        self._cause = StoredMemory(
+            unit_id="unit-cause",
+            text="the cause",
+            fact_type="world",
+            document_id=self._DOC_ID,
+            created_at=t0,
+            entity_ids=["e-ada"],
+        )
+        self._effect = StoredMemory(
+            unit_id="unit-effect",
+            text="the effect",
+            fact_type="world",
+            document_id=self._DOC_ID,
+            created_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+            causal_edges=[CausalEdgeRecord(target_unit_id="unit-cause", relation_type="caused_by")],
+        )
+        self._page = ScanPage
+        self._t0 = t0
+
+    async def list_documents(self, *, bank_id, limit=100, offset=0, **_kw):
+        if offset:
+            return {"items": [], "total": 1}
+        return {
+            "items": [{"id": self._DOC_ID, "tags": ["t"], "created_at": self._t0, "retain_params": None}],
+            "total": 1,
+        }
+
+    async def get_document_record(self, *, bank_id, document_id, include_text=False):
+        return {"id": document_id, "original_text": "the source text"}
+
+    async def list_chunk_texts(self, *, bank_id, document_id):
+        return ["chunk one", "chunk two"]
+
+    async def scan_memories(self, *, bank_id, fact_types=None, page_token="", **_kw):
+        if page_token:
+            return self._page(memories=[], next_page_token="")
+        if fact_types and "observation" in fact_types:
+            return self._page(memories=[], next_page_token="")
+        return self._page(memories=[self._effect, self._cause], next_page_token="")
+
+    async def resolve_entity_names(self, *, conn, fq_table, bank_id, entity_ids):
+        return {"e-ada": "Ada Lovelace"}
+
+
+class _SqlMemories:
+    def writes_memory_rows_in_sql_for(self, bank_id: str) -> bool:
+        return True
+
+
+@pytest.mark.asyncio
+async def test_export_of_a_store_owned_bank_contains_its_memories():
+    """The archive must carry the bank's facts, entities and causal edges — not be empty.
+
+    This is the shape of the original defect: the loaders read `memory_units`, `unit_entities` and
+    `memory_links`, which for a store-owned bank are empty, so the export produced a well-formed
+    archive with nothing in it and returned 200. Asserting on archive CONTENTS rather than on a
+    status code is the point — an empty archive is exactly what the broken version returned
+    successfully.
+    """
+    from hindsight_api.engine.transfer.export import export_documents
+
+    archive = await export_documents(None, "bank-x", None, memories=_FakeStoreOwned())
+
+    with zipfile.ZipFile(io.BytesIO(archive)) as zf:
+        names = zf.namelist()
+        doc_names = [n for n in names if n.startswith("documents/")]
+        assert doc_names, names
+        doc = json.loads(zf.read(doc_names[0]))
+        manifest = json.loads(zf.read("manifest.json"))
+
+    assert manifest["fact_count"] == 2, manifest
+    assert manifest["document_count"] == 1, manifest
+    assert doc["original_text"] == "the source text"
+    assert [c["chunk_text"] for c in doc["chunks"]] == ["chunk one", "chunk two"]
+
+    texts = [f["text"] for f in doc["facts"]]
+    assert texts == ["the cause", "the effect"], texts
+    # The entity name has to come back through the store's registry, not a SQL join.
+    assert doc["facts"][0]["entities"] == ["Ada Lovelace"], doc["facts"][0]
+    # And the causal edge has to survive as an ordinal into this document's fact list.
+    assert doc["facts"][1]["causal_relations"] == [{"relation_type": "caused_by", "target_fact_index": 0}]
+
+
+@pytest.mark.asyncio
+async def test_export_bank_of_a_store_owned_bank_carries_its_memories():
+    """The whole-bank archive takes memories from the store and everything else from SQL.
+
+    `export_bank` is a superset of the document export: only the memories move, while bank config,
+    mental models, directives, webhooks, knowledge pages and the history tails stay in Postgres for
+    every deployment. Both halves are asserted, because routing all of it to the store would lose
+    the config and routing none of it would lose the memories.
+    """
+    from hindsight_api.engine.transfer.export import export_bank
+
+    conn = _BankRowsOnlyConn()
+    archive = await export_bank(conn, "bank-x", memories=_FakeStoreOwned())
+
+    with zipfile.ZipFile(io.BytesIO(archive)) as zf:
+        names = zf.namelist()
+        doc_names = [n for n in names if n.startswith("documents/")]
+        assert doc_names, names
+        doc = json.loads(zf.read(doc_names[0]))
+
+    # The memories came from the store...
+    assert [f["text"] for f in doc["facts"]] == ["the cause", "the effect"]
+    assert doc["facts"][1]["causal_relations"] == [{"relation_type": "caused_by", "target_fact_index": 0}]
+    # ...and Postgres was still consulted for the bank's own rows.
+    assert conn.fetched, "export_bank must still read bank config/history from Postgres"
+
+
+@pytest.mark.asyncio
+async def test_a_sql_backed_bank_is_not_read_through_the_store():
+    """A Postgres bank must keep taking the connection path, not be routed to the store."""
+    from hindsight_api.engine.transfer.export import export_documents
+
+    with pytest.raises(Exception) as ei:  # noqa: PT011 - backend=None fails once SQL is reached
+        await export_documents(None, "bank-x", None, memories=_SqlMemories())
+    assert "list_documents" not in str(ei.value), "a SQL bank must not be read through the store"

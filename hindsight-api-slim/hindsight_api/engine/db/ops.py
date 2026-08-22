@@ -491,7 +491,12 @@ class DataAccessOps(ABC):
         index_clause: str,
         fact_types: dict[str, str],
     ) -> None:
-        """Create per-bank partial vector indexes.
+        """Create per-bank partial vector indexes for a freshly created bank.
+
+        Only reached when the size threshold is off (the default), where indexes
+        are created up front rather than earned; with a threshold set, the
+        maintenance operation builds them CONCURRENTLY off the request path
+        instead. See ``per_bank_indexes_are_eager``.
 
         PG creates per-(bank, fact_type) partial indexes.
         Non-PG is a no-op (uses global index).
