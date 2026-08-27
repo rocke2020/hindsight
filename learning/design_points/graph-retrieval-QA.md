@@ -6,6 +6,7 @@ Scope: companion to [graph-retrieval-flow.md](graph-retrieval-flow.md). Answers 
 
 ## Terminology
 
+- **Fact type**: the retrieval category stored on each memory unit. The complete current set is `world` (objective or external facts, including user preferences, rules, constraints, people, and events), `experience` (actions, experiences, or observations the assistant/agent actually performed), and `observation` (an evidence-backed belief produced by consolidating supporting facts). Retain-time extraction creates `world` and `experience` units; consolidation creates `observation` units. Mental models are separate objects, not a fact type. Thus, “same-fact-type” in §2 means the ANN pass only links a seed to a neighbor whose category is identical; it never creates a semantic edge across these three categories.
 - **Posting table**: a junction table that materializes a membership relation as rows — here `unit_entities(unit_id, entity_id)` posting which facts mention which canonical entities.
 - **Entry point**: an in-window, similarity-gated memory unit chosen to start the temporal arm; the only thing Oracle's temporal arm returns.
 - **Frontier**: the mutable worklist of a BFS-style loop. Link Expansion has none; the Postgres temporal arm does.
@@ -54,6 +55,36 @@ Resolution quality directly changes graph topology: a wrongly split or merged en
 Yes, line 92 is correct on both claims.
 
 `unit_entities` is the many-to-many **posting table** between memory units and canonical entities (PK `(unit_id, entity_id)`, FKs to both parents, written in `orchestrator.py:571`). It is the entity-recall truth source: Link Expansion self-joins it to find facts sharing entities (`ops_postgresql.py:788-819`). `entity_cooccurrences` is only a derived statistics cache (used by resolution and the UI graph view).
+
+**Concrete example — entity registry versus fact membership.** Suppose retain extracts these two memory units; the IDs below are shortened only for readability:
+
+| `memory_units.id` | Fact text |
+|---|---|
+| `MU_A` | Alice builds REST APIs with Python at TechCorp. |
+| `MU_B` | Bob trains fraud-detection models with Python at DataSoft. |
+
+Entity resolution creates one canonical row per distinct entity in the bank. In particular, both mentions of “Python” resolve to the same `E_PYTHON` row:
+
+| `entities.id` | `entities.canonical_name` |
+|---|---|
+| `E_ALICE` | Alice |
+| `E_BOB` | Bob |
+| `E_PYTHON` | Python |
+| `E_TECHCORP` | TechCorp |
+| `E_DATASOFT` | DataSoft |
+
+`unit_entities` then records every fact-to-entity membership:
+
+| `unit_entities.unit_id` | `unit_entities.entity_id` |
+|---|---|
+| `MU_A` | `E_ALICE` |
+| `MU_A` | `E_PYTHON` |
+| `MU_A` | `E_TECHCORP` |
+| `MU_B` | `E_BOB` |
+| `MU_B` | `E_PYTHON` |
+| `MU_B` | `E_DATASOFT` |
+
+The difference is now visible: `entities` says **what canonical things exist**; `unit_entities` says **which memory units mention each thing**. Starting from seed `MU_A`, Link Expansion follows `MU_A -> E_PYTHON -> MU_B`. The shared `E_PYTHON` posting is what makes `MU_B` an entity-expanded candidate; the `entities` row alone cannot show that the two facts share Python.
 
 On causal types: ordinary retain writes **only `caused_by`** — the extraction schema constrains `relation_type` to it, and the writer accepts only `CANONICAL_CAUSAL_LINK_TYPES`, each edge at weight `1.0` (`causal_links.py:11-18`, `retain/link_utils.py:811-830`, `874-910`). `causes`, `enables`, `prevents` are **legacy** types: new rows of those types can only be created by transfer-archive import via `restore_legacy_causal_links_batch` (`link_utils.py:833-852`), but retrieval keeps reading all four (`ops_postgresql.py:883`, `retrieval.py:721`) so existing banks keep their semantics. So "old version used `causes`/`enables`/`prevents`" — yes, and those rows are still honored at read time.
 
