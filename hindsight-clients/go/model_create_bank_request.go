@@ -32,8 +32,10 @@ type CreateBankRequest struct {
 	RetainCustomInstructions NullableString `json:"retain_custom_instructions,omitempty"`
 	RetainChunkSize NullableInt32 `json:"retain_chunk_size,omitempty"`
 	RetainStructuredChunkSize NullableInt32 `json:"retain_structured_chunk_size,omitempty"`
+	RetainMaxAttachmentsPerChunk NullableInt32 `json:"retain_max_attachments_per_chunk,omitempty"`
 	EnableObservations NullableBool `json:"enable_observations,omitempty"`
 	ObservationsMission NullableString `json:"observations_mission,omitempty"`
+	EnableTextSearch NullableBool `json:"enable_text_search,omitempty"`
 	EnableTemporalRetrieval NullableBool `json:"enable_temporal_retrieval,omitempty"`
 	EnableGraphRetrieval NullableBool `json:"enable_graph_retrieval,omitempty"`
 	EnableReranking NullableBool `json:"enable_reranking,omitempty"`
@@ -602,6 +604,48 @@ func (o *CreateBankRequest) UnsetRetainStructuredChunkSize() {
 	o.RetainStructuredChunkSize.Unset()
 }
 
+// GetRetainMaxAttachmentsPerChunk returns the RetainMaxAttachmentsPerChunk field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *CreateBankRequest) GetRetainMaxAttachmentsPerChunk() int32 {
+	if o == nil || IsNil(o.RetainMaxAttachmentsPerChunk.Get()) {
+		var ret int32
+		return ret
+	}
+	return *o.RetainMaxAttachmentsPerChunk.Get()
+}
+
+// GetRetainMaxAttachmentsPerChunkOk returns a tuple with the RetainMaxAttachmentsPerChunk field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *CreateBankRequest) GetRetainMaxAttachmentsPerChunkOk() (*int32, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.RetainMaxAttachmentsPerChunk.Get(), o.RetainMaxAttachmentsPerChunk.IsSet()
+}
+
+// HasRetainMaxAttachmentsPerChunk returns a boolean if a field has been set.
+func (o *CreateBankRequest) HasRetainMaxAttachmentsPerChunk() bool {
+	if o != nil && o.RetainMaxAttachmentsPerChunk.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetRetainMaxAttachmentsPerChunk gets a reference to the given NullableInt32 and assigns it to the RetainMaxAttachmentsPerChunk field.
+func (o *CreateBankRequest) SetRetainMaxAttachmentsPerChunk(v int32) {
+	o.RetainMaxAttachmentsPerChunk.Set(&v)
+}
+// SetRetainMaxAttachmentsPerChunkNil sets the value for RetainMaxAttachmentsPerChunk to be an explicit nil
+func (o *CreateBankRequest) SetRetainMaxAttachmentsPerChunkNil() {
+	o.RetainMaxAttachmentsPerChunk.Set(nil)
+}
+
+// UnsetRetainMaxAttachmentsPerChunk ensures that no value is present for RetainMaxAttachmentsPerChunk, not even an explicit nil
+func (o *CreateBankRequest) UnsetRetainMaxAttachmentsPerChunk() {
+	o.RetainMaxAttachmentsPerChunk.Unset()
+}
+
 // GetEnableObservations returns the EnableObservations field value if set, zero value otherwise (both if not set or set to explicit null).
 func (o *CreateBankRequest) GetEnableObservations() bool {
 	if o == nil || IsNil(o.EnableObservations.Get()) {
@@ -684,6 +728,48 @@ func (o *CreateBankRequest) SetObservationsMissionNil() {
 // UnsetObservationsMission ensures that no value is present for ObservationsMission, not even an explicit nil
 func (o *CreateBankRequest) UnsetObservationsMission() {
 	o.ObservationsMission.Unset()
+}
+
+// GetEnableTextSearch returns the EnableTextSearch field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *CreateBankRequest) GetEnableTextSearch() bool {
+	if o == nil || IsNil(o.EnableTextSearch.Get()) {
+		var ret bool
+		return ret
+	}
+	return *o.EnableTextSearch.Get()
+}
+
+// GetEnableTextSearchOk returns a tuple with the EnableTextSearch field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *CreateBankRequest) GetEnableTextSearchOk() (*bool, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.EnableTextSearch.Get(), o.EnableTextSearch.IsSet()
+}
+
+// HasEnableTextSearch returns a boolean if a field has been set.
+func (o *CreateBankRequest) HasEnableTextSearch() bool {
+	if o != nil && o.EnableTextSearch.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetEnableTextSearch gets a reference to the given NullableBool and assigns it to the EnableTextSearch field.
+func (o *CreateBankRequest) SetEnableTextSearch(v bool) {
+	o.EnableTextSearch.Set(&v)
+}
+// SetEnableTextSearchNil sets the value for EnableTextSearch to be an explicit nil
+func (o *CreateBankRequest) SetEnableTextSearchNil() {
+	o.EnableTextSearch.Set(nil)
+}
+
+// UnsetEnableTextSearch ensures that no value is present for EnableTextSearch, not even an explicit nil
+func (o *CreateBankRequest) UnsetEnableTextSearch() {
+	o.EnableTextSearch.Unset()
 }
 
 // GetEnableTemporalRetrieval returns the EnableTemporalRetrieval field value if set, zero value otherwise (both if not set or set to explicit null).
@@ -861,11 +947,17 @@ func (o CreateBankRequest) ToMap() (map[string]interface{}, error) {
 	if o.RetainStructuredChunkSize.IsSet() {
 		toSerialize["retain_structured_chunk_size"] = o.RetainStructuredChunkSize.Get()
 	}
+	if o.RetainMaxAttachmentsPerChunk.IsSet() {
+		toSerialize["retain_max_attachments_per_chunk"] = o.RetainMaxAttachmentsPerChunk.Get()
+	}
 	if o.EnableObservations.IsSet() {
 		toSerialize["enable_observations"] = o.EnableObservations.Get()
 	}
 	if o.ObservationsMission.IsSet() {
 		toSerialize["observations_mission"] = o.ObservationsMission.Get()
+	}
+	if o.EnableTextSearch.IsSet() {
+		toSerialize["enable_text_search"] = o.EnableTextSearch.Get()
 	}
 	if o.EnableTemporalRetrieval.IsSet() {
 		toSerialize["enable_temporal_retrieval"] = o.EnableTemporalRetrieval.Get()

@@ -81,6 +81,7 @@ import { TagFilterInput } from "./tag-filter-input";
 import { FacetLegend, MetadataChip, TagChip } from "@/components/ui/facet-chip";
 import { Spinner } from "@/components/ui/spinner";
 import { HarnessLogo } from "@/components/ui/harness-logo";
+import { InlineAttachmentText } from "@/components/ui/inline-attachment-text";
 import { documentHarness, resolveHarnessLogo } from "@/lib/harness-logo";
 
 const ITEMS_PER_PAGE = 50;
@@ -634,7 +635,7 @@ function InvalidatedFactsSection({ bankId, documentId }: { bankId: string; docum
   );
 }
 
-function ChunkRow({ chunk }: { chunk: any }) {
+function ChunkRow({ chunk, bankId }: { chunk: any; bankId: string }) {
   const [expanded, setExpanded] = useState(false);
   const [memoriesExpanded, setMemoriesExpanded] = useState(false);
   const [chunkFactType, setChunkFactType] = useState<ChunkFactType>("world");
@@ -691,9 +692,12 @@ function ChunkRow({ chunk }: { chunk: any }) {
           /* Split view: left text, right compact memories */
           <div className="grid grid-cols-2 divide-x divide-border" style={{ height: "350px" }}>
             <div className="overflow-y-auto">
-              <pre className="px-4 py-3 text-[11px] leading-5 text-foreground/80 whitespace-pre-wrap font-mono">
-                {text}
-              </pre>
+              <InlineAttachmentText
+                text={text}
+                bankId={bankId}
+                attachments={chunk.attachments}
+                className="px-4 py-3 text-[11px] leading-5 text-foreground/80 whitespace-pre-wrap font-mono"
+              />
             </div>
             <div className="flex flex-col overflow-hidden">
               <ChunkMemoriesHeader
@@ -749,6 +753,7 @@ export function DocumentsView() {
   const [importing, setImporting] = useState(false);
   const [exportDialogOpen, setExportDialogOpen] = useState(false);
   const [exportIncludeObservations, setExportIncludeObservations] = useState(false);
+  const [exportIncludeKnowledgeBase, setExportIncludeKnowledgeBase] = useState(false);
   const [importDialogOpen, setImportDialogOpen] = useState(false);
   const [importFile, setImportFile] = useState<File | null>(null);
   const [importOnConflict, setImportOnConflict] = useState<"skip" | "replace" | "new-id">("skip");
@@ -1235,11 +1240,20 @@ export function DocumentsView() {
     URL.revokeObjectURL(url);
   };
 
-  const exportDocuments = async (documentIds?: string[], includeObservations = false) => {
+  const exportDocuments = async (
+    documentIds?: string[],
+    includeObservations = false,
+    includeKnowledgeBase = false
+  ) => {
     if (!currentBank || exporting) return;
     setExporting(true);
     try {
-      const blob = await client.exportDocuments(currentBank, documentIds, includeObservations);
+      const blob = await client.exportDocuments(
+        currentBank,
+        documentIds,
+        includeObservations,
+        includeKnowledgeBase
+      );
       const suffix = documentIds && documentIds.length === 1 ? `-${documentIds[0]}` : "-documents";
       triggerDownload(blob, `${currentBank}${suffix}.zip`);
       toast.success(t("exportSuccess"));
@@ -1342,7 +1356,7 @@ export function DocumentsView() {
         )}
       </div>
 
-      {/* Export dialog: explains the action and offers the observations choice. */}
+      {/* Export dialog: offers opt-in inclusion of derived/bank-level knowledge. */}
       <Dialog open={exportDialogOpen} onOpenChange={setExportDialogOpen}>
         <DialogContent>
           <DialogHeader>
@@ -1362,6 +1376,19 @@ export function DocumentsView() {
               <p className="text-xs text-muted-foreground">{t("exportIncludeObservationsHint")}</p>
             </div>
           </div>
+          <div className="flex items-start gap-2 py-2">
+            <Checkbox
+              id="export-include-knowledge-base"
+              checked={exportIncludeKnowledgeBase}
+              onCheckedChange={(v) => setExportIncludeKnowledgeBase(v === true)}
+            />
+            <div className="grid gap-1 leading-none">
+              <Label htmlFor="export-include-knowledge-base">
+                {t("exportIncludeKnowledgeBaseLabel")}
+              </Label>
+              <p className="text-xs text-muted-foreground">{t("exportIncludeKnowledgeBaseHint")}</p>
+            </div>
+          </div>
           <DialogFooter>
             <Button
               variant="outline"
@@ -1373,7 +1400,9 @@ export function DocumentsView() {
             </Button>
             <Button
               size="sm"
-              onClick={() => exportDocuments(undefined, exportIncludeObservations)}
+              onClick={() =>
+                exportDocuments(undefined, exportIncludeObservations, exportIncludeKnowledgeBase)
+              }
               disabled={exporting}
             >
               <Download className="h-4 w-4 mr-2" />
@@ -2076,6 +2105,19 @@ export function DocumentsView() {
                             autoFocus
                           />
                           <p className="text-xs text-muted-foreground">{t("saveHint")}</p>
+                          {/* Attachments appear in the raw text as ⟦hs-att:…⟧
+                              tokens. Keeping a token keeps the attachment where
+                              it is; deleting one removes it from the document.
+                              Say so, rather than letting an editor delete a
+                              screenshot by tidying up something that looks like
+                              noise. */}
+                          {(selectedDocument.attachments?.length ?? 0) > 0 && (
+                            <p className="text-xs text-muted-foreground">
+                              {t("attachmentEditHint", {
+                                count: selectedDocument.attachments.length,
+                              })}
+                            </p>
+                          )}
                         </div>
                       ) : (
                         <div className="rounded-lg border border-border bg-muted/30 overflow-hidden">
@@ -2099,9 +2141,12 @@ export function DocumentsView() {
                               {t("editButton")}
                             </Button>
                           </div>
-                          <pre className="p-4 text-[11px] leading-5 text-foreground/80 whitespace-pre-wrap font-mono">
-                            {selectedDocument.original_text}
-                          </pre>
+                          <InlineAttachmentText
+                            text={selectedDocument.original_text}
+                            bankId={currentBank ?? ""}
+                            attachments={selectedDocument.attachments}
+                            className="p-4 text-[11px] leading-5 text-foreground/80 whitespace-pre-wrap font-mono"
+                          />
                         </div>
                       )
                     ) : null}
@@ -2126,7 +2171,7 @@ export function DocumentsView() {
                   ) : chunks.length > 0 ? (
                     <div className="rounded-lg border border-border overflow-hidden divide-y divide-border">
                       {chunks.map((chunk) => (
-                        <ChunkRow key={chunk.chunk_id} chunk={chunk} />
+                        <ChunkRow key={chunk.chunk_id} chunk={chunk} bankId={currentBank ?? ""} />
                       ))}
                     </div>
                   ) : chunksLoaded ? (

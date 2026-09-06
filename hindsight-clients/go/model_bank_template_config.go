@@ -27,6 +27,7 @@ type BankTemplateConfig struct {
 	RetainStructuredChunkSize NullableInt32 `json:"retain_structured_chunk_size,omitempty"`
 	EnableObservations NullableBool `json:"enable_observations,omitempty"`
 	ObservationsMission NullableString `json:"observations_mission,omitempty"`
+	EnableTextSearch NullableBool `json:"enable_text_search,omitempty"`
 	EnableTemporalRetrieval NullableBool `json:"enable_temporal_retrieval,omitempty"`
 	EnableGraphRetrieval NullableBool `json:"enable_graph_retrieval,omitempty"`
 	EnableReranking NullableBool `json:"enable_reranking,omitempty"`
@@ -38,6 +39,7 @@ type BankTemplateConfig struct {
 	RetainDefaultStrategy NullableString `json:"retain_default_strategy,omitempty"`
 	RetainStrategies map[string]interface{} `json:"retain_strategies,omitempty"`
 	RetainChunkBatchSize NullableInt32 `json:"retain_chunk_batch_size,omitempty"`
+	RetainMaxAttachmentsPerChunk NullableInt32 `json:"retain_max_attachments_per_chunk,omitempty"`
 	McpEnabledTools []string `json:"mcp_enabled_tools,omitempty"`
 	ConsolidationLlmBatchSize NullableInt32 `json:"consolidation_llm_batch_size,omitempty"`
 	ConsolidationSourceFactsMaxTokens NullableInt32 `json:"consolidation_source_facts_max_tokens,omitempty"`
@@ -418,6 +420,48 @@ func (o *BankTemplateConfig) SetObservationsMissionNil() {
 // UnsetObservationsMission ensures that no value is present for ObservationsMission, not even an explicit nil
 func (o *BankTemplateConfig) UnsetObservationsMission() {
 	o.ObservationsMission.Unset()
+}
+
+// GetEnableTextSearch returns the EnableTextSearch field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *BankTemplateConfig) GetEnableTextSearch() bool {
+	if o == nil || IsNil(o.EnableTextSearch.Get()) {
+		var ret bool
+		return ret
+	}
+	return *o.EnableTextSearch.Get()
+}
+
+// GetEnableTextSearchOk returns a tuple with the EnableTextSearch field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *BankTemplateConfig) GetEnableTextSearchOk() (*bool, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.EnableTextSearch.Get(), o.EnableTextSearch.IsSet()
+}
+
+// HasEnableTextSearch returns a boolean if a field has been set.
+func (o *BankTemplateConfig) HasEnableTextSearch() bool {
+	if o != nil && o.EnableTextSearch.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetEnableTextSearch gets a reference to the given NullableBool and assigns it to the EnableTextSearch field.
+func (o *BankTemplateConfig) SetEnableTextSearch(v bool) {
+	o.EnableTextSearch.Set(&v)
+}
+// SetEnableTextSearchNil sets the value for EnableTextSearch to be an explicit nil
+func (o *BankTemplateConfig) SetEnableTextSearchNil() {
+	o.EnableTextSearch.Set(nil)
+}
+
+// UnsetEnableTextSearch ensures that no value is present for EnableTextSearch, not even an explicit nil
+func (o *BankTemplateConfig) UnsetEnableTextSearch() {
+	o.EnableTextSearch.Unset()
 }
 
 // GetEnableTemporalRetrieval returns the EnableTemporalRetrieval field value if set, zero value otherwise (both if not set or set to explicit null).
@@ -862,6 +906,48 @@ func (o *BankTemplateConfig) SetRetainChunkBatchSizeNil() {
 // UnsetRetainChunkBatchSize ensures that no value is present for RetainChunkBatchSize, not even an explicit nil
 func (o *BankTemplateConfig) UnsetRetainChunkBatchSize() {
 	o.RetainChunkBatchSize.Unset()
+}
+
+// GetRetainMaxAttachmentsPerChunk returns the RetainMaxAttachmentsPerChunk field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *BankTemplateConfig) GetRetainMaxAttachmentsPerChunk() int32 {
+	if o == nil || IsNil(o.RetainMaxAttachmentsPerChunk.Get()) {
+		var ret int32
+		return ret
+	}
+	return *o.RetainMaxAttachmentsPerChunk.Get()
+}
+
+// GetRetainMaxAttachmentsPerChunkOk returns a tuple with the RetainMaxAttachmentsPerChunk field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *BankTemplateConfig) GetRetainMaxAttachmentsPerChunkOk() (*int32, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.RetainMaxAttachmentsPerChunk.Get(), o.RetainMaxAttachmentsPerChunk.IsSet()
+}
+
+// HasRetainMaxAttachmentsPerChunk returns a boolean if a field has been set.
+func (o *BankTemplateConfig) HasRetainMaxAttachmentsPerChunk() bool {
+	if o != nil && o.RetainMaxAttachmentsPerChunk.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetRetainMaxAttachmentsPerChunk gets a reference to the given NullableInt32 and assigns it to the RetainMaxAttachmentsPerChunk field.
+func (o *BankTemplateConfig) SetRetainMaxAttachmentsPerChunk(v int32) {
+	o.RetainMaxAttachmentsPerChunk.Set(&v)
+}
+// SetRetainMaxAttachmentsPerChunkNil sets the value for RetainMaxAttachmentsPerChunk to be an explicit nil
+func (o *BankTemplateConfig) SetRetainMaxAttachmentsPerChunkNil() {
+	o.RetainMaxAttachmentsPerChunk.Set(nil)
+}
+
+// UnsetRetainMaxAttachmentsPerChunk ensures that no value is present for RetainMaxAttachmentsPerChunk, not even an explicit nil
+func (o *BankTemplateConfig) UnsetRetainMaxAttachmentsPerChunk() {
+	o.RetainMaxAttachmentsPerChunk.Unset()
 }
 
 // GetMcpEnabledTools returns the McpEnabledTools field value if set, zero value otherwise (both if not set or set to explicit null).
@@ -1996,6 +2082,9 @@ func (o BankTemplateConfig) ToMap() (map[string]interface{}, error) {
 	if o.ObservationsMission.IsSet() {
 		toSerialize["observations_mission"] = o.ObservationsMission.Get()
 	}
+	if o.EnableTextSearch.IsSet() {
+		toSerialize["enable_text_search"] = o.EnableTextSearch.Get()
+	}
 	if o.EnableTemporalRetrieval.IsSet() {
 		toSerialize["enable_temporal_retrieval"] = o.EnableTemporalRetrieval.Get()
 	}
@@ -2028,6 +2117,9 @@ func (o BankTemplateConfig) ToMap() (map[string]interface{}, error) {
 	}
 	if o.RetainChunkBatchSize.IsSet() {
 		toSerialize["retain_chunk_batch_size"] = o.RetainChunkBatchSize.Get()
+	}
+	if o.RetainMaxAttachmentsPerChunk.IsSet() {
+		toSerialize["retain_max_attachments_per_chunk"] = o.RetainMaxAttachmentsPerChunk.Get()
 	}
 	if o.McpEnabledTools != nil {
 		toSerialize["mcp_enabled_tools"] = o.McpEnabledTools

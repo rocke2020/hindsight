@@ -88,6 +88,17 @@ _SKIP_TABLES = frozenset(
         "graph_maintenance_queue",  # transient work queue; regenerated on import
         "entity_maintenance_queue",  # transient work queue; regenerated on import
         "file_storage",  # raw uploads; documents.original_text is already carried
+        # Attachments retained as inline content, and the document edges derived
+        # from the text. Skipped because the bytes they point at live in
+        # file_storage, which is skipped just above — carrying the rows alone
+        # would give the target a bank full of records referencing blobs it does
+        # not have. The placeholders survive in documents.original_text, and both
+        # extraction and the read paths already degrade gracefully when one
+        # resolves to nothing, so an imported document keeps its facts and simply
+        # cannot show the attachment. Carrying them properly means bundling their
+        # bytes into the archive — a deliberate feature, not a line in this set.
+        "attachments",
+        "document_attachments",
         # Curation archive of retired facts — local operational state, not part of
         # the live knowledge the export replays. Its rows mirror memory_units (stale
         # embedding) and snapshot source-bank entity ids that the import re-resolves
@@ -197,7 +208,7 @@ def _is_store_owned(memories: Any, bank_id: str) -> bool:
     if memories is None:
         return False
     try:
-        return not memories.writes_memory_rows_in_sql_for(bank_id)
+        return memories.store_owned_for(bank_id)
     except Exception:  # noqa: BLE001 - a store that cannot answer is treated as SQL-backed
         return False
 
@@ -208,6 +219,7 @@ async def export_documents(
     document_ids: list[str] | None = None,
     *,
     include_observations: bool = False,
+    include_knowledge_base: bool = False,
     memories: Any = None,
 ) -> bytes:
     """Export documents from ``bank_id`` into an in-memory ZIP archive.
@@ -224,14 +236,16 @@ async def export_documents(
         The ZIP archive as bytes.
 
     Raises:
-        ValueError: if ``include_observations`` is combined with ``document_ids``.
+        ValueError: if a bank-level section is combined with ``document_ids``.
     """
     # Observations are bank-level and can be derived from facts spanning several
     # documents, so they're only coherent when the whole bank is exported. For a
     # document subset we'd have to silently drop every cross-document observation
     # — reject the combination instead so the caller isn't surprised.
-    if include_observations and document_ids is not None:
-        raise ValueError("include_observations is only supported when exporting the whole bank (omit document_id)")
+    if (include_observations or include_knowledge_base) and document_ids is not None:
+        raise ValueError(
+            "include_observations and include_knowledge_base are only supported when exporting the whole bank (omit document_id)"
+        )
 
     memories = _resolve_memories(memories)
 
@@ -240,6 +254,8 @@ async def export_documents(
     # them, so imported facts keep their consolidated/failed state. Without
     # observations (the default document export) the target re-consolidates
     # from scratch, so lifecycle is deliberately dropped.
+    mental_models: list[dict] = []
+    knowledge_pages: list[TransferKnowledgePage] = []
     if _is_store_owned(memories, bank_id):
         # No connection is taken at all: for this bank every table the SQL loaders read is empty,
         # so holding one would only make the empty result look better-founded than it is.
@@ -250,11 +266,18 @@ async def export_documents(
         observations = (
             await _load_observations_from_store(memories, bank_id, loaded.unit_index) if include_observations else []
         )
+        if include_knowledge_base:
+            async with acquire_with_retry(backend) as conn:
+                mental_models = await _dump_bank_rows(conn, "mental_models", bank_id)
+                knowledge_pages = await _load_knowledge_pages(conn, bank_id)
     else:
         async with acquire_with_retry(backend) as conn:
             loaded = await _load_documents(conn, bank_id, document_ids, include_lifecycle=include_observations)
             documents = loaded.documents
             observations = await _load_observations(conn, bank_id, loaded.unit_index) if include_observations else []
+            if include_knowledge_base:
+                mental_models = await _dump_bank_rows(conn, "mental_models", bank_id)
+                knowledge_pages = await _load_knowledge_pages(conn, bank_id)
 
     fact_total = sum(len(document.facts) for document in documents)
     manifest = TransferManifest(
@@ -264,12 +287,16 @@ async def export_documents(
         document_count=len(documents),
         fact_count=fact_total,
         observation_count=len(observations),
+        mental_model_count=len(mental_models),
+        knowledge_page_count=len(knowledge_pages),
     )
 
     # ZIP compression and per-document JSON serialisation are CPU-bound and, on a
     # large bank, would block the event loop for seconds (issue #3321). Run the
     # assembly in a worker thread so unrelated requests/tasks keep progressing.
-    archive_bytes = await anyio.to_thread.run_sync(_build_archive_bytes, documents, observations, manifest)
+    archive_bytes = await anyio.to_thread.run_sync(
+        _build_archive_bytes, documents, observations, mental_models, knowledge_pages, manifest
+    )
 
     logger.info(
         "[transfer] Exported %d document(s), %d fact(s), %d observation(s) from bank %s",
@@ -284,6 +311,8 @@ async def export_documents(
 def _build_archive_bytes(
     documents: list[TransferDocument],
     observations: list[TransferObservation],
+    mental_models: list[dict],
+    knowledge_pages: list[TransferKnowledgePage],
     manifest: TransferManifest,
 ) -> bytes:
     """Serialise the loaded documents/observations/manifest into a ZIP archive.
@@ -302,6 +331,12 @@ def _build_archive_bytes(
         if observations:
             payload = "[\n" + ",\n".join(o.model_dump_json(indent=2) for o in observations) + "\n]\n"
             zf.writestr("observations.json", payload)
+
+        if mental_models:
+            zf.writestr("mental_models.json", json.dumps(mental_models, indent=2, default=_row_json_default))
+        if knowledge_pages:
+            payload = "[\n" + ",\n".join(p.model_dump_json(indent=2) for p in knowledge_pages) + "\n]\n"
+            zf.writestr("knowledge_pages.json", payload)
 
         zf.writestr("manifest.json", manifest.model_dump_json(indent=2))
 
@@ -675,7 +710,9 @@ async def _load_observations_from_store(
             continue
         observations.append(
             TransferObservation(
+                source_id=str(memory.unit_id),
                 text=memory.text,
+                created_at=memory.created_at,
                 tags=list(memory.tags or []),
                 event_date=memory.event_date,
                 occurred_start=memory.occurred_start,
@@ -756,7 +793,7 @@ async def _load_observations(
     """
     rows = await conn.fetch(
         f"""
-        SELECT id, text, tags, event_date, occurred_start, occurred_end,
+        SELECT id, text, tags, created_at, event_date, occurred_start, occurred_end,
                mentioned_at, observation_scopes, proof_count, source_memory_ids
         FROM {fq_table("memory_units")}
         WHERE bank_id = $1 AND fact_type = 'observation'
@@ -777,7 +814,9 @@ async def _load_observations(
             continue
         observations.append(
             TransferObservation(
+                source_id=str(row["id"]),
                 text=row["text"],
+                created_at=row["created_at"],
                 tags=list(row["tags"] or []),
                 event_date=row["event_date"],
                 occurred_start=row["occurred_start"],
@@ -849,6 +888,7 @@ async def _load_facts(conn: Any, bank_id: str, doc_ids: list[str], include_lifec
         bucket = loaded.facts_by_doc.setdefault(doc_id, [])
         ordinal = len(bucket)
         fact = TransferFact(
+            source_id=str(row["id"]),
             text=row["text"],
             fact_type=row["fact_type"],
             context=row["context"],
