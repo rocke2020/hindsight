@@ -10,6 +10,7 @@ permissions:
 
 jobs:
   update:
+    if: github.repository == 'vectorize-io/hindsight'
     concurrency:
       group: star-history
       cancel-in-progress: false
