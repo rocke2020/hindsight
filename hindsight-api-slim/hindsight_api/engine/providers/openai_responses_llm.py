@@ -34,7 +34,6 @@ possible future optimization.
 import asyncio
 import json
 import logging
-import os
 import time
 from contextlib import AbstractAsyncContextManager, nullcontext
 from typing import Any, Callable
@@ -42,7 +41,7 @@ from urllib.parse import parse_qs, urlparse, urlunparse
 
 from openai import APIConnectionError, APIStatusError, AsyncOpenAI
 
-from hindsight_api.config import DEFAULT_LLM_TIMEOUT, ENV_LLM_TIMEOUT
+from hindsight_api.config import get_config
 from hindsight_api.engine.bank_attribution import apply_bank_attribution
 from hindsight_api.engine.llm_interface import (
     LLM_TOOL_CHOICE_AUTO,
@@ -54,6 +53,7 @@ from hindsight_api.engine.llm_interface import (
 from hindsight_api.engine.llm_trace import LLMResponseUsage, stash_response_usage
 from hindsight_api.engine.llm_transport import build_sdk_timeout, describe_transport_error
 from hindsight_api.engine.providers.llm_debug import dump_request_on_4xx
+from hindsight_api.engine.providers.openai_compatible_headers import with_openai_compatible_user_agent
 
 # Provider-agnostic pure helpers (text cleanup, quota-defer parsing, json-mode
 # hint). These are module-level utilities, not chat/completions behavior.
@@ -211,13 +211,15 @@ class OpenAIResponsesLLM(LLMInterface):
         self.openai_service_tier = kwargs.get("openai_service_tier")
         self._config_extra_body = extra_body or {}
         self.default_headers = default_headers
-        self.timeout = timeout or float(os.getenv(ENV_LLM_TIMEOUT, str(DEFAULT_LLM_TIMEOUT)))
+        self.timeout = timeout or get_config().llm_timeout
 
         # Manual retries (max_retries=0). Extract query params from base_url so an
         # Azure-style ``?api-version=`` is forwarded as a default query param.
-        client_kwargs: dict[str, Any] = {"api_key": self.api_key, "max_retries": 0}
-        if self.default_headers:
-            client_kwargs["default_headers"] = self.default_headers
+        client_kwargs: dict[str, Any] = {
+            "api_key": self.api_key,
+            "max_retries": 0,
+            "default_headers": with_openai_compatible_user_agent(self.default_headers),
+        }
         if self.base_url:
             parsed = urlparse(self.base_url)
             if parsed.query:
