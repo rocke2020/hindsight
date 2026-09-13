@@ -1,163 +1,232 @@
-# Graph Retrieval Q&A: Nine Questions on the Flow Doc
+# Hindsight Graph Retrieval Q&A
 
-> **TL;DR:** All nine questions are answered against the `dev@278cde1` code, and every claim in the companion flow doc's disputed lines (92, 111, 115-121, 129) is **confirmed correct**. The graph is not causal-only; Link Expansion is one bounded pass with three additive scores; ordinary retain writes only `caused_by` while retrieval still reads the legacy `causes/enables/prevents` types; Oracle's temporal arm returns only entry points because it skips the `unnest`-based spreading loop. One real code defect was found: the module header of `link_expansion_retrieval.py` is stale prose that contradicts its own implementation.
+## Overview
 
-Scope: companion to [graph-retrieval-flow.md](graph-retrieval-flow.md). Answers were produced by two independent readers — direct code reading plus a read-only Codex consultation — and merged; the two agreed on every point. Paths below are relative to `hindsight-api-slim/hindsight_api/` unless a `tests/` prefix is present.
+This document answers the main implementation questions raised by [Hindsight Graph Retrieval: Retain-Time Links to Recall-Time Evidence](graph-retrieval-flow.md). The answers follow the current `dev@ef1179c65` executable paths: retain-time graph construction, semantic seed selection, one-pass Link Expansion, PostgreSQL temporal spreading, and downstream fusion and scoring.
+
+The central distinction is simple: Link Expansion is a semantic-seeded, one-pass candidate retriever over entity, semantic, and outgoing causal connections; it is not a general graph walk or answer generator. Causal links are also consumed separately by PostgreSQL temporal spreading when recall has a time window.
+
+Scope: static source analysis of the built-in PostgreSQL and Oracle stores. Examples use concrete IDs and values for explanation, but they are not captured live LLM, embedding, database, latency, or answer-quality evidence.
 
 ## Terminology
 
-- **Fact type**: the retrieval category stored on each memory unit. The complete current set is `world` (objective or external facts, including user preferences, rules, constraints, people, and events), `experience` (actions, experiences, or observations the assistant/agent actually performed), and `observation` (an evidence-backed belief produced by consolidating supporting facts). Retain-time extraction creates `world` and `experience` units; consolidation creates `observation` units. Mental models are separate objects, not a fact type. Thus, “same-fact-type” in §2 means the ANN pass only links a seed to a neighbor whose category is identical; it never creates a semantic edge across these three categories.
-- **Posting table**: a junction table that materializes a membership relation as rows — here `unit_entities(unit_id, entity_id)` posting which facts mention which canonical entities.
-- **Entry point**: an in-window, similarity-gated memory unit chosen to start the temporal arm; the only thing Oracle's temporal arm returns.
-- **Frontier**: the mutable worklist of a BFS-style loop. Link Expansion has none; the Postgres temporal arm does.
-- **Activation**: the graph arm's internal ranking score, the sum of the entity/semantic/causal signal scores.
-- **Stale header**: a module docstring that documents behavior the code no longer has.
+- **Fact type**: The retrieval category of a memory unit. The complete recall set is `world`, `experience`, and `observation`.
+- **Graph seed**: A semantically matched memory unit used as a fixed Link Expansion starting point.
+- **Posting table**: A junction table representing membership as rows; `unit_entities(unit_id, entity_id)` records which facts mention which canonical entities.
+- **Activation**: The graph arm's internal additive score across entity, semantic, and causal evidence.
+- **Entry point**: An in-window, similarity-gated memory unit that starts the temporal arm.
+- **Frontier**: The worklist used by PostgreSQL temporal spreading; Link Expansion has no mutable frontier.
 
-## 1. Is the graph only used for causal analysis?
+## 1. Which fact types participate in recall?
 
-No — causal links are just one of the graph's uses, and not the largest. The stored graph (`memory_links` + `unit_entities`) is read by:
+Recall accepts exactly three fact types:
 
-1. **The Link Expansion recall arm** — all three signals: shared entities via `unit_entities`, semantic links, and causal links (`search/link_expansion_retrieval.py:293-338`, `db/ops_postgresql.py:788-887`).
-2. **The Postgres temporal recall arm** — its spreading loop follows outgoing `temporal` plus all four causal link types (`search/retrieval.py:719-724`).
-3. **Reflect** — indirectly: it has no direct `memory_links` access, but its `recall()` tool runs the full arm set, graph included.
-4. **Retain-time maintenance** — `graph_maintenance.py` relinks temporal/semantic edges; entity resolution itself consumes the `entity_cooccurrences` cache derived from the graph.
+| Fact type | Meaning | Producer |
+|---|---|---|
+| `world` | Objective or external facts, including user preferences, rules, corrections, constraints, people, and events | Retain-time extraction |
+| `experience` | Actions, experiences, discoveries, or observations the assistant or agent actually performed | Retain-time extraction; the extractor's internal `assistant` label is persisted as `experience` |
+| `observation` | Consolidated knowledge synthesized from supporting facts | Consolidation |
 
-`entity_cooccurrences` is never a recall traversal source — recall's entity signal reads `unit_entities`.
+Mental models are separate objects, not another recall fact type. Semantic-link construction and Link Expansion stay within one fact type per call; a semantic graph edge is not created across `world`, `experience`, and `observation` categories.
 
-## 2. What are semantic graph links?
+## 2. Is the graph only used for causal analysis?
 
-A semantic link is a directed `memory_links` row `(from_unit_id, to_unit_id, link_type='semantic', weight)` where **weight is the cosine similarity measured at retain time**. Construction:
+No. The graph recall arm combines three independent structural signals:
 
-- During streaming retain, per-batch semantic links are skipped; after all batches commit, a best-effort final ANN pass treats each new unit as a seed, searches same-bank, same-fact-type units with `top_k=20` ("Recall uses at most 20 neighbors", `retain/orchestrator.py:1969-1975`), clamps similarity to [0,1], and keeps only edges at or above `semantic_link_min_similarity` (default **0.7**, `config.py:1038`) — see `retain/link_utils.py:629-664`.
-- Within-batch similarities are computed in numpy with the same threshold, no DB needed (`link_utils.py:673-729`).
-- Failure of this pass does not roll back retained facts — vector recall still works, but semantic graph edges stay incomplete until an explicit relink/repair.
+1. Shared canonical entities through `unit_entities`.
+2. Retain-time semantic-neighbor rows in `memory_links`.
+3. Explicit causal rows in `memory_links`.
 
-At recall the rows are read **in both directions** (the stored graph is not assumed symmetric), and each candidate's semantic score is the `MAX(weight)` across all seed connections (`ops_postgresql.py:833-871`).
+PostgreSQL temporal retrieval is a separate fourth recall arm that can also traverse temporal and causal links when a time window exists. Therefore causal evidence is one graph signal and one temporal-spreading input; it is not the entire graph and not a separate fifth arm.
 
-## 3. What is the chunk size?
+`entity_cooccurrences` does not drive entity recall. It is derived statistics used by entity resolution and graph-related views; Link Expansion reads `unit_entities` directly.
 
-`DEFAULT_RETAIN_CHUNK_SIZE = 3000` **characters** (not tokens), `config.py:1243`, exposed as `HINDSIGHT_API_RETAIN_CHUNK_SIZE` / hierarchical field `retain_chunk_size`. It bounds each chunk handed to fact extraction (`retain/fact_extraction.py:2004`); plain text splits on sentence/separator boundaries, JSON conversations and JSONL prefer turn/line boundaries. A separate optional `retain_structured_chunk_size` (default unset) can let one structured turn/line stay whole; when unset it falls back to the same 3000-char limit. Unrelated to graphs — this is the retain ingestion knob.
+## 3. How is an ordinary causal link created, and which way does it point?
 
-## 4. What is canonical entity resolution?
-
-It is the mapping of every entity mention (extracted or caller-supplied) onto **one persistent `entities` row**, reusing that row's id and stored `canonical_name`, so that "Python", "python", and "Python language" all post to the same node. Flow:
-
-1. `retain/entity_processing.py` merges extractor entities with caller-supplied ones per fact and dedups case-insensitively. Extracted names default to fuzzy resolution; caller names can opt out (`resolve: False` → literal, case-insensitive exact match only, never merged — #3479).
-2. `retain/link_utils.py:196-301` normalizes whitespace, drops empty names, flattens mentions, and attaches same-fact peers as `nearby_entities` context.
-3. `EntityResolver` fetches candidate canonical rows — indexed pg_trgm trigram lookup on PostgreSQL, exact matching for label entities (`entity_resolver.py:703-790`).
-4. Each candidate passes name-compatibility gates (word-level similarity, so "John Smith"/"Jane Smith" do not merge), then is scored: **name similarity ×0.5 + co-occurrence overlap ×0.3 + temporal proximity ×0.2, reuse threshold 0.6** (`entity_resolver.py:1177-1210`).
-5. If nothing clears the threshold, a new entity is inserted (with intrabatch near-duplicate clustering, cutoff 0.5), then Phase 2 writes the `(unit_id, entity_id)` postings into `unit_entities` inside the fact transaction (`retain/orchestrator.py:549-571`).
-
-Resolution quality directly changes graph topology: a wrongly split or merged entity changes which facts count as "shared-entity" neighbors at recall.
-
-## 5. `unit_entities`, and the causal link types — is the doc's line 92 right?
-
-Yes, line 92 is correct on both claims.
-
-`unit_entities` is the many-to-many **posting table** between memory units and canonical entities (PK `(unit_id, entity_id)`, FKs to both parents, written in `orchestrator.py:571`). It is the entity-recall truth source: Link Expansion self-joins it to find facts sharing entities (`ops_postgresql.py:788-819`). `entity_cooccurrences` is only a derived statistics cache (used by resolution and the UI graph view).
-
-**Concrete example — entity registry versus fact membership.** Suppose retain extracts these two memory units; the IDs below are shortened only for readability:
-
-| `memory_units.id` | Fact text |
-|---|---|
-| `MU_A` | Alice builds REST APIs with Python at TechCorp. |
-| `MU_B` | Bob trains fraud-detection models with Python at DataSoft. |
-
-Entity resolution creates one canonical row per distinct entity in the bank. In particular, both mentions of “Python” resolve to the same `E_PYTHON` row:
-
-| `entities.id` | `entities.canonical_name` |
-|---|---|
-| `E_ALICE` | Alice |
-| `E_BOB` | Bob |
-| `E_PYTHON` | Python |
-| `E_TECHCORP` | TechCorp |
-| `E_DATASOFT` | DataSoft |
-
-`unit_entities` then records every fact-to-entity membership:
-
-| `unit_entities.unit_id` | `unit_entities.entity_id` |
-|---|---|
-| `MU_A` | `E_ALICE` |
-| `MU_A` | `E_PYTHON` |
-| `MU_A` | `E_TECHCORP` |
-| `MU_B` | `E_BOB` |
-| `MU_B` | `E_PYTHON` |
-| `MU_B` | `E_DATASOFT` |
-
-The difference is now visible: `entities` says **what canonical things exist**; `unit_entities` says **which memory units mention each thing**. Starting from seed `MU_A`, Link Expansion follows `MU_A -> E_PYTHON -> MU_B`. The shared `E_PYTHON` posting is what makes `MU_B` an entity-expanded candidate; the `entities` row alone cannot show that the two facts share Python.
-
-On causal types: ordinary retain writes **only `caused_by`** — the extraction schema constrains `relation_type` to it, and the writer accepts only `CANONICAL_CAUSAL_LINK_TYPES`, each edge at weight `1.0` (`causal_links.py:11-18`, `retain/link_utils.py:811-830`, `874-910`). `causes`, `enables`, `prevents` are **legacy** types: new rows of those types can only be created by transfer-archive import via `restore_legacy_causal_links_batch` (`link_utils.py:833-852`), but retrieval keeps reading all four (`ops_postgresql.py:883`, `retrieval.py:721`) so existing banks keep their semantics. So "old version used `causes`/`enables`/`prevents`" — yes, and those rows are still honored at read time.
-
-## 6. Is Link Expansion really one pass, not multi-hop?
-
-Yes — confirmed in code, and yes, the design intent is a simple, fast online query. The whole expansion for a fact type is **one SQL statement** (`_expand_combined`, `link_expansion_retrieval.py:293-359`): a CTE union of entity/semantic/causal expansions over the *fixed* seed set, one roundtrip, one connection slot. Candidates it discovers are never fed back as a new frontier. The bounds:
-
-- **20 seeds** — `GRAPH_SEED_LIMIT = 20` (`link_expansion_retrieval.py:44`); seeds come from the shared semantic pool when thresholds allow, else the retriever runs its own seed query.
-- **200 candidates per entity** — `DEFAULT_LINK_EXPANSION_PER_ENTITY_LIMIT = 200` (`config.py:1236`) applied inside the per-entity LATERAL subquery *before* aggregation.
-- **Recall budget** — each signal's CTE ends `LIMIT $3` (the budget), and Python cuts the final merged list to `budget` again.
-
-Contrast: the **temporal arm** is the only recall path with a mutable frontier and iteration (batch 20, 10 neighbors per source, max 5 iterations — `retrieval.py:663-695`). The rationale for one-pass: online recall must stay low-latency and bounded; multi-hop fan-out is exactly the cost a 10-second timeout and the LATERAL caps exist to prevent. Deeper traversal is deliberately left to the temporal arm's tightly-budgeted loop and to consolidation (offline).
-
-## 7. `semantic_link_weight` vs `causal_link_weight`, and the three scores
-
-The two weights are **stored column values** in `memory_links.weight`, not retrieval-time multipliers:
-
-- **semantic weight** = the cosine similarity that created the edge at retain time, ∈ [0,1] by construction (floor 0.7 to exist at all);
-- **causal weight** = the explicit edge weight from extraction; ordinary retain writes a constant `1.0` (legacy imported edges may carry other values).
-
-The three per-candidate scores (`link_expansion_retrieval.py:227-262`):
+Ordinary LLM-based retain emits only `caused_by`, and each reference must point to an earlier fact in the same extraction group. After the facts receive real `memory_units` IDs, the current effect becomes `from_unit_id`, the referenced earlier cause becomes `to_unit_id`, and the writer stores weight `1.0`.
 
 ```text
-entity_score   = tanh(distinct_shared_entity_count * 0.5)   # saturating: 1→0.46, 2→0.76, 3→0.91
-semantic_score = max(semantic_link_weight)                   # best edge from any seed, either direction
-causal_score   = max(causal_link_weight)                     # best outgoing edge from any seed
+Fact 0: Maya lost her job.              -> MU_JOB
+Fact 1: Maya could not pay rent.        -> MU_RENT
+        causal_relations=[{target_index: 0, relation_type: caused_by}]
 
-activation     = entity_score + semantic_score + causal_score   # ∈ [0, 3]
+Stored row:
+MU_RENT --caused_by, weight 1.0--> MU_JOB
 ```
 
-The design point of each shape: `tanh` makes entity co-occurrence saturate (one more shared entity matters less the more you already have); `max` (not sum) for semantic/causal means the strength of the *best evidence* counts, so a candidate linked by many weak edges does not outrank one strong edge; the additive sum rewards **convergent evidence** — a fact reachable by two independent signals beats a fact with one strong signal. This activation ranks only the graph arm; fusion downstream uses rank positions, not raw activation.
+Link Expansion follows causal rows only from a seed's `from_unit_id` to `to_unit_id`. An effect seed `MU_RENT` can therefore retrieve its cause `MU_JOB`; a cause seed `MU_JOB` does not retrieve `MU_RENT` through that same row. Entity or semantic expansion may still connect them independently.
 
-**Known stale prose:** the module header of `link_expansion_retrieval.py` (lines 5-16) claims all three signals live in `memory_links` and that causal score is `weight + 1.0`. Both statements are false for the current code (entity expansion reads `unit_entities`; the merge step at lines 246-254 uses raw `weight`). The flow doc's "source caution" (its line 243) already flags this; the header itself is the drift source and is worth a cleanup PR.
+Transfer import can restore historical `causes`, `enables`, and `prevents` rows. Normal retain does not create those types, but Link Expansion and PostgreSQL temporal spreading continue to read all four causal types.
 
-## 8. Link Expansion end-to-end: flow, target, benefit, example
+## 4. Can ordinary causal extraction connect facts from different chunks?
 
-**Target:** recover structurally connected evidence that flat vector search ranks poorly or misses, as one bounded candidate arm — not a GraphRAG answer pipeline, not a query-entity graph walk.
+No. Causal references are fact indices local to one extraction group. Separate chunks are extracted independently, so a fact in one group cannot name a fact index from another group and ordinary retain cannot materialize a direct causal edge between them.
 
-**Flow:**
+The default retain chunk limit is 3000 characters, not tokens. Plain text prefers structural boundaries such as paragraphs and sentences; structured conversations and JSONL prefer complete turn or line boundaries while those units fit the configured structured limit. An oversized split can therefore weaken causal continuity even when all text is retained.
 
-1. Recall embeds the query; semantic + BM25 run in one combined SQL.
-2. Up to 20 semantic candidates above `graph_seed_min_similarity` (default 0.3) become graph seeds (a stricter semantic floor triggers the retriever's own seed query so entry points are not silently lost).
-3. From the unchanged seed set, one CTE query expands: shared entities (via `unit_entities`), semantic links (bidirectional), causal links (outgoing).
-4. Python dedups by unit id, computes the additive activation, sorts, cuts to budget; tag filters apply after the cut.
-5. The graph list joins semantic, BM25, and (if a time window exists) temporal lists in RRF/interleave fusion → optional cross-encoder rerank → recency/temporal/proof boosts → token-budget packing. Graph rank 1 guarantees neither final rank 1 nor inclusion.
+A larger recall budget cannot reconstruct an edge that extraction never created. If cross-boundary continuity matters, it must be addressed at retain/extraction design rather than hidden behind deeper graph traversal.
 
-**Benefit:** it gives a second, *structural* retrieval route into the same bank. A fact that shares an entity or an edge with a seed can enter the fused pool even when its query-vector similarity is weak — recall (finding it at all) improves even if the cross-encoder later demotes it. It also costs one extra SQL roundtrip per fact type, which is why it stays one pass.
+## 5. What are `entities`, `unit_entities`, and `entity_cooccurrences`?
 
-**End-to-end example** (illustrative, same setup as the flow doc §4): retain three facts — A "Alice builds REST APIs with Python at TechCorp", B "Bob trains fraud-detection models with Python at DataSoft", C "Alice and Bob co-lead Project Orion for TechCorp". Retain builds `unit_entities` A→{Alice, Python, TechCorp}, B→{Bob, Python, DataSoft}, C→{Alice, Bob, Orion, TechCorp}, plus a retain-time ANN edge A–C with weight 0.82. Query: "What machine-learning work is connected to Alice through tools she uses?" Suppose only A clears the 0.3 seed floor, so {A} is the seed set:
+They serve different roles:
 
-| Candidate | Signals found | Score |
+- `entities` is the bank's canonical entity registry: one row per resolved entity identity.
+- `unit_entities` is the many-to-many membership table between memory units and canonical entities; it is the entity-recall source of truth.
+- `entity_cooccurrences` is derived pairwise statistics used to help future entity resolution and graph views; it is not traversed by Link Expansion.
+
+Assume two facts resolve both “Python” mentions to the same canonical entity:
+
+```text
+memory_units:
+  MU_A = Alice builds REST APIs with Python.
+  MU_B = Bob trains fraud models with Python.
+
+entities:
+  E_ALICE, E_BOB, E_PYTHON
+
+unit_entities:
+  MU_A -> E_ALICE
+  MU_A -> E_PYTHON
+  MU_B -> E_BOB
+  MU_B -> E_PYTHON
+```
+
+Starting from seed `MU_A`, entity expansion follows `MU_A -> E_PYTHON -> MU_B`. The `E_PYTHON` registry row alone cannot establish that the two facts share Python; the two posting rows do.
+
+Canonical resolution attempts to reuse an existing entity based on compatible names plus contextual signals such as co-occurrence and time. It is probabilistic matching, not a guarantee that every spelling variant merges correctly, so false splits and false merges directly change the recall topology.
+
+## 6. What is a semantic graph link, and why is it read in both directions?
+
+A semantic link is a directed row `(from_unit_id, to_unit_id, link_type='semantic', weight)` whose weight is the clamped cosine similarity measured during link construction. The streaming retain path creates these rows in a post-commit, best-effort ANN pass using same-bank, same-fact-type neighbors, up to 20 per seed, at the default `0.7` similarity floor.
+
+Stored direction reflects which unit initiated indexing, not a directional meaning relationship. Recall therefore checks both sides:
+
+```text
+stored: MU_A --semantic, 0.82--> MU_C
+
+seed MU_A: outgoing lookup returns MU_C with semantic score 0.82
+seed MU_C: incoming lookup returns MU_A with semantic score 0.82
+```
+
+When several seeds connect to the same candidate, Link Expansion keeps `MAX(weight)`, not the sum. A failed final ANN pass leaves vector semantic recall usable but makes semantic graph expansion incomplete until relinking, reprocessing, or repair supplies the missing rows.
+
+## 7. How are graph seeds selected?
+
+Each requested fact type gets at most 20 semantic seeds at the default graph seed floor `0.3`. Link Expansion does not extract entity names from the query; the query embedding selects memory-unit entry points.
+
+The combined semantic/BM25 query normally fetches enough semantic candidates for both the semantic arm and graph seeding. That shared pool is reusable when the semantic result floor is less than or equal to the graph seed floor.
+
+If the request makes the semantic floor stricter than the graph seed floor, the shared pool may omit valid graph seeds. `LinkExpansionRetriever` then runs its own ANN seed query at the graph floor. A `None` seed list requests this fallback; an explicitly empty compatible list means the shared query found no seeds and must not trigger a duplicate query.
+
+No seed means no graph-arm result for that fact type.
+
+## 8. Is Link Expansion really one pass rather than multi-hop?
+
+Yes. For each fact type, Link Expansion runs one combined database query over the fixed seed IDs:
+
+1. Entity expansion self-joins `unit_entities` through the seeds' canonical entities.
+2. Semantic expansion reads both outgoing and incoming semantic links.
+3. Causal expansion reads outgoing causal links.
+4. Python merges and ranks those rows.
+
+Discovered candidates never become a second seed frontier. The main bounds are 20 seeds per fact type, 200 candidates per entity by default, one budget limit per signal query, and a final graph-result cut to the same recall budget.
+
+This is different from PostgreSQL temporal spreading. When a time window exists, the temporal arm starts from up to 10 entry points selected from a 60-candidate in-window semantic pool distributed across 8 time buckets, then can process a mutable frontier in batches of 20, with 10 neighbors per source and at most 5 iterations.
+
+## 9. How does temporal retrieval use causal links?
+
+PostgreSQL temporal spreading reads outgoing `temporal`, `causes`, `caused_by`, `enables`, and `prevents` links. Every target must still pass fact-type, semantic-similarity, tag, and update-time filters before it is admitted.
+
+Propagation uses the parent temporal score, stored link weight, a causal multiplier, and a common `0.7` decay:
+
+```text
+causes / caused_by: multiplier 2.0
+enables / prevents: multiplier 1.5
+temporal:           multiplier 1.0
+
+propagated_temporal = parent_temporal_score * link_weight * multiplier * 0.7
+```
+
+A candidate whose combined temporal score exceeds `0.2` can enter the next frontier, so this arm can follow a causal chain beyond one edge. It remains bounded by the temporal recall budget, frontier batch size, per-source neighbor limit, and iteration cap.
+
+This traversal does not make Link Expansion multi-hop; the two arms can return some of the same facts for different reasons and RRF can reward that agreement.
+
+## 10. How is graph activation calculated, and is it the final score?
+
+Link Expansion deduplicates candidates by memory-unit ID and combines the strongest contribution from each graph signal:
+
+```text
+entity_score   = tanh(distinct_shared_entity_count * 0.5)
+semantic_score = max(semantic_link_weight), or 0
+causal_score   = max(causal_link_weight), or 0
+
+activation = entity_score + semantic_score + causal_score
+```
+
+The entity transform gives approximately `0.462`, `0.762`, `0.905`, and `0.964` for one through four shared entities. Semantic and causal signals each contribute up to `1.0`, so activation approaches `3.0` when the signals converge.
+
+Activation is not the final recall score. It orders only the graph arm. RRF normally consumes graph rank using `1 / (60 + rank)` and combines it with semantic, BM25, and optional temporal ranks; it never compares raw graph activation directly with vector similarity or BM25 scores.
+
+After fusion, candidates may be trimmed, hydrated, cross-encoder reranked, adjusted for recency, temporal proximity, proof count, and configured strategy priority, filtered by minimum scores, and cut by result and token budgets. A graph rank of 1 guarantees neither final rank 1 nor inclusion.
+
+Interleave is the exception to normal downstream scoring: it round-robins the arm lists, skips the cross-encoder and combined recency/temporal/proof scoring, and preserves interleave order through budget and token selection.
+
+## 11. How are observation graph candidates found?
+
+Observations inherit entity evidence from the facts that support them rather than relying on direct observation-to-entity postings. Their entity path is:
+
+```text
+seed observation -> source facts -> source entities -> connected source facts
+                 -> observations supported by those connected facts
+```
+
+Semantic and causal observation expansion still reads `memory_links` directly between observation units. Each backend combines observation entity, semantic, and causal expansion into one database fetch and returns the same three signal groups to the Python activation merge.
+
+PostgreSQL stores observation provenance in the `source_memory_ids` array on `memory_units`; Oracle uses the `observation_sources` junction table. The storage shape differs, but the logical entity path above is the same.
+
+## 12. What differs between PostgreSQL and Oracle?
+
+PostgreSQL is the default built-in backend; Oracle 23ai is optional. Both implement semantic-seeded Link Expansion, including shared-entity expansion, bidirectional semantic-link reads, outgoing causal-link reads, and one fused observation expansion fetch.
+
+The material differences in this flow are:
+
+| Area | PostgreSQL | Oracle |
 |---|---|---|
-| C | shares Alice + TechCorp (entity), 0.82 semantic edge | tanh(2×0.5) + 0.82 ≈ **1.582** |
-| B | shares Python only (entity) | tanh(1×0.5) ≈ **0.462** |
+| Ordinary Link Expansion | Combined entity + semantic + causal query with a 10-second entity-timeout fallback | Combined entity + semantic + causal query; no matching timeout fallback |
+| Observation provenance | `memory_units.source_memory_ids` array | `observation_sources` junction table |
+| Temporal entry points | Similarity-gated, time-windowed entry points | Same logical entry-point selection |
+| Temporal spreading | Runs the bounded `unnest`/lateral frontier loop | Skips spreading and returns entry points only |
 
-Graph arm returns `[C, B]`. The key moment is B: its text has weak query-vector similarity (fraud-detection vs "Alice's tools"), so semantic/BM25 rank it low or miss it — but the stored `Python` topology routes it into the fused pool, where RRF + reranking then decide. That rescue of structurally-obvious-but-semantically-distant facts is the whole point of the arm. Verified mechanics: `tests/test_link_expansion_scoring.py` (3 passed) exercises these formulas.
+Oracle can still construct and store temporal links at retain time. What it lacks in this path is iterative recall-time traversal of those links.
 
-## 9. Line 129: what does Oracle's temporal arm actually return?
+## 13. How does the graph path degrade when data or queries are incomplete?
 
-Oracle's temporal arm returns **only the temporal entry points** — the in-window, similarity-gated, coverage-spread starting units — and never spreads. Both backends share the entry-point stage (`retrieval.py:538-660`): per fact type, fetch a pool of up to 60 similarity-ranked in-window candidates (`_TEMPORAL_POOL_SIZE`), then narrow to ≤10 entry points spread across 8 time buckets (`_TEMPORAL_ENTRY_POINTS`, `_TEMPORAL_COVERAGE_BUCKETS`), each returned as a full result with `temporal_score`/`temporal_proximity` computed from its position inside the window.
+The failure modes are scoped rather than all-or-nothing:
 
-Postgres then runs the bounded multi-hop loop: frontier initialized from the entry points, following outgoing `temporal`/`causal` edges, 20 nodes per batch, 10 neighbors per source, ≤5 iterations, budget-bounded, re-enqueueing only neighbors with combined score > 0.2 (`retrieval.py:663-790`).
+- Missing causal extraction means no causal edge; other recall arms can still find the facts.
+- A chunk or extraction-group boundary can prevent a causal relation from being created.
+- A failed post-commit ANN pass weakens semantic graph expansion but does not remove retained facts or direct vector recall.
+- Entity-resolution errors change shared-entity neighborhoods.
+- Non-observation Link Expansion timeout drops entity expansion for that attempt and keeps semantic plus causal expansion.
+- Observation expansion has no equivalent timeout fallback.
+- Expanded candidates are cut to budget before final tag filtering, so rejected candidates are not backfilled.
+- Causal traversal direction can make an edge reachable from the effect but not the cause.
+- Fusion, reranking, score filters, and token packing can remove a graph candidate after retrieval.
 
-Oracle skips that loop entirely: `supports_unnest = getattr(conn, "backend_type", "postgresql") != "oracle"` (`retrieval.py:693`) — the spreading query is built on `FROM unnest($2::uuid[]) CROSS JOIN LATERAL`, which has no Oracle translation, so the `while` loop never executes and the entry points are the whole result. The code comment states the tradeoff explicitly: semantic/keyword/graph arms cover the rest, so Oracle degrades gracefully rather than erroring.
+The main defaults are a `0.3` graph seed floor, 20 seeds per fact type, a `0.7` semantic-link floor, 200 candidates per entity, a 10-second non-observation timeout, fixed low/mid/high thinking budgets of `100/300/1000`, a disabled per-arm candidate cap (`0`), and an effective reranker candidate cap of 300 unless a per-budget override is configured.
 
-Note the distinction with the `fetch_temporal_neighbors` methods in `ops_oracle.py:506` / `ops_postgresql.py:721`: those are **retain-time** helpers that find dated neighbors when *constructing* temporal links (Oracle runs per-unit backward/forward queries). Oracle can therefore store temporal links even though its recall never traverses them iteratively.
+## 14. Is this a standalone GraphRAG pipeline, and which code is authoritative?
 
-## Verification Appendix
+No. Hindsight uses graph structure to expand recall candidates, but this path does not parse query entities, perform arbitrary graph walks, build community summaries, or generate an answer. The accurate implementation name is **graph retrieval with Link Expansion**.
 
-What was actually run on `dev@278cde1` (worktree `hindsight2`):
+The executable query builders and Python merge are authoritative when nearby comments disagree. In the current source, the module header of `engine/search/link_expansion_retrieval.py` still says all three signals are stored in `memory_links` and describes causal score as `weight + 1.0`; the implementation instead reads entity membership from `unit_entities` and uses raw causal weight. Those header statements are stale and must not be used to interpret runtime behavior.
 
-- `uv run pytest tests/test_link_expansion_scoring.py` → **3 passed** (exercises the tanh/max/additive-activation formulas of Q7).
-- `uv run pytest tests/test_recall_time_range_graph.py tests/test_observation_expansion_scoring.py` → 3 passed (observation expansion), 5 errors in `test_recall_time_range_graph.py`. The errors are an **environment mismatch, not a code failure**: the local test database at `127.0.0.1:5556` has a 1024-dim `vector` column (created under a different embedding model), while the local provider `BAAI/bge-small-en-v1.5` emits 384 dims (`asyncpg DataError: expected 1024 dimensions, not 384`). Not repaired here — fixing it means altering the local test DB schema.
-- All `file:line` citations above were read directly in source; Codex's independently-derived numbers (entity-resolution weights 0.5/0.3/0.2, threshold 0.6; temporal pool 60/10/8) were spot-checked against `entity_resolver.py:1177-1210` and `retrieval.py:408-410` before being included.
+Source paths are relative to `hindsight-api-slim/hindsight_api/`:
 
-Answer provenance: host (direct code reading + test runs) and g-c consultant (read-only Codex consult, session `01a040e6`) produced independent answers to all nine questions; they agreed on every substantive point, and the merged doc above is the result.
+- Fact types and causal extraction: `engine/response_models.py`, `engine/retain/fact_extraction.py`, `engine/causal_links.py`.
+- Entity resolution and postings: `engine/entity_resolver.py`, `engine/retain/link_utils.py`, `engine/retain/orchestrator.py`.
+- Recall orchestration and temporal spreading: `engine/memories/postgres.py`, `engine/search/retrieval.py`.
+- Link Expansion and SQL: `engine/search/link_expansion_retrieval.py`, `engine/db/ops_postgresql.py`, `engine/db/ops_oracle.py`.
+- Fusion and final scoring: `engine/search/fusion.py`, `engine/search/recall_boost.py`, `engine/search/reranking.py`, `engine/memory_engine.py`.
+
+This Q&A documents current source semantics. Live extraction quality, embedding similarity, query plans, latency, recall quality, and final answer quality require separate runtime or benchmark evidence.
