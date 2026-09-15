@@ -4,7 +4,7 @@
 
 Hindsight graph retrieval is a semantic-seeded recall arm that expands stored entity, semantic, and causal connections once, ranks the resulting fact candidates, and contributes that ranked list to the same fusion pipeline as semantic, keyword, and optional temporal retrieval. It is not a standalone GraphRAG answer generator: it neither extracts graph entities from the query nor generates the final answer.
 
-Causal relations have two distinct recall roles. `LinkExpansionRetriever` follows outgoing causal edges for one bounded pass, while PostgreSQL temporal retrieval can follow temporal and causal edges through a bounded multi-hop frontier when the query has a time window. Ordinary retain stores `caused_by` from the effect fact to an earlier cause fact, so edge direction directly determines which causal neighbor a seed can reach.
+Causal relations have two distinct recall roles. `LinkExpansionRetriever` follows outgoing causal edges for one bounded pass, while PostgreSQL temporal retrieval can follow temporal and causal edges through a bounded multi-hop frontier when the query has a time window. Ordinary retain stores `caused_by` from an effect fact to an earlier cause fact extracted from the same group; **earlier** means earlier in that group's fact order, not a memory unit that already existed in the bank. Edge direction directly determines which causal neighbor a seed can reach.
 
 Scope: static source trace of `dev@ef1179c65`, the built-in PostgreSQL and Oracle stores, and `LinkExpansionRetriever`. The example values are illustrative; no live LLM, embedding model, or database run is claimed.
 
@@ -34,9 +34,9 @@ flowchart TD
         D --> F[(memory_units fact nodes)]
         E --> G[(entities and unit_entities postings)]
         F --> G
-        C --> CR[Validate effect-to-earlier-cause references]
-        F --> EFFECT[Effect memory-unit row]
-        F --> CAUSE[Earlier-cause memory-unit row]
+        C --> CR[Validate backward causal references within extraction group]
+        F --> EFFECT[New row for effect fact]
+        F --> CAUSE[New row for earlier cause fact in same extraction group]
         CR --> EFFECT
         EFFECT -->|caused_by; weight 1.0| CAUSE
         EFFECT --> H[(causal memory_links)]
@@ -105,7 +105,7 @@ Retain creates fact nodes first, then connects those nodes through canonical ent
 
 ### 2.2 Causal extraction and persistence
 
-Ordinary LLM-based extraction emits only the canonical `caused_by` relation. A causal reference must target an earlier fact in the same extraction group, so the extracted relation is backward-looking by construction:
+Ordinary LLM-based extraction emits only the canonical `caused_by` relation. A causal reference must target an earlier fact in the same extraction group, so the extracted relation is backward-looking by construction. Both facts normally become new memory-unit rows during the current retain operation; the reference does not identify or search for a historical row already stored in the bank:
 
 ```text
 Fact 0: Maya lost her job.
@@ -115,7 +115,9 @@ Persisted edge:
 MU_RENT --caused_by, weight 1.0--> MU_JOB
 ```
 
-After fact filtering, retain remaps extraction ordinals to the surviving fact sequence. It inserts the `memory_units` rows, obtains their real IDs, maps the current fact to `from_unit_id` and the referenced earlier fact to `to_unit_id`, rejects invalid indices and self-links, and then inserts the causal row. Separately extracted chunks cannot create a direct `caused_by` edge between each other because their fact indices never share one extraction group.
+After fact filtering, retain remaps extraction ordinals to the surviving fact sequence. It inserts the new `memory_units` rows, obtains their real IDs, maps the current fact to `from_unit_id` and the referenced earlier fact from the same extraction group to `to_unit_id`, rejects invalid indices and self-links, and then inserts the causal row. The causal writer does not compare the new units with historical units or search the bank for possible causes. Separately extracted chunks cannot create a direct `caused_by` edge between each other because their fact indices never share one extraction group.
+
+See [Hindsight Causal Extraction Boundary](./causal-extraction-boundary.md) for the extraction-group definition, concrete same-chunk and history-only examples, and the distinction between causal, entity, semantic, and temporal linking.
 
 Transfer import may restore historical `causes`, `enables`, and `prevents` rows. Normal retain does not create those types, but recall accepts them so imported graph evidence remains usable.
 
