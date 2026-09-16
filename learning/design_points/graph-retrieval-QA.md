@@ -43,16 +43,23 @@ PostgreSQL temporal retrieval is a separate fourth recall arm that can also trav
 
 ## 3. How is an ordinary causal link created, and which way does it point?
 
-Ordinary LLM-based retain emits only `caused_by`, and each reference must point to an earlier fact in the same extraction group. After the facts receive real `memory_units` IDs, the current effect becomes `from_unit_id`, the referenced earlier cause becomes `to_unit_id`, and the writer stores weight `1.0`.
+Ordinary LLM-based retain emits only `caused_by`, and each reference must point to an earlier fact in the same extraction group. Both endpoints are columns of the shared `memory_links` table (alongside `link_type`, `weight`, and an optional `entity_id`); temporal, semantic, and causal edges all live in that one table and are distinguished by `link_type`.
+
+The endpoint mapping is fixed by the writer. The fact that carries the reference becomes `from_unit_id`; the referenced target becomes `to_unit_id`:
 
 ```text
 Fact 0: Maya lost her job.              -> MU_JOB
 Fact 1: Maya could not pay rent.        -> MU_RENT
         causal_relations=[{target_index: 0, relation_type: caused_by}]
 
-Stored row:
-MU_RENT --caused_by, weight 1.0--> MU_JOB
+Stored row (memory_links):
+from_unit_id = MU_RENT   (fact 1, the effect, carries causal_relations)
+to_unit_id   = MU_JOB    (target_index 0, the cause being referenced)
+link_type    = caused_by
+weight       = 1.0
 ```
+
+Equivalently: `from_unit_id` is the effect, `to_unit_id` is the cause, so the edge reads `MU_RENT --caused_by, weight 1.0--> MU_JOB`. The mnemonic is "from = the fact holding the reference; to = the fact it points at". One fact can hold both roles across different edges: it is `from_unit_id` for the cause it cites, and `to_unit_id` for a later effect that cites it.
 
 Link Expansion follows causal rows only from a seed's `from_unit_id` to `to_unit_id`. An effect seed `MU_RENT` can therefore retrieve its cause `MU_JOB`; a cause seed `MU_JOB` does not retrieve `MU_RENT` through that same row. Entity or semantic expansion may still connect them independently.
 

@@ -2,7 +2,7 @@
 
 ## Overview
 
-Hindsight graph retrieval is a semantic-seeded recall arm that expands stored entity, semantic, and causal connections once, ranks the resulting fact candidates, and contributes that ranked list to the same fusion pipeline as semantic, keyword, and optional temporal retrieval. It is not a standalone GraphRAG answer generator: it neither extracts graph entities from the query nor generates the final answer.
+Hindsight graph retrieval is a semantic-seeded recall arm that expands stored entity, semantic, and causal connections once, ranks the resulting fact candidates, and contributes that ranked list to the same fusion pipeline as semantic, keyword, and optional temporal retrieval. It is not a standalone GraphRAG answer generator: it neither extracts graph entities from the query nor generates the final answer. The built-in default recall path is generative-LLM-free, including temporal-window analysis; it still uses a query embedding model and optional cross-encoder reranker, which are learned but non-generative retrieval components.
 
 Causal relations have two distinct recall roles. `LinkExpansionRetriever` follows outgoing causal edges for one bounded pass, while PostgreSQL temporal retrieval can follow temporal and causal edges through a bounded multi-hop frontier when the query has a time window. Ordinary retain stores `caused_by` from an effect fact to an earlier cause fact extracted from the same group; **earlier** means earlier in that group's fact order, not a memory unit that already existed in the bank. Edge direction directly determines which causal neighbor a seed can reach.
 
@@ -10,6 +10,7 @@ Scope: static source trace of `dev@ef1179c65`, the built-in PostgreSQL and Oracl
 
 ## Terminology
 
+- **Fact type**: The recall partition assigned to each memory unit. The complete current set is `world`, `experience`, and `observation`: `world` stores objective or external facts, including user preferences, rules, corrections, and constraints; `experience` stores actions, experiences, or observations the assistant or agent actually performed; and `observation` stores consolidated knowledge derived from raw `world` and `experience` facts. Raw extraction produces `world` and `experience`; consolidation produces `observation`. Mental models are separate objects, not another fact type.
 - **Memory unit**: A fact-level `memory_units` row containing text, embedding, fact type, time, tags, and provenance.
 - **Entity posting**: A `unit_entities` row connecting a memory unit to a canonical `entities` row.
 - **Memory link**: A directed `memory_links` row whose type is temporal, semantic, or causal.
@@ -17,6 +18,7 @@ Scope: static source trace of `dev@ef1179c65`, the built-in PostgreSQL and Oracl
 - **Link Expansion**: The built-in one-pass graph retriever; candidates discovered during the pass do not become another frontier.
 - **Temporal spreading**: The separate PostgreSQL temporal-arm traversal that can add newly discovered candidates to a bounded frontier.
 - **Recall arm**: One ranked candidate list: semantic, BM25 keyword, graph, or temporal.
+- **Query analyzer**: The CPU component that converts a natural-language date expression into a temporal window. The default implementation uses explicit period rules followed by `dateparser`, not a generative LLM.
 - **ANN**: Approximate nearest-neighbor vector search, used for semantic recall and semantic-link construction.
 - **RRF**: Reciprocal rank fusion, which combines arm ranks without comparing their raw score scales.
 
@@ -140,6 +142,8 @@ Recall computes the query embedding before entering the store-owned recall bound
 
 Semantic retrieval is the baseline arm. BM25, temporal retrieval, graph retrieval, and cross-encoder reranking are independently enabled by bank configuration and are enabled by default.
 
+The built-in default recall path makes no generative LLM call. Query embedding and optional cross-encoder reranking are model inference but not text generation; semantic, BM25, Link Expansion, temporal spreading, fusion, scoring, and token selection are retrieval or deterministic processing. If temporal retrieval is enabled without an explicit window, the default `DateparserQueryAnalyzer` resolves supported date expressions on CPU. A caller can explicitly inject `TransformerQueryAnalyzer`, which uses local FLAN-T5 generation, but that is an optional replacement rather than the default recall design.
+
 ### 3.1 Seed reuse and fallback
 
 Each fact type receives at most 20 graph seeds. The normal combined semantic query fetches enough rows for both the semantic arm and graph seeding when the semantic result floor is less than or equal to `graph_seed_min_similarity`; candidates clearing the graph floor are reused without another ANN query.
@@ -199,11 +203,53 @@ PostgreSQL reads observation provenance from `source_memory_ids`; Oracle reads i
 
 Temporal retrieval runs only when time-window analysis or the caller supplies a window. It first selects semantically relevant `memory_units` whose event or mention time overlaps the window, then narrows that pool to entry points distributed across the window.
 
+An explicit `temporal_window` bypasses language parsing. Otherwise, the default query analyzer tries built-in period rules before `dateparser` language detection and degrades to no temporal arm when it cannot obtain a supported window; the semantic, keyword, and graph arms still run. Language coverage is intentionally not claimed uniform: Chinese has a dedicated rule set, English and several European languages have common period rules, and Japanese has no dedicated rule set, so ordinary Japanese relative-date sentences may produce no window even when an isolated shared CJK token is recognized. See [Hindsight Temporal Retrieval Flow](./temproral-retrieval-flow.md) for the exact multilingual boundary and embedding-model implications.
+
 On PostgreSQL, the temporal arm can perform up to five spreading iterations. Each iteration reads outgoing `temporal`, `causes`, `caused_by`, `enables`, and `prevents` rows from a bounded frontier, applies a per-source neighbor limit of 10, requires the target to pass the temporal semantic floor and request filters, and admits candidates until the temporal budget is exhausted.
 
 Causal link types affect propagation strength: `causes` and `caused_by` use a `2.0` causal multiplier, `enables` and `prevents` use `1.5`, and temporal links use `1.0`, before the common `0.7` decay. A newly admitted candidate can enter the next frontier when its combined temporal score exceeds `0.2`; this is the multi-hop behavior that Link Expansion intentionally does not have.
 
 Oracle returns the time-window entry points but skips spreading because the current traversal depends on PostgreSQL `unnest`. Therefore “temporal retrieval follows causal chains” is a PostgreSQL capability, not a backend-independent guarantee.
+
+### 5.1 Relationship to Graph-Arm Activation
+
+Graph activation and temporal propagation may consume the same stored causal row, but they are independent arm-local calculations with different inputs and purposes. Their raw values are never added to each other.
+
+| Property | Graph-arm `activation` | Temporal `combined_temporal` |
+|---|---|---|
+| Starting nodes | Up to 20 semantic graph seeds per fact type | Up to 10 semantically relevant in-window entry points per fact type |
+| Signals | Shared entities, bidirectional semantic links, and outgoing causal links | Direct window proximity plus outgoing temporal and causal links |
+| Formula | `tanh(shared_entities * 0.5) + max_semantic_weight + max_causal_weight` | `max(date_proximity, parent_score * link_weight * link_multiplier * 0.7)` |
+| Range | Each signal contributes at most about `1.0`, so activation approaches `3.0` | Not normalized to `1.0`; causal multipliers can produce values above `1.0` |
+| Traversal effect | Orders one-pass graph candidates; discovered candidates do not become seeds | Values above `0.2` can add discovered candidates to the next PostgreSQL frontier |
+| Downstream connection | Fusion consumes the graph candidate's rank | Fusion consumes the temporal candidate's rank; the score also controls continuation and is stored as `temporal_score` |
+
+`link_weight` and `link_multiplier` are separate. `link_weight` is stored on `memory_links`: ordinary retain writes causal links at `1.0`, while a temporal link uses `max(0.3, 1.0 - gap_hours / 24)`, so a 12-hour gap legitimately produces stored weight `0.5`. The runtime multiplier is then selected from the link type: `2.0` for `causes` or `caused_by`, `1.5` for `enables` or `prevents`, and `1.0` for `temporal`. A propagation step over `MU_RENT --temporal, weight 0.5--> MU_JOB` is therefore feasible and multiplies the parent score by `0.5 * 1.0 * 0.7`.
+
+For example, reuse the stored row `MU_MOVE --caused_by, weight 1.0--> MU_RENT` and assume both units share the entity `Maya`.
+
+In Link Expansion, if `MU_MOVE` is a graph seed and `MU_RENT` has no semantic-link contribution, the graph calculation is:
+
+```text
+entity_score = tanh(1 * 0.5) = 0.462
+causal_score = 1.0
+activation   = 0.462 + 0 + 1.0 = 1.462
+```
+
+`MU_RENT` becomes a graph candidate with activation `1.462`, but Link Expansion stops there. It does not use `MU_RENT` as a new seed to follow `MU_RENT --caused_by--> MU_JOB`.
+
+In PostgreSQL temporal spreading, assume instead that `MU_MOVE` is an in-window entry point, so its propagation strength starts at `1.0`, while `MU_RENT` is outside the window and has direct date proximity `0.0`:
+
+```text
+propagated_temporal = 1.0 * 1.0 * 2.0 * 0.7 = 1.4
+combined_temporal   = max(0.0, 1.4) = 1.4
+```
+
+`MU_RENT` is admitted to the temporal arm. Because `1.4 > 0.2` and budget remains, it becomes a new frontier node, so temporal spreading may continue through `MU_RENT --caused_by--> MU_JOB`. The threshold controls continuation, not initial admission: a first-seen eligible target is already appended before the `> 0.2` check.
+
+The two arms meet only at fusion. If `MU_RENT` is rank 1 in both graph and temporal lists, RRF with `k = 60` computes `1 / 61 + 1 / 61`, approximately `0.0328`; it does not compute `1.462 + 1.4`. This lets agreement between independent retrieval paths improve fused rank without pretending that their raw score scales are comparable.
+
+One current implementation caveat narrows the role of `temporal_score`: cross-fact-type temporal aggregation asks for a nonexistent `combined_score` field, so it preserves entry/traversal insertion order rather than explicitly sorting by `temporal_score`. The score still controls frontier continuation and remains attached to the temporal result. See [Hindsight Temporal Retrieval Flow](./temproral-retrieval-flow.md#7-fusion-and-final-ranking) for that downstream boundary.
 
 ## 6. Fusion, Reranking, and Response Selection
 
@@ -217,6 +263,55 @@ Graph retrieval returns candidates, not answers. Every graph candidate must surv
 6. Combined scoring multiplies normalized relevance by recency, temporal proximity, and proof-count adjustments, then applies any configured additive strategy boost. Interleave bypasses this scoring and preserves interleave order.
 7. At most `2 * thinking_budget` scored candidates continue to chunk enrichment and token-budget selection.
 8. The final response includes only candidates that fit the requested result and token constraints.
+
+### 6.1 Optional Per-Arm Candidate Cap
+
+The optional cap truncates each already sorted retrieval-arm list independently before fusion. It applies after results from all requested fact types have been combined, so it is neither one global cap across all arms nor a separate allowance for every fact type.
+
+For example, assume `recall_max_candidates_per_source = 2` and the four best-first arm lists are:
+
+```text
+semantic: [S1, S2, S3, S4]
+BM25:     [K1, K2, K3]
+graph:    [G1, G2, G3]
+temporal: [T1]
+```
+
+The lists entering fusion become:
+
+```text
+semantic: [S1, S2]
+BM25:     [K1, K2]
+graph:    [G1, G2]
+temporal: [T1]
+```
+
+Fusion therefore receives seven arm entries rather than all eleven. The cap keeps the leading candidates in each arm so one over-expanding source cannot consume most of the later global reranker budget. It does not guarantee seven unique memories because the same memory ID may occur in several arms and is deduplicated during fusion. With the default value `0`, no arm is truncated and the original lists pass through unchanged.
+
+### 6.2 Interleave Example
+
+Interleave is an explicit alternative to RRF that gives every non-empty arm's leading candidates early positions. It visits the arm lists in fixed priority order—semantic, BM25, graph, then temporal—taking every available rank-1 item before every rank-2 item, and so on.
+
+For example, assume the best-first lists entering fusion are:
+
+```text
+semantic: [S1, S2, S3]
+BM25:     [K1, K2]
+graph:    [G1]
+temporal: [T1, T2]
+```
+
+The round-robin passes are:
+
+```text
+rank 1: S1, K1, G1, T1
+rank 2: S2, K2,     T2
+rank 3: S3
+```
+
+The fused order is `[S1, K1, G1, T1, S2, K2, T2, S3]`. This preserves the opportunity for each arm's top hit: `T1` receives the fourth position instead of sitting behind the rest of the longer semantic and BM25 lists.
+
+Duplicate memory IDs are emitted only at their first interleave position while retaining rank metadata from every arm. For example, semantic `[X, S2]` plus BM25 `[K1, X]` produces `[X, K1, S2]`; `X` appears once at the semantic rank-1 position and records both `semantic_rank = 1` and `bm25_rank = 2`. Empty or shorter arms are simply skipped. Interleave mode then skips cross-encoder and combined-score reordering so this position-derived order remains authoritative through the later sorts, although final filters and budgets can still remove candidates.
 
 The default budget function is fixed: low, mid, and high map to thinking budgets of 100, 300, and 1000. Adaptive budget mapping is available but is not the default.
 
@@ -302,6 +397,7 @@ Source paths are relative to `hindsight-api-slim/hindsight_api/`; test paths are
 
 - Retain extraction and writes: `engine/retain/fact_extraction.py`, `engine/retain/orchestrator.py`, `engine/retain/link_utils.py`.
 - Recall orchestration: `engine/memories/postgres.py`, `engine/search/retrieval.py`.
+- Temporal query analysis: `engine/query_analyzer.py`, `engine/temporal_periods.py`, `engine/chinese_temporal_periods.py`, `engine/search/temporal_extraction.py`.
 - Link Expansion: `engine/search/link_expansion_retrieval.py`.
 - PostgreSQL and Oracle expansion SQL: `engine/db/ops_postgresql.py`, `engine/db/ops_oracle.py`.
 - Fusion and scoring: `engine/search/fusion.py`, `engine/search/recall_boost.py`, `engine/search/reranking.py`, `engine/memory_engine.py`.
