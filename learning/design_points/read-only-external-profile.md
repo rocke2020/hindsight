@@ -162,7 +162,9 @@ kill <service pid>
 nohup ~/.hindsight/bin/start-hindsight.sh >> ~/.hindsight/logs/server.log 2>&1 &
 ```
 
-One hard-won lesson from this deployment: a restart with the *wrong* launcher (`start-api.sh`) loads the repo `.env` without the launcher's injected database URL, so the service starts a different embedded pg0 instance (`hindsight` on the next free port) whose stale 384-dim rows conflict with the configured 1024-dim embeddings, and startup fails in `ensure_embedding_dimension` — an error that looks like a migration bug but is purely "wrong database instance". If that happens, stop the stray pg0 (`pg_ctl -D ~/.pg0/instances/hindsight/data stop`) and relaunch with the real launcher.
+One hard-won lesson from this deployment: a restart with the *wrong* launcher (`start-api.sh`) loads the repo `.env` without the launcher's injected database URL, so the service starts a different embedded pg0 instance (`hindsight` on the next free port) whose stale 384-dim rows conflict with the configured 1024-dim embeddings, and startup fails in `ensure_embedding_dimension` — an error that looks like a migration bug but is purely "wrong database instance". If that happens, stop the stray pg0 (`pg_ctl -D ~/.pg0/instances/hindsight/data stop`) and relaunch with the real launcher. The stale rows themselves (3 quick-start demo facts plus their documents/entities, from 2026-08-17, 384-dim) were removed from that instance on 2026-09-17 with explicit authorization, so the wrong-launcher path now migrates cleanly instead of crashing. Note for operating the stray instance manually: its `postgresql.conf` defaults to port 5432 (occupied by the real service's database), so `pg_ctl` starts need `-o "-p 5433"`.
+
+The embedding service behind the 1024-dim configuration is **qwen3-embedding:0.6b served by local vllm-metal** at `http://127.0.0.1:18000/v1` (`HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL` in the checkout `.env`). There is no qwen3-embedding on local Ollama — a reference to Ollama port 11434 exists only in the stale, unused `~/.hindsight/hindsight.env` and is wrong.
 
 ### 8.4 Live verification (real outputs, 2026-09-17)
 
