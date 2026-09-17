@@ -119,3 +119,62 @@ The design was then implemented as a draft validator plus a 16-test acceptance p
 Coverage boundaries, stated honestly: the reflect *model's compliance* with the directive is prompt-level (section 5) and is not asserted here; and the probe wires the guard onto the engine fixture directly while loading through the real env-var path is covered separately — a full HTTP-process blackbox story in `hindsight-system-tests/` remains the repo's owed gate if this graduates from design to product feature.
 
 One deployment trap worth restating from section 4: the acceptance test caught nothing at load time when the variable was misspelled — `HINDSIGHT_API_OPERATION_VALIDATOR` (unsuffixed) silently loads no extension, and every protection in this document then evaporates without an error anywhere. The unsuffixed-name test exists precisely to keep that failure mode visible.
+
+## 8. Deployment (Native Hindsight, No Engine Changes)
+
+Deploying the design is three environment variables, one importable module, and one restart — no Hindsight source changes. This exact procedure was applied to the local running service and verified live (section 8.4).
+
+### 8.1 The three environment variables
+
+Add to the environment the service actually loads (for the local service: the checkout's `.env`, sourced by `~/.hindsight/bin/start-hindsight.sh`):
+
+```
+HINDSIGHT_API_OPERATION_VALIDATOR_EXTENSION=tests.profile_guard_draft:ProfileGuard
+HINDSIGHT_API_OPERATION_VALIDATOR_SYNC_API_KEY=<generated secret>
+PYTHONPATH=<checkout>/hindsight-api-slim
+```
+
+Why each line exists:
+
+1. **The extension path** uses the module:class form the loader parses (`extensions/loader.py:49-61`). The variable name must carry the `_EXTENSION` suffix — the unsuffixed spelling silently loads nothing (section 4.2's trap, restated because it is the one failure mode that raises no error anywhere).
+2. **The sync key** is the profile sync service's credential. The HTTP layer reads the Authorization header (Bearer or raw) into `RequestContext.api_key` unconditionally (`api/http.py:5064-5088`), so no tenant extension is required for the sync principal to be distinguishable — the sync service simply sends `Authorization: Bearer <key>` on its pushes. In a deployment *with* a tenant extension, the sync key must be one the extension authenticates, and the draft guard's raw-key comparison should be upgraded to `api_key_id` (background execution reconstructs context with persisted ids and no raw key, `memory_engine.py:3001-3019`).
+3. **`PYTHONPATH`** is required because the service's editable install maps only the `hindsight_api` package, not the project root — `tests.profile_guard_draft` is not otherwise importable at runtime. The guard module must also exist in the checkout the service runs from: the local service runs from the `main` checkout (branch `main`), while the guard is committed on `dev`, so the file is copied there (`hindsight-api-slim/tests/profile_guard_draft.py`, untracked in that checkout). A production deployment should package the guard properly (its own installable module) instead of riding on `tests/`.
+
+The guard loads at startup and logs two lines — the deployment's smoke signal:
+
+```
+INFO - hindsight_api.extensions.loader - Loaded extension ProfileGuard with config keys: ['sync_api_key']
+INFO - root - Loaded operation validator: ProfileGuard
+```
+
+### 8.2 The operational contract
+
+1. **Banks are preprovisioned by the sync service.** With the guard active, every non-sync caller — control plane included — is denied bank creation (`retain` on a missing bank returns 403 "Bank creation is reserved"). Existing banks are unaffected: agent retain, recall, reflect, and curation all pass. Any UI flow that creates new banks must either use the sync credential or be preprovisioned; this is the design's price for closing the whole-bank restore route (section 2), and it is the one behavior change existing local consumers will notice.
+2. **The dual-push procedure** (section 3): on profile change, the sync service first `PATCH`es the directive (same id, new content), then re-retains the memory copy — same fixed `document_id`, `timestamp: "unset"`, `update_mode: "replace"`.
+3. **The MCP surface inherits the same rules** — `create_directive` / `delete_directive` MCP tools are denied for the agent credential while `retain` / `recall` / `reflect` / `update_memory` keep working.
+
+### 8.3 Restarting the local service (what was actually run)
+
+The local service is *not* started by `scripts/dev/start-api.sh`. Its real launcher is `~/.hindsight/bin/start-hindsight.sh`, which sources the main checkout's `.env` (guarded by the `HINDSIGHT_SERVICE_CONFIG_SOURCE` marker), injects `HINDSIGHT_API_DATABASE_URL=pg0://hindsight-openclaw-qwen3` from the script (deliberately not in `.env` — a `.env`-held URL gets picked up by pytest conftest from the same checkout and the database TRUNCATEd), and execs the venv binary on `127.0.0.1:8888`. Logs land in `~/.hindsight/logs/server.log`.
+
+```
+kill <service pid>
+nohup ~/.hindsight/bin/start-hindsight.sh >> ~/.hindsight/logs/server.log 2>&1 &
+```
+
+One hard-won lesson from this deployment: a restart with the *wrong* launcher (`start-api.sh`) loads the repo `.env` without the launcher's injected database URL, so the service starts a different embedded pg0 instance (`hindsight` on the next free port) whose stale 384-dim rows conflict with the configured 1024-dim embeddings, and startup fails in `ensure_embedding_dimension` — an error that looks like a migration bug but is purely "wrong database instance". If that happens, stop the stray pg0 (`pg_ctl -D ~/.pg0/instances/hindsight/data stop`) and relaunch with the real launcher.
+
+### 8.4 Live verification (real outputs, 2026-09-17)
+
+Against the restarted local service (real LLM, real embeddings, real database), all eight probes of the acceptance matrix passed:
+
+1. Agent (no key) `POST .../directives` → 403, `"Operation 'create_directive' is reserved to the profile sync service; the external profile is read-only inside Hindsight."`
+2. Agent retain into a missing bank → 403, `"Bank creation is reserved to the profile sync service."`
+3. Sync retain into the missing bank → 200, bank provisioned.
+4. Sync `POST .../directives` with the data-framed profile content → directive created with a stable id.
+5. Agent retain into the now-existing bank → 200 (curation path preserved).
+6. Agent recall → 200 with results.
+7. Sync `PATCH .../directives/{id}` → in-place update to the v2 content.
+8. Agent `PATCH` on the same directive → 403, and a sync read of the final state confirmed the v2 content untouched.
+
+The service is now running with the design live: the profile directive copy is writable only by the sync key, bank lifecycle is reserved to the sync key, and ordinary agent memory usage is unchanged.
