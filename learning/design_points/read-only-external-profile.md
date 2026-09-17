@@ -7,7 +7,7 @@ An external system owns a user's medical profile and wants the agent's answers t
 1. The **authoritative copy lives outside Hindsight**, with the consuming agent (or its host application). When the agent calls reflect, it injects the current profile into the reflect call itself — Hindsight never stores or protects an authoritative profile at all.
 2. Hindsight holds only a **memory copy** — the profile retained as an ordinary document with a fixed `document_id`, re-retained with `update_mode: "replace"` whenever the external profile changes. This copy is deliberately ordinary: agent-curatable, consolidation-mergeable, recall-visible.
 
-This makes "Hindsight has read-only authority over the profile" true *trivially*: there is nothing authoritative inside Hindsight to modify. No validator, no extension, no engine changes, no operational restrictions — the profile's protection is the external owner's, and Hindsight's copy is a derived cache. An earlier iteration of this design kept the authoritative copy inside Hindsight as a directive protected by an OperationValidator extension; it was implemented, verified live, and then removed in favor of this simpler split — the full history is recorded in section 5.
+This makes "Hindsight has read-only authority over the profile" true *trivially*: there is nothing authoritative inside Hindsight to modify. No validator, no extension, no engine changes, no operational restrictions — the profile's protection is the external owner's, and Hindsight's copy is a derived cache. The investigation that led here — including an implemented-and-then-removed server-side protection design — is recorded in `read-only-external-profile_investigation.md`.
 
 Scope: Hindsight `dev` branch (`hindsight-api-slim/hindsight_api/`). No Hindsight source changes required or made.
 
@@ -34,7 +34,7 @@ query = "The following medical profile is authoritative ground truth for this us
 
 Two rules that matter:
 
-1. **Frame the profile as data, not commands.** The profile is semi-trusted external text; injecting it without framing would make it behavioral instructions — the same prompt-injection surface a directive would have had, but now the agent's own framing controls it. The "authoritative ground truth, treat as facts" wrapper keeps it evidential.
+1. **Frame the profile as data, not commands.** The profile is semi-trusted external text; injecting it without framing would make it behavioral instructions. The "authoritative ground truth, treat as facts" wrapper keeps it evidential.
 2. **The query is also what the reflect model reads first** — the profile text rides in the initial user message, and the model's own tool calls (`recall`, `search_observations`, …) carry their own queries, so retrieval inside reflect is not distorted by the profile prefix.
 
 What this buys: the profile reaches every reflect answer verbatim and current — no server-side freshness problem, because the agent ships the current copy with every call. What it costs: the profile text is paid in prompt tokens on every reflect, and every consuming agent (or host app) must hold its own current copy — freshness becomes the consumer's responsibility. `based_on.directives` evidence citation is not available for this copy (it is not a directive); the profile's presence in the answer is verifiable only by inspection of the answer itself.
@@ -67,27 +67,6 @@ Honest limits, so they are not rediscovered as bugs:
 
 ## 4. Operational Notes
 
-Nothing to deploy. No Hindsight configuration, extension, or env var is part of this design; any previously-installed guard (section 5) is removed by deleting its env lines and restarting. The only operational requirements are the caller's: hold the current profile, frame it as data in reflect queries, and push memory-copy updates with the fixed `document_id` + `replace` recipe of section 2.
+Nothing to deploy. No Hindsight configuration, extension, or env var is part of this design. The only operational requirements are the caller's: hold the current profile, frame it as data in reflect queries, and push memory-copy updates with the fixed `document_id` + `replace` recipe of section 2.
 
 For the local service: restart via the real launcher `~/.hindsight/bin/start-hindsight.sh` (never `scripts/dev/start-api.sh`, which loads `.env` without the launcher's injected `HINDSIGHT_API_DATABASE_URL` and starts a different embedded pg0 instance). Embeddings are qwen3-embedding:0.6b on local vllm-metal at `http://127.0.0.1:18000/v1` (1024-dim).
-
-## 5. History: The Directive-Copy Design and Why It Was Replaced
-
-The first implemented design kept the authoritative profile *inside* Hindsight as a directive (injected into reflect prompts with "NEVER violate" priority, `engine/reflect/prompts.py:40-76`), protected by a custom OperationValidator extension that denied directive writes and bank lifecycle to non-sync principals. The directive table is structurally protectable with no engine changes — its only writers are the three validated CRUD methods (`engine/memory_engine.py:19496-19673`), with whole-bank restore the one direct-write exception (`engine/transfer/importer.py:702-718`), closed by preprovisioning banks and denying agent bank creation. That design was implemented as `tests/profile_guard_draft.py` + a 16-test acceptance probe, deployed to the local service, and verified live with real HTTP 403/200 probes.
-
-It was replaced because its one unavoidable cost was also its weakest point: protecting the restore route required denying bank creation to every non-sync caller (including the control plane), which conflicts with the normal flow where users create their own banks — and the entire mechanism existed only to protect a copy that the agent-side injection makes unnecessary. The simpler question "who needs to hold the authoritative bytes at all" answered "nobody inside Hindsight," and the guard, its env vars, and its behavioral restrictions were removed (2026-09-17). The lessons the implementation taught remain worth keeping:
-
-1. **A guard that runs is not a guard that blocks.** The first version compared operation names against a string deny-set, but `BankWriteOperation` is a StrEnum with lowercase values — nothing matched and protection silently failed until an acceptance test asserted the *denied* path with its rejection reason. Compare against enum members; test denials, not just loads.
-2. **`OperationValidatorExtension` is abstract over the core hooks** — a write-only guard still implements pass-throughs for `validate_retain`/`validate_recall`/`validate_reflect` or instantiation fails.
-3. **Assert state after rejection, not just the raise.** Denial-raises and content-untouched are different properties.
-4. **`preview_prompt(bank_id, "reflect")` renders the exact next reflect system prompt deterministically** — the right surface for prompt-content claims, no LLM needed.
-5. **The unsuffixed env var (`HINDSIGHT_API_OPERATION_VALIDATOR` without `_EXTENSION`) silently loads nothing** — the one failure mode that raises no error anywhere.
-
-Alternatives evaluated and rejected during the design, with their deciding evidence:
-
-1. **Single document carrier + document-scoped validator (no engine change)** — impossible: `BankWriteContext` carries no target id (`extensions/operation_validator.py:447-452`); protecting the document forces denying agent curation bank-wide. Ungated write paths (document import `api/http.py:8337-8358` / `engine/memory_engine.py:7186-7213`; engine-level deletion `memory_engine.py:10100-10159, 10301-10354`; sync-job retry `memory_engine.py:20060-20092`) make document protection leaky regardless.
-2. **Engine change: target ids in `BankWriteContext`** — sound but a real PR (dataclass fields, ~5 call sites, memory-to-document resolution including archived rows, plus guards for import/deletion/retry paths). Unnecessary once authority leaves Hindsight.
-3. **`reflect_mission` / bank config as carrier** — occupies reflect's role section, not evidential content; `MERGE_BANK_MISSION` rewrites mission text via an LLM.
-4. **External gateway mediating all agent access** — a new always-in-the-path component; anyone bypassing it bypasses protection.
-
-The design history was cross-reviewed against source by Codex across three rounds on 2026-09-17 (session `01a0ae11-6de9-7671-ae5c-afc105618768`); the final simplification is the user's call that agent-side authority beats server-side protection.
