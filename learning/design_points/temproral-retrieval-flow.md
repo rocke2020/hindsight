@@ -2,12 +2,12 @@
 
 ## Overview
 
-1. Hindsight temporal retrieval is an optional fourth recall arm. It activates only when recall has a time window, either supplied explicitly as `temporal_window` or extracted from the query relative to `question_date`; an explicit window wins, and disabling temporal retrieval skips both window extraction and the arm.
+1. Hindsight temporal retrieval is an optional fourth recall arm. It activates only when recall has a time window, either supplied explicitly by the caller through the `RecallRequest.temporal_window` field or extracted from the query relative to `question_date`; an explicit window wins, and disabling temporal retrieval skips both window extraction and the arm.
 2. The temporal arm is not a global date filter. It selects semantically relevant entry points whose event or mention time overlaps the requested window, then PostgreSQL may spread outward over stored temporal and causal links. The semantic, keyword, and graph arms remain free to return memories outside the event-time window.
 3. Entry-point selection is bounded and coverage-aware per fact type: fetch up to 60 in-window ANN candidates above the temporal semantic floor, divide the window into 8 buckets, and retain up to 10 entry points by round-robin coverage across populated buckets.
 4. PostgreSQL spreading is a bounded multi-hop candidate expansion over outgoing `temporal`, `causes`, `caused_by`, `enables`, and `prevents` rows.
 5. Temporal candidates join the same fusion, reranking, scoring, and token-selection path as the other recall arms. A memory returned by several arms gains RRF evidence from each rank, but the current first-arm-wins merge can discard the temporal result object's `temporal_proximity` when the same memory appeared earlier in semantic, keyword, or graph results.
-6. The built-in default temporal path is generative-LLM-free: an explicit window is used directly, otherwise CPU period rules and `dateparser` attempt to produce one. Language coverage is uneven, and correct date parsing does not by itself guarantee multilingual semantic relevance because entry-point selection still depends on the configured embedding model.
+6. The built-in default temporal path does not use a generative LLM: it uses a caller-provided window directly; otherwise, it derives a window locally using deterministic date rules first and `dateparser` as a fallback. Language coverage is uneven, and correct date parsing does not by itself guarantee multilingual semantic relevance because entry-point selection still depends on the configured embedding model.
 
 Scope: static source trace of the built-in PostgreSQL memory store on `dev@93a32072f2`. The examples explain executable behavior; they are not live query-analysis, embedding, database-plan, latency, or answer-quality evidence.
 
@@ -45,7 +45,7 @@ flowchart TD
         Q[Query plus optional question_date] --> W{Explicit temporal_window?}
         EW[Explicit validated window] --> W
         W -->|yes| R[Use explicit window]
-        W -->|no| P[CPU period rules then dateparser]
+        W -->|no| P[Deterministic date rules then dateparser]
         R --> I[In-window ANN pool: up to 60 per fact type]
         P -->|window found| I
         P -->|no window or parse failure| OFF[No temporal arm]
@@ -126,6 +126,20 @@ The bank's `enable_temporal_retrieval` setting, enabled by default, is the singl
 2. If the setting is on and the caller supplied `temporal_window`, Pydantic requires `end >= start`, interprets naive bounds as UTC, and passes the inclusive bounds through unchanged. Query-date extraction is skipped.
 3. If the setting is on and no explicit window was supplied, recall analyzes the query. `question_date` is the reference instant for expressions such as “yesterday,” “last month,” and multilingual equivalents; without it, the analyzer uses the current time.
 4. If analysis finds no supported temporal expression, or parsing raises an exception, recall degrades to no temporal arm. The semantic, keyword, and graph arms still run.
+
+For example, a caller that already knows the intended range can send it directly in the recall request:
+
+```json
+{
+  "query": "What did we decide about pricing?",
+  "temporal_window": {
+    "start": "2023-04-01T00:00:00Z",
+    "end": "2023-06-30T23:59:59Z"
+  }
+}
+```
+
+Here, Hindsight uses the supplied inclusive bounds and does not inspect the query text for a date expression. The window influences the temporal arm's ranking; it does not exclude out-of-window results returned by the semantic, keyword, or graph arms.
 
 Natural-language extraction performs CPU work outside the async event loop through a single-worker executor. Period rules are tried before generic date parsing; generic parsing chooses the strongest supported match and turns a point date into that day's start-to-end range. An explicit `temporal_window` is therefore the deterministic interface when the caller already knows the intended range.
 

@@ -146,7 +146,7 @@ The built-in default recall path makes no generative LLM call. Query embedding a
 
 ### 3.1 Seed reuse and fallback
 
-Each fact type receives at most 20 graph seeds. The normal combined semantic query fetches enough rows for both the semantic arm and graph seeding when the semantic result floor is less than or equal to `graph_seed_min_similarity`; candidates clearing the graph floor are reused without another ANN query.
+Each fact type receives at most 20 graph seeds. A memory unit qualifies as a seed only when its semantic similarity to the query clears the graph seed floor, which defaults to `0.3`; this is deliberately lower than the `0.7` semantic-link floor that governs which semantic links are stored, because seeding only needs a rough topical match to start expansion. The normal combined semantic query fetches enough rows for both the semantic arm and graph seeding when the semantic result floor is less than or equal to `graph_seed_min_similarity`; candidates clearing the graph floor are reused without another ANN query.
 
 If a request sets the semantic floor above the graph seed floor, the shared semantic result pool cannot prove that it contains every valid graph seed. `LinkExpansionRetriever` therefore runs its own semantic seed query at the graph floor. `None` means the shared pool is unusable and triggers this query; an explicitly empty shared list means the compatible query ran and found no seeds, so no second query is issued.
 
