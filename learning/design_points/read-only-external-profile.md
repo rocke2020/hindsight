@@ -44,9 +44,9 @@ Two rules that matter:
 
 What this buys: the latest official snapshot available to the agent reaches every reflect call verbatim, without depending on Hindsight recall to surface it. It does not prove freshness beyond the supplied revision or as-of time. The profile text is paid in prompt tokens on every reflect, and every consuming agent (or host app) must track its own latest received snapshot. `based_on.directives` evidence citation is not available for this copy (it is not a directive); the profile's presence in the answer is verifiable only by inspection of the answer itself.
 
-## 2. The Recall Path: The Memory Copy
+## 2. The Retain Path: Creating and Refreshing the Memory Copy
 
-The memory copy exists so relevant profile facts may surface during ordinary recall. Recall is best-effort: Hindsight may return profile facts, newer conversation facts, both, or neither within a particular retrieval budget.
+Retain creates the memory copy from the external profile and refreshes it whenever the external owner publishes a new snapshot. The caller uses a stable `document_id` and `update_mode: "replace"` to replace the previous profile snapshot.
 
 **Write path (the agent, or the external system through the agent):**
 
@@ -73,7 +73,6 @@ Example retain item:
 - **Forcing re-extraction.** Ordinary same-content retain can skip extraction via delta processing; `reprocess_document` sets `force_reextract=True` for this reason (`engine/retain/orchestrator.py:1765-1777`, `engine/memory_engine.py:12844-12852`). Pass it when a push must re-extract identical text.
 - **Observations refresh asynchronously.** Consolidation submission requires settings enabled, and submission errors are logged without failing the retain (`engine/memory_engine.py:5729-5739`). A successful retain does not guarantee refreshed derived observations.
 - **Version ordering is last-writer-wins** (`engine/retain/orchestrator.py:864-868`). Serialize pushes per user; a retried older snapshot must not overwrite a newer one.
-- **This copy is deliberately ordinary.** The agent may curate its facts (`update_memory` / `invalidate_memory`), consolidation may merge them into observations, and other retained conversation content may contradict them. Source-of-record authority never lives in this memory copy; it remains with the external owner, while the agent-side copy only transports the latest snapshot the agent has received.
 
 **Timestamp semantics:** use the external owner's trustworthy snapshot as-of time, not the agent's ingestion or synchronization time. Hindsight maps the item timestamp to each extracted fact's `mentioned_at`, meaning when the source material stated the fact (`engine/retain/fact_extraction.py:2209-2211`); temporal retrieval can use that field (`engine/search/retrieval.py:573-582`), and consolidation treats it as statement recency (`engine/consolidation/prompts.py:59-68`). Keep diagnosis dates, medication start/end dates, allergy discovery dates, procedures, and other clinical event times inside the profile content so extraction can represent them separately as `occurred_start` / `occurred_end`.
 
@@ -81,7 +80,13 @@ Do not use a generic `profile_updated_at` if it only means that one field change
 
 Use `timestamp: "unset"` only when no trustworthy snapshot-wide as-of time exists. It makes extracted facts' `mentioned_at` null, so facts without extracted occurrence dates are absent from the temporal retrieval arm, although semantic, BM25, or graph recall may still find them. Current consolidation behavior also replaces a missing observation `mentioned_at` with consolidation time (`engine/consolidation/consolidator.py:3333-3337`), so `unset` does not preserve end-to-end timelessness once observations are created.
 
-## 3. Newer Conversation Evidence and a Stale Profile
+## 3. The Recall Path: Retrieving Profile Facts
+
+The memory copy exists so relevant profile facts may surface during ordinary recall. Recall is best-effort: Hindsight may return profile facts, newer conversation facts, both, or neither within a particular retrieval budget.
+
+**This copy is deliberately ordinary.** The agent may curate its facts (`update_memory` / `invalidate_memory`), consolidation may merge them into observations, and other retained conversation content may contradict them. Source-of-record authority never lives in this memory copy; it remains with the external owner, while the agent-side copy only transports the latest snapshot the agent has received.
+
+## 4. Newer Conversation Evidence and a Stale Profile
 
 A newer user statement does not mutate the external owner's profile document. It is separate, dated evidence that may conflict with the official snapshot until the external owner updates its source of record.
 
@@ -95,7 +100,7 @@ For example:
 
 This is why the stable `document_id` and replacement policy are still necessary even though Hindsight evolves memories internally. Extraction and consolidation transform retained evidence; they do not synchronize an outdated external source or establish which conflicting medical claim is true.
 
-## 4. Residual Risks
+## 5. Residual Risks
 
 Honest limits, so they are not rediscovered as bugs:
 
@@ -105,7 +110,7 @@ Honest limits, so they are not rediscovered as bugs:
 4. **Dual-consumer freshness is the host's job.** With no server-side authoritative copy, each consumer must track profile version itself; two consumers can briefly disagree if their copies update at different times.
 5. **Recallable form is extracted facts, not verbatim text.** The memory copy surfaces as LLM-extracted facts linked to entities; the verbatim profile survives as `documents.original_text` (fetchable via `get_document`) and travels in every reflect call.
 
-## 5. Operational Notes
+## 6. Operational Notes
 
 Nothing to deploy. No Hindsight configuration, extension, or env var is part of this design. The caller must hold the latest official snapshot it has received, carry its revision or as-of time, retain newer conversations as separate dated evidence, disclose unresolved conflicts, and push memory-copy updates with the stable `document_id` + `replace` recipe of section 2.
 

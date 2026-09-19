@@ -2,10 +2,10 @@
 
 ## Overview
 
-1. Hindsight temporal retrieval is an optional fourth recall arm. It activates only when recall has a time window, either supplied explicitly by the caller through the `RecallRequest.temporal_window` field or extracted from the query relative to `question_date`; an explicit window wins, and disabling temporal retrieval skips both window extraction and the arm.
-2. The temporal arm is not a global date filter. It selects semantically relevant entry points whose event or mention time overlaps the requested window, then PostgreSQL may spread outward over stored temporal and causal links. The semantic, keyword, and graph arms remain free to return memories outside the event-time window.
-3. Entry-point selection is bounded and coverage-aware per fact type: fetch up to 60 in-window ANN candidates above the temporal semantic floor, divide the window into 8 buckets, and retain up to 10 entry points by round-robin coverage across populated buckets.
-4. PostgreSQL spreading is a bounded multi-hop candidate expansion over outgoing `temporal`, `causes`, `caused_by`, `enables`, and `prevents` rows.
+1. **The current PostgreSQL temporal arm combines date ranges, query semantic similarity, and graph traversal.** It selects entry memories using the date window and semantic similarity, expands over outgoing `temporal`, `causes`, `caused_by`, `enables`, and `prevents` links, and computes propagation scores from the current edge's weight and relation multiplier. Eligible new targets become candidates; targets whose combined score exceeds `0.2` can become later source nodes while budget and iteration limits permit. Both temporal and causal edges participate in this bounded multi-hop traversal; a causal edge can be followed even when no temporal edge connects the same memories.
+2. Hindsight temporal retrieval is an optional fourth recall arm. It activates only when recall has a time window, either supplied explicitly by the caller through the `RecallRequest.temporal_window` field or extracted from the query relative to `question_date`; an explicit window wins, and disabling temporal retrieval skips both window extraction and the arm.
+3. The temporal arm is not a global date filter. The event/mention-time window constrains entry memories and is not reapplied to spread targets; query semantic similarity and the other eligibility filters still apply during spreading. The semantic, keyword, and graph arms also remain free to return memories outside the event-time window.
+4. Entry-point selection is bounded and coverage-aware per fact type: fetch up to 60 in-window ANN candidates above the temporal semantic floor, divide the window into 8 buckets, and retain up to 10 entry points by round-robin coverage across populated buckets.
 5. Temporal candidates join the same fusion, reranking, scoring, and token-selection path as the other recall arms. A memory returned by several arms gains RRF evidence from each rank, but the current first-arm-wins merge can discard the temporal result object's `temporal_proximity` when the same memory appeared earlier in semantic, keyword, or graph results.
 6. The built-in default temporal path does not use a generative LLM: it uses a caller-provided window directly; otherwise, it derives a window locally using deterministic date rules first and `dateparser` as a fallback. Language coverage is uneven, and correct date parsing does not by itself guarantee multilingual semantic relevance because entry-point selection still depends on the configured embedding model.
 
@@ -70,11 +70,36 @@ The implementation carries four distinct notions of time. Treating them as one �
 | Time concept | Source | Consumer | Boundary |
 |---|---|---|---|
 | `occurred_start` / `occurred_end` | Retain-time fact extraction or imported fact data | Temporal entry overlap, temporal proximity, response metadata | Describes when the event happened. |
-| `mentioned_at` | The retained source item's `event_date` | Fallback entry overlap and proximity when event time is absent | Describes when the source mentioned the fact. |
+| `mentioned_at` | The retain item's `timestamp`, called `event_date` internally | Independent entry-time match; fallback proximity when event time is absent | Describes when the source mentioned the fact. |
 | `question_date` | Recall caller | Relative-date parsing and final recency-scoring anchor | “Last week” is resolved relative to this value; it is not itself a result filter. |
 | `created_after` / `created_before` | Recall caller | Every retrieval arm, including temporal entry points and spread targets | Despite the names, these are exclusive bounds on `memory_units.updated_at`, not event time. |
 
-`memory_units.event_date` is a compatibility and indexing field derived at write time as `occurred_start` when available, otherwise `mentioned_at`. Retain-time temporal-link construction reads this effective value. Recall-time entry selection instead uses the richer interval and mention fields directly so a period can overlap a query window even when its start is outside the window.
+`memory_units.event_date` stores one representative date for code that expects a single timestamp and for building temporal links during retain. At insertion, it takes `occurred_start` when available, otherwise `mentioned_at`; the separate start, end, and mention fields remain stored too ([write implementation](../../hindsight-api-slim/hindsight_api/engine/memories/pg/writes.py#L81)). This database column differs from the retain item's internal `event_date`, which supplies `mentioned_at`. For a September 18 profile snapshot saying "Diagnosed on March 10," an extracted diagnosis with `occurred_start = March 10` has `mentioned_at = September 18` and stored `memory_units.event_date = March 10`.
+
+During recall, Hindsight chooses starting memories for temporal search by checking when each event happened and when its source mentioned it. It checks `occurred_start`, `occurred_end`, and `mentioned_at` directly. A memory passes the time check if **any** of these conditions holds:
+
+1. Its event period overlaps the query window: the event starts on or before the window ends, and ends on or after the window starts.
+2. Its `mentioned_at` falls inside the window, even if event dates are also present.
+3. Its `occurred_start` falls inside the window.
+4. Its `occurred_end` falls inside the window.
+
+The bounds are inclusive. When both event endpoints exist, the overlap condition in the [recall SQL](../../hindsight-api-slim/hindsight_api/engine/search/retrieval.py#L574) is:
+
+```text
+occurred_start <= query_window_end
+AND occurred_end >= query_window_start
+```
+
+For example, suppose the query window is **March 10–15, 2026**. Assume extraction produced the fields below; all dates use the same year and time zone.
+
+| Memory | `occurred_start` | `occurred_end` | `mentioned_at` | Stored `event_date` | Why it passes the time check |
+|---|---|---|---|---|---|
+| Trip lasting March 1–20 | March 1 | March 20 | March 25 | March 1 | The trip contains the entire March 10–15 window. Both event endpoints and the mention time are outside the window, but the periods overlap. |
+| Trip lasting March 1–12 | March 1 | March 12 | March 25 | March 1 | The trip overlaps March 10–12. Its start is outside the window, but part of the trip is inside. |
+| "I prefer quiet hotels," with no event dates extracted | null | null | March 12 | March 12 | The source mentioned the preference inside the window. This also illustrates the write-time fallback from a missing `occurred_start` to `mentioned_at`. |
+| Trip lasting March 1–5, mentioned on March 12 | March 1 | March 5 | March 12 | March 1 | The event does not overlap the window, but its mention time does. Mention-time matching is independent of event-time matching. |
+
+Checking only whether stored `event_date` falls inside March 10–15 would miss both overlapping trips and the earlier trip mentioned on March 12. The separate event and mention fields preserve those matches. Passing the time check makes a memory eligible for the temporal candidate pool; semantic similarity, scope filters, candidate limits, entry-point coverage selection, and later ranking still determine whether it reaches the final response.
 
 The practical API distinction is:
 
@@ -203,18 +228,45 @@ A zero-width window gives its matching entries proximity `1.0`. The result expos
 
 PostgreSQL starts with the selected entry-point IDs as a mutable frontier. Spreading is performed separately for each fact type and admits candidates until that fact type's thinking budget is exhausted.
 
+`propagated_temporal` is the score inherited from a parent through the current edge within the temporal recall arm. The name identifies the recall arm, not the edge type: both temporal and causal edges feed this same calculation. For example, `A --caused_by--> B` can contribute a propagation score for B even when no temporal edge connects A and B. The target's own date proximity is a separate value, combined with the inherited score using `max`.
+
 For each frontier batch, the query reads outgoing rows whose link type is `temporal`, `causes`, `caused_by`, `enables`, or `prevents` and whose stored weight is at least `0.1`. It takes at most 10 highest-weight links per source, then keeps targets that belong to the same bank and fact type, have an embedding, clear the temporal semantic floor, and pass tag, tag-group, and update-time filters.
 
-For a newly discovered target:
+PostgreSQL constrains every stored `link_weight` to the inclusive range `[0.0, 1.0]`, and the `>= 0.1` spreading filter narrows the traversable range to `[0.1, 1.0]`. The current retain path produces a narrower range: temporal links use `[0.3, 1.0]` from the time-gap formula in Section 3, while causal links are written with exactly `1.0`. Therefore the temporal row's `0.5` below is one valid example within its range rather than a constant.
+
+For a newly discovered target, `relation_multiplier` below denotes the runtime variable `causal_boost`, selected from the current edge's type in the [scoring implementation](../../hindsight-api-slim/hindsight_api/engine/search/retrieval.py#L765):
 
 ```text
-causal_multiplier = 2.0 for causes or caused_by
-                    1.5 for enables or prevents
-                    1.0 for temporal
+relation_multiplier = 2.0 for causes or caused_by
+                      1.5 for enables or prevents
+                      1.0 for temporal
 
-propagated_temporal = parent_temporal_score * link_weight * causal_multiplier * 0.7
+propagated_temporal = parent_temporal_score * link_weight * relation_multiplier * 0.7
 combined_temporal   = max(target_midpoint_proximity, propagated_temporal)
 ```
+
+This is one propagation formula applied to the current edge. Both `link_weight` and `relation_multiplier` come from that edge's row and type:
+
+| Current edge | `link_weight` | `relation_multiplier` | Substitution into the same formula |
+|---|---|---|---|
+| `temporal`, assuming a stored weight of `0.5` | `0.5` | `1.0` | `parent_temporal_score * 0.5 * 1.0 * 0.7` |
+| `caused_by`, with a stored weight of `1.0` | `1.0` | `2.0` | `parent_temporal_score * 1.0 * 2.0 * 0.7` |
+
+Each calculation uses only one edge's parameters. Even if `A -> B` has both edge types, the implementation does not combine the temporal edge's `0.5` weight with the causal edge's `2.0` multiplier. The temporal weight `0.5` is illustrative, not a fixed value for all temporal edges.
+
+The [processing loop](../../hindsight-api-slim/hindsight_api/engine/search/retrieval.py#L734) executes in this order:
+
+```text
+Read one returned edge row
+  -> Is target B already visited? Yes: skip without calculating a score
+  -> Otherwise: mark B visited
+  -> Select the multiplier for this edge's type
+  -> Apply the propagation formula once, then calculate combined_temporal
+```
+
+The `visited` set admits a memory only on the first encountered path, so a later stronger path neither replaces its score nor gives it a second result row. This also applies to two differently typed edges connecting the same pair of nodes. "First encountered" means returned-row processing order; the query has no outer `ORDER BY` guaranteeing that the causal row is processed first.
+
+For the same parent strength of `1.0`, the two illustrative substitutions yield `0.35` and `1.40`: the causal propagation value is four times the temporal propagation value. These are two alternative outcomes, not two calculations that the runtime performs for the same target before choosing the larger one. The final `combined_temporal` values need not differ by four times because each also considers the target's own date proximity.
 
 Every first-seen eligible target is appended to the temporal arm and consumes one budget slot. Only a target with `combined_temporal > 0.2` joins the next frontier. The score can exceed `1.0` because causal multipliers are greater than one.
 
@@ -225,7 +277,7 @@ The traversal is bounded by:
 - 10 outgoing links per source;
 - at most 5 loop iterations.
 
-The five-iteration cap counts processed frontier batches, not a clean five-hop depth. A wide frontier can spend several iterations processing nodes at the same depth. The `visited` set admits a memory only on the first encountered path, so a later stronger path neither replaces its score nor gives it a second result row.
+The five-iteration cap counts processed frontier batches, not a clean five-hop depth. A wide frontier can spend several iterations processing nodes at the same depth.
 
 Two scope details are easy to miss:
 
