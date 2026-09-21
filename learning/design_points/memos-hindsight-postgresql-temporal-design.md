@@ -1,8 +1,8 @@
-# Memos + Hindsight: Temporal Recall with ANN Semantic Search and Multi-Hop Spreading
+# MemOS + Hindsight: Temporal Recall with ANN Semantic Search and Multi-Hop Spreading
 
 ## Overview
 
-1. The specified Memos checkout is `usememos/memos`, not MemTensor/MemOS. Its temporal behavior is document-time browsing: filter and order memos by mutable `created_ts` or `updated_ts`. It has no event-time interval, mention time, time-aware semantic rank, temporal graph, or temporal spreading.
+1. The specified checkout is MemTensor/MemOS, package `MemoryOS`. MemOS preserves source-message `chat_time`, stores memory-node `created_at` / `updated_at`, exposes metadata comparison filters, and declares a search `reference_time`; however, the inspected core search does not consume `reference_time`, does not promote source time into a structured event interval, and does not perform temporal ranking or temporal-edge spreading.
 2. Hindsight separates event time (`occurred_start` / `occurred_end`), mention time (`mentioned_at`), and processing time, then adds a temporal recall arm. Its normal fact/event extraction during indexing is generative, while its current default recall window analyzer and retrieval path are non-generative.
 3. ANN semantic retrieval and multi-hop spreading are both required foundations of the first version. PostgreSQL with pgvector HNSW finds semantically relevant entry points; traversal of PostgreSQL temporal edges then discovers additional evidence without a fixed hop limit. Hop decay and a continuation threshold control which discovered nodes keep spreading; visited-node deduplication, the node budget, and the request deadline bound execution. A two-hop discovery is the minimum acceptance example, not the maximum supported depth.
 4. An allowlisted generative indexer may extract atomic facts, event/reference roles, and implicit or relative time during asynchronous indexing. Recall makes no generative call: it embeds the query once, retrieves ANN and FTS candidates, expands the temporal graph, fuses ranks, and returns evidence. An explicit `time_basis = event | referenced | mentioned | created | updated` and half-open window constrain seeds, every intermediate node, and final results.
@@ -11,7 +11,8 @@ This design incorporates the current flow and caveats documented in [`temproral-
 
 ## Terminology and Scope
 
-- **Source created/updated time**: The document timestamps exposed by Memos. They are user/import mutable in the current API and must not be described as immutable ingestion clocks.
+- **Source message time**: MemOS `SourceMessage.chat_time`, preserved as provenance text supplied by the caller or parser. It is not a normalized event interval in the inspected core path.
+- **Source created/updated time**: The source-document timestamps copied into the target projection. They remain separate from MemOS node lifecycle timestamps and from event time.
 - **Event time**: When the described event happened, stored as an `event` time-span annotation.
 - **Referenced time**: A date or period mentioned by the source that is not asserted as the occurrence time of the indexed fact.
 - **Mention time**: When the source recorded or mentioned the content. It remains distinct from event time even when only one of them is known.
@@ -30,35 +31,33 @@ This design incorporates the current flow and caveats documented in [`temproral-
 - **Generative indexer**: An asynchronous, schema-constrained model call that derives atomic facts and temporal annotations from one source chunk. Its output is a rebuildable projection, never authoritative source text.
 - **Non-generative encoder**: An embedding or cross-encoder model that returns vectors or relevance scores rather than generated text. The embedding encoder is required for normal ranked recall; a scoring-only cross-encoder remains optional. Model identity is fixed per projection.
 
-Scope: Hindsight retrieval source rechecked at `df7e126d88d8eec88a3d1804ba603315536ac174`, using the current working-tree version of `temproral-retrieval-flow.md`; the Memos comparison retains the previously inspected `019ca26bd316c9dea7f18b90b05d1df5e2f4c1dc` snapshot. This is a PostgreSQL design, not an implemented Hindsight change. No live database plan, latency, recall-quality, parser-accuracy, or multilingual evaluation is claimed.
+Scope: Hindsight retrieval source rechecked at `df7e126d88d8eec88a3d1804ba603315536ac174`, using the current working-tree version of `temproral-retrieval-flow.md`; the MemOS comparison uses `176d4f676a93e0e34ca9fd50091eff5ad3236506`. This is a PostgreSQL design, not an implemented Hindsight change. No live database plan, latency, recall-quality, parser-accuracy, or multilingual evaluation is claimed.
 
 ## 1. Source-Backed Comparison
 
-Memos offers useful time-field filtering and deterministic UI range construction; Hindsight offers richer generative event/fact indexing and relevance-aware temporal retrieval. Neither current system exactly implements the proposed combination of targeted generative indexing and strict non-generative recall.
+MemOS offers source-message time provenance, memory lifecycle timestamps, and general metadata filtering alongside relevance retrieval; Hindsight offers richer generative event/fact indexing and relevance-aware temporal retrieval. Neither current system exactly implements the proposed combination of targeted generative indexing and strict non-generative recall.
 
-| Concern | Memos | Hindsight | New design |
+| Concern | MemOS | Hindsight | New design |
 |---|---|---|---|
-| Retrieval unit | Whole memo | LLM-extracted fact, observation, or raw chunk in chunks mode | Grounded extracted fact with raw-chunk fallback, revision, and ordinal |
-| Time fields | Mutable create/update timestamps | Event interval, mention time, derived compatibility `event_date`, create/update time | Keep event, referenced, mention, create, update, and index time separate |
-| Event-time indexing | None | Usually extracted by a generative LLM; chunks mode has no event extraction | Explicit metadata first; targeted generative fact/time extraction with validation and source provenance; deterministic fallback |
-| PostgreSQL time indexes | Space/status/create-time composite index | B-tree/partial indexes on event and mention fields; stored temporal edges | GiST spans, point-time B-trees, required HNSW, and indexed temporal-edge endpoints |
-| Query window | CEL created/updated range | Explicit window or default non-generative dateparser analysis | Explicit window is authoritative; deterministic analysis is optional fallback |
-| Window meaning | Strict filter on chosen document timestamp | Seeds only the temporal arm; other arms and spread targets may be outside it | Strict eligibility for every arm, graph endpoint, supporting annotation, and hydrated result |
-| Relevance | Pinned/time sort; content substring filters | Vector-gated temporal entries, coverage selection, graph spreading, RRF/rerank | ANN + FTS + multi-hop spreading, RRF, optional final coverage and scoring-only rerank |
-| Graph behavior | None | Temporal/causal multi-hop spreading in PostgreSQL | Required same-basis multi-hop expansion without a fixed depth limit; score continuation plus node/deadline bounds |
-| Generative call | None for list/filter | Normal retain extraction uses an LLM; default recall date analysis does not | Allowed only during asynchronous indexing; prohibited during recall |
+| Retrieval unit | Typed textual-memory node with source provenance, metadata, embedding, status, and history | LLM-extracted fact, observation, or raw chunk in chunks mode | Grounded extracted fact with raw-chunk fallback, revision, and ordinal |
+| Time fields | Source `chat_time`; node `created_at` / `updated_at`; archived-version `timespec` schema | Event interval, mention time, derived compatibility `event_date`, create/update time | Keep event, referenced, mention, source create/update, and index time separate |
+| Event-time indexing | No active structured event-interval projection in the inspected core path | Usually extracted by a generative LLM; chunks mode has no event extraction | Explicit metadata first; targeted generative fact/time extraction with validation and source provenance; deterministic fallback |
+| PostgreSQL time support | TIMESTAMPTZ node columns and comparison-filter builder; no dedicated time index beyond generic JSONB/node indexes | B-tree/partial indexes on event and mention fields; stored temporal edges | GiST spans, point-time B-trees, required HNSW, and indexed temporal-edge endpoints |
+| Query window | General metadata `filter`; `reference_time` is declared but not passed into core TreeTextMemory search | Explicit window or default non-generative dateparser analysis | Explicit window is authoritative; deterministic analysis is optional fallback |
+| Window meaning | Backend-dependent candidate filter, not a system-wide temporal contract; the PostgreSQL vector path ignores the rich `filter` argument | Seeds only the temporal arm; other arms and spread targets may be outside it | Strict eligibility for every arm, graph endpoint, supporting annotation, and hydrated result |
+| Relevance | Vector/key/tag candidates, optional BM25/full text, reranking/dedup | Vector-gated temporal entries, coverage selection, graph spreading, RRF/rerank | ANN + FTS + multi-hop spreading, RRF, optional final coverage and scoring-only rerank |
+| Graph behavior | Optional `PARENT` hierarchy; `FOLLOWS` generation is inactive and marked TODO for recall | Temporal/causal multi-hop spreading in PostgreSQL | Required same-basis multi-hop expansion without a fixed depth limit; score continuation plus node/deadline bounds |
+| Generative call | Fast recall is non-generative; fine query parsing and optional reorganization use LLMs | Normal retain extraction uses an LLM; default recall date analysis does not | Allowed only during asynchronous indexing; prohibited during recall |
 
-### 1.1 Memos
+### 1.1 MemOS
 
-Memos stores `created_ts` and `updated_ts` as epoch-second columns on each memo. PostgreSQL's main memo index is `(space_id, row_status, created_ts DESC, id DESC)`; there is no corresponding current index for `updated_ts`, event intervals, or temporal relevance.
+MemOS preserves each chat source's caller/parser-supplied `chat_time` inside `SourceMessage` provenance. Tree memory nodes separately carry `created_at` and `updated_at`; the PostgreSQL backend stores those as TIMESTAMPTZ columns while retaining other metadata in JSONB. `MemoryManager` commonly refreshes `updated_at` when adding or updating a node, so node timestamps describe memory lifecycle, not necessarily when the represented event occurred.
 
-Both timestamps are document attributes rather than immutable system history. Create accepts supplied timestamp values, and update masks allow callers to replace both `create_time` and `update_time`. A temporal design must therefore label them source/display time and preserve their provenance instead of treating them as trusted ingestion order.
+The public search request accepts a general nested metadata `filter` with comparison operators and declares `reference_time` for time-sensitive parsing. In the inspected core flow, `search_text_memories` forwards the filter but not `reference_time`; no other core consumer uses that field. `chat_time` remains nested provenance rather than a normalized top-level temporal predicate. `ArchivedTextualMemory.timespec` is a declared snapshot field, but the current repository has no retrieval consumer for it.
 
-`updated_ts` is also caller-path dependent rather than trigger-maintained: the standard web editor includes `update_time`, and dedicated relation/attachment setters advance it, but a direct API content update that omits the field need not change it. It is useful organization metadata, not a complete change log.
+Temporal filtering is also backend-dependent. Neo4j and PolarDB implement richer filter builders. The PostgreSQL backend has a timestamp-aware filter builder for deletion, but `search_by_embedding` ignores its `filter` argument and applies only simple equality `search_filter` conditions; `get_all_memory_items` likewise accepts but does not apply `filter`. Consequently the current PostgreSQL path does not establish strict created/updated-time filtering across every recall arm.
 
-`ListMemos` accepts CEL predicates over `created_ts` and `updated_ts`, applies access and state predicates, then orders by pinned plus either create or update time with ID as the final tie-break. The calendar UI converts a local day or month into a half-open epoch range and filters the selected time basis. This is deterministic and useful for browsing, but it is not event-time extraction or relevance-ranked temporal recall.
-
-References and comments do not add time semantics. Comments are excluded from the ordinary list by default, and relation lookup does not traverse or rank by timestamps.
+MemOS has graph-shaped temporal scaffolding but not an active temporal recall graph. `RelationAndReasoningDetector` defines a `FOLLOWS` builder based on node `updated_at`, yet the caller block is inactive and the code itself marks time-sequence recall TODO. Standard search ranks semantic/key/tag/BM25 candidates and does not spread through `FOLLOWS`. The design can reuse MemOS's provenance distinction and API-level filter vocabulary, but it cannot claim event intervals, date-proximity scoring, or multi-hop temporal discovery from the inspected revision.
 
 ### 1.2 Hindsight
 
@@ -82,9 +81,9 @@ Current temporal score metadata also has downstream gaps: the temporal list is n
 
 ### 1.3 Reuse, Correct, and Omit
 
-Reuse from Memos:
+Reuse from MemOS:
 
-- Explicit create/update time basis, half-open calendar ranges, authorization before pagination, stable ID tie-breaks, and ordinary chronological browsing.
+- Source-message time provenance, separate memory lifecycle timestamps, explicit metadata filter syntax, vector retrieval, and the separation between fast non-generative recall and slower generative modes.
 
 Reuse from Hindsight and `temproral-retrieval-flow.md`:
 
@@ -98,7 +97,7 @@ Correct in the new design:
 - Give temporal links an explicit time basis and symmetric traversal. Track hop depth for explanation and tie-breaking; SQL batching and hop depth do not impose traversal cutoffs.
 - Treat generated facts and temporal annotations as rebuildable, source-grounded projections: validate their schema and source spans, preserve extractor identity, and retain raw chunks as evidence and fallback.
 - Preserve factual timestamps exactly and use `unit_ordinal` for deterministic ordering.
-- Treat Memos timestamps as mutable source fields and Hindsight `event_date` as a compatibility key, not an independent time truth.
+- Treat MemOS `chat_time` as source provenance, MemOS node timestamps as lifecycle metadata, and Hindsight `event_date` as a compatibility key; none is an independent event-time truth.
 - Publish deterministic parsing and embeddings only for the current document revision.
 
 Omit from the first version:
@@ -274,13 +273,13 @@ This is a bounded-proposal graph over indexed evidence, not an always-current ex
 
 Indexing spends generative-model latency only where it adds durable retrieval value. All model work happens outside the user-facing recall path, and every derived unit remains traceable to immutable source evidence.
 
-1. In one short transaction, authorize the write, lock the document, increment `current_revision`, store exact Memos-style source created/updated timestamps plus their provenance, and enqueue an idempotent job for `(scope_id, document_id, revision, indexer_version)`.
+1. In one short transaction, authorize the write, lock the document, increment `current_revision`, store exact caller-supplied source-message/source-document timestamps plus their provenance, and enqueue an idempotent job for `(scope_id, document_id, revision, indexer_version)`.
 2. A worker claims the job and releases the database connection. It chunks the source deterministically by existing text/structured boundaries and prepares each raw chunk for publication as source evidence and a recall-eligible fallback unit. Once published, a chunk remains eligible even when only part of it is represented by accepted facts.
 3. Caller-supplied structured event metadata creates authoritative `event` annotations before model extraction and should identify an exact source span or explicit structured item. After extraction, an annotation moves to an accepted fact only when that fact's supporting span covers the annotation span; an unmapped or chunk-level annotation remains attached to the recall-eligible raw chunk. Generated annotations for the same supported assertion cannot replace or compete with the caller value in recall; conflicting generated values are rejected from the published projection and counted for evaluation.
 4. When the generative indexer is enabled, call it independently for each bounded chunk with the captured reference time and timezone. Its strict output schema contains atomic fact text, an exact supporting source span, and zero or more temporal annotations with `role`, bounds, granularity, meaning, and supporting span. The useful jobs are fact boundary extraction, event-versus-reference classification, and implicit or relative time resolution; observation synthesis, answer generation, and unused causal inference remain disabled.
 5. Validate generated output before persistence: roles and enum values must be allowlisted, ranges must be valid, supporting spans must resolve inside the chunk, and quoted evidence must match the source. Reject an invalid fact or annotation independently. The raw chunk remains searchable for facts, text spans, and caller annotations not covered by accepted extracted facts rather than failing ingestion or assuming partial extraction is complete.
 6. An optional deterministic parser supplements missing explicit date references and provides the no-model fallback. It normally emits `date_reference`; it emits `event` only for a narrow grammar that deterministically asserts occurrence. Identical spans are deduplicated by role and range, while a legitimate event/reference distinction remains as two annotations with visible origins.
-7. `mentioned_at` comes only from an explicit caller/source field. Memos `source_created_at` may be used as a caller-declared mention time, but the mapping is recorded; it is not silently treated as an event.
+7. `mentioned_at` comes only from an explicit caller/source field. MemOS `SourceMessage.chat_time` may be normalized into a caller-declared mention time when parseable, but the original value and mapping are recorded; it is not silently treated as an event.
 8. Assign `unit_ordinal` in document order. Extracted facts link to their parent chunk and use a stable sub-ordinal. Equal timestamps retain their exact values and sort by ordinal/ID; unlike current Hindsight, indexing never adds artificial seconds to factual time. Raw chunks and accepted facts may both enter candidate retrieval: an extracted fact is preferred only when it represents the same source span and matched temporal annotation, while distinct or uncovered raw evidence remains independently eligible.
 9. Build the PostgreSQL text-search vector and one required embedding per unit with the fixed non-generative encoder. Generative extraction, deterministic parsing, and encoding happen outside the publish transaction. An encoding failure leaves the job unfinished; it must not mark an embedding-free projection ready for complete ranked recall.
 10. In one publish transaction, lock the document and compare its current revision with the job revision. A mismatch discards the stale projection. A match batch-inserts chunks, accepted facts, time annotations, and their bounded temporal-link proposals from Section 3.3, then marks the revision ready. Current neighbors in that transaction include units in the same batch and already published units. Concurrent publications need not discover each other; v1 promises bounded approximate adjacency, not a serially complete nearest-neighbor graph.
@@ -431,7 +430,7 @@ Basis semantics are exact:
 | `created` | `source_created_at` lies in `[start, end)` | `source_created_at` |
 | `updated` | `source_updated_at` lies in `[start, end)` | `source_updated_at` |
 
-A local calendar day is resolved once by the caller or adapter into a timezone-aware half-open UTC range, preserving Memos's correct DST-sensitive calendar behavior. Server-side field accessors must not reinterpret that range in UTC calendar terms.
+A local calendar day is resolved once by the caller or adapter into a timezone-aware half-open UTC range so DST-sensitive boundaries remain correct. Server-side field accessors must not reinterpret that range in UTC calendar terms.
 
 ## 7. Updates, Authorization, and Failure Behavior
 
@@ -453,7 +452,7 @@ The first example separates temporal roles; the second shows ANN followed by mul
 
 ### 8.1 Distinct time bases
 
-Assume one current memo revision contains:
+Assume one current source revision contains:
 
 ```text
 “In 2024 we discussed cancelling the 2025 trip.
@@ -527,7 +526,7 @@ The first vertical slice must prove PostgreSQL HNSW retrieval followed by actual
 1. **Small real ANN-plus-spreading path:** In an isolated authorized database scope, publish caller-dated units, fixed-model embeddings, and temporal links; run an ANN query, expand A→B→C, hydrate C, and independently inspect its dates, edge witnesses, path, and query plan. Use a corpus large enough to exercise HNSW, not only a three-row table with an exact scan. Keep this inspectable path ahead of a full baseline campaign or optional enrichment.
 2. **Complete strict temporal coverage:** Exercise event/reference ranges, mention/create/update timestamps, revisions, authorization, all-hop eligibility, graph budgets, FTS/RRF fusion, and time-only keyset browsing. Prove that a short/error path is reported accurately and cannot silently broaden the window.
 3. **Grounded generative indexing:** Add the bounded schema-constrained extractor and deterministic supplement. Validate source spans, observation/reference time, separate temporal roles, and raw-chunk fallback. Publish embeddings and temporal edges with the accepted revision. The recalled evidence must remain usable with a fail-on-call generative provider in the recall process.
-4. **Quality and plan acceptance:** Compare Memos-style chronological/FTS browsing, ANN+FTS without spreading, and the complete ANN+FTS+multi-hop design on one frozen corpus. Compare filtered ANN neighbors with exact vector search, and record candidate recall, final evidence recall, per-hop contribution, score-based continuation, latency, and scanned rows. Include sparse scopes/ACLs and narrow/broad windows; document approximation and disconnected paths.
+4. **Quality and plan acceptance:** Compare a MemOS-like metadata-filtered vector/lexical baseline, ANN+FTS without spreading, and the complete ANN+FTS+multi-hop design on one frozen corpus. Compare filtered ANN neighbors with exact vector search, and record candidate recall, final evidence recall, per-hop contribution, score-based continuation, latency, and scanned rows. Include sparse scopes/ACLs and narrow/broad windows; document approximation and disconnected paths.
 5. **Optional scoring-only reranker:** Add it only after the complete v1 path works and measured relevance gains justify its deadline cost.
 
 Required fail-capable cases are:
@@ -570,7 +569,7 @@ Defer until measured evidence requires it:
 - Recurring-event rules, business/fiscal calendars, timezone geocoding from place names, and Allen interval algebra.
 - Bitemporal history, valid-time corrections across every source revision, and a general lineage ledger.
 - Composite GiST via `btree_gist`, table partitioning, per-scope HNSW indexes, and adaptive plan selection before query-plan evidence.
-- Automatic expansion through Memos references/comments or Hindsight graph relations outside the requested strict window.
+- Automatic expansion through MemOS hierarchy/scaffolded relations or Hindsight graph relations outside the requested strict window.
 - Recency decay as a universal relevance signal; chronology remains an explicit browse mode.
 
 Generative fact/date extraction is part of indexing. Observation consolidation, unused causal inference, generative query analysis, query rewriting, generative reranking, Reflect-style retrieval, and answer generation are outside the recall boundary and require a separate latency and product decision.
@@ -579,19 +578,19 @@ Generative fact/date extraction is part of indexing. Observation consolidation, 
 
 The design combines Hindsight-style ANN entry selection and multi-hop temporal expansion with an explicit, strictly filtered, non-generative PostgreSQL recall contract. Both retrieval mechanisms ship in the first version.
 
-| Area | Memos | Hindsight | New design |
+| Area | MemOS | Hindsight | New design |
 |---|---|---|---|
-| Temporal capability | Browse/filter mutable memo create or update time | Generatively extract facts and event intervals, then use temporal retrieval and spreading | Index grounded facts/times, then ANN retrieval and multi-hop discovery inside strict PostgreSQL predicates |
-| Indexing unit | Whole memo | Extracted fact, observation, or raw chunk | Extracted fact linked to an exact raw-chunk span, with raw-chunk fallback |
-| Generative work | None for time browsing | Normal indexing uses it | Allowed only in asynchronous indexing for fact boundaries, temporal roles, and implicit/relative time |
-| Recall work | Timestamp filtering and ordering | Non-generative default query analysis plus semantic, keyword, graph, and temporal arms | Required pgvector ANN and multi-hop spreading, FTS/RRF, optional final coverage and scoring-only reranking |
-| Window contract | Strict for the selected create/update field | Temporal seeds are in-window, but other arms and spread targets may be outside | One explicit basis and window constrain every candidate-producing and hydration stage |
-| Temporal graph | None | Stored temporal links and bounded spreading | Same-basis canonical proximity edges, score-based continuation without a fixed hop limit, node/deadline budgets, and per-hop eligibility |
-| Failure behavior | No event-time interpretation | Depends on configured retain mode and model extraction | Invalid extraction falls back to the raw chunk; recall remains available and does not invent event roles |
+| Temporal capability | Source `chat_time`, node lifecycle timestamps, general metadata filters, and a declared but core-unused `reference_time` | Generatively extract facts and event intervals, then use temporal retrieval and spreading | Index grounded facts/times, then ANN retrieval and multi-hop discovery inside strict PostgreSQL predicates |
+| Indexing unit | Typed textual-memory node with provenance and version/history metadata | Extracted fact, observation, or raw chunk | Extracted fact linked to an exact raw-chunk span, with raw-chunk fallback |
+| Generative work | Memory extraction and optional hierarchy/reorganization; not a structured temporal projection in the inspected path | Normal indexing uses it | Allowed only in asynchronous indexing for fact boundaries, temporal roles, and implicit/relative time |
+| Recall work | Fast vector/key/tag/optional BM25 recall is non-generative; fine parsing may call an LLM | Non-generative default query analysis plus semantic, keyword, graph, and temporal arms | Required pgvector ANN and multi-hop spreading, FTS/RRF, optional final coverage and scoring-only reranking |
+| Window contract | No closed system-wide temporal window contract; filtering varies by backend and arm | Temporal seeds are in-window, but other arms and spread targets may be outside | One explicit basis and window constrain every candidate-producing and hydration stage |
+| Temporal graph | `FOLLOWS` builder exists but is inactive and recall is TODO | Stored temporal links and bounded spreading | Same-basis canonical proximity edges, score-based continuation without a fixed hop limit, node/deadline budgets, and per-hop eligibility |
+| Failure behavior | Missing temporal interpretation falls back to relevance retrieval, not strict temporal recall | Depends on configured retain mode and model extraction | Invalid extraction falls back to the raw chunk; recall remains available and does not invent event roles |
 
 The shared Hindsight components are asynchronous fact extraction, event intervals distinct from mention time, caller-supplied windows, non-generative date analysis, ANN and lexical relevance, temporal edges, spreading with decay, RRF, and coverage-aware selection. The differences are grounded annotations and raw fallback, separate time bases, strict eligibility at every hop, exact timestamps, symmetric proximity traversal, explicit breadth-first levels, and merged path evidence.
 
-For the Section 8 memo, Memos alone can find the record by January creation or September update but cannot answer when its two described events occurred. Hindsight can extract the 2024 discussion and March 2026 meeting, but a temporal query can still receive results from unconstrained arms or outside-window spread targets. The new design performs the useful fact/time extraction during indexing, then an `event + March 2026` recall reaches only the stored meeting fact through PostgreSQL while `referenced + 2025` reaches only the trip reference; neither query invokes a generative model.
+For the Section 8 source, MemOS can preserve its message time and retrieve the node by semantic or metadata criteria, but the inspected core cannot distinguish the described 2024 discussion, referenced 2025 trip, and March 2026 meeting as separate temporal roles. Hindsight can extract the discussion and meeting, but a temporal query can still receive results from unconstrained arms or outside-window spread targets. The new design performs fact/time extraction during indexing, then an `event + March 2026` recall reaches only the stored meeting fact through PostgreSQL while `referenced + 2025` reaches only the trip reference; neither query invokes a generative model.
 
 For the A→B→C fixture, ANN supplies a relevant starting point and temporal spreading adds a result missing from direct retrieval. Mem0's inspected OSS entity boosts operate within its initial semantic pool; they do not replace this traversal. The proposed design uses both semantic similarity and temporal connectivity, with the caller's chosen time basis remaining authoritative throughout.
 
@@ -599,16 +598,14 @@ For the A→B→C fixture, ANN supplies a relevant starting point and temporal s
 
 The current [`temproral-retrieval-flow.md`](./temproral-retrieval-flow.md) and the source entries below ground the runtime comparison. [`temporal-causal-propagation-scoring.md`](./temporal-causal-propagation-scoring.md) supplies the proposed `0.7` decay, separate direct/propagated scores, seed strength `1.0`, strict `> 0.2` continuation, and temporal-score ordering. This design retains those scoring rules, adapts dates to its strict selected time basis, and does not inherit that Hindsight-specific proposal's existing five-batch limit or causal-edge scope. Source-described behavior and proposed behavior remain separate.
 
-Memos `019ca26bd316c9dea7f18b90b05d1df5e2f4c1dc`:
+MemOS `176d4f676a93e0e34ca9fd50091eff5ad3236506`:
 
-- Memo timestamps and the only current memo time index: `/Users/rocke_dong/codes/memos/store/migration/postgres/LATEST.sql:53-79`.
-- Custom create/update timestamps at insert: `/Users/rocke_dong/codes/memos/store/db/postgres/memo.go:35-65`.
-- Mutable `create_time` and `update_time`: `/Users/rocke_dong/codes/memos/server/api/v1/memo_service.go:404-418`.
-- Caller-path-dependent update-time maintenance: `/Users/rocke_dong/codes/memos/store/db/postgres/memo_attachment.go:181-225` and `/Users/rocke_dong/codes/memos/web/src/components/MemoEditor/services/memoService.ts:32-58`.
-- Time ordering and stable ID tie-break: `/Users/rocke_dong/codes/memos/server/api/v1/memo_service_query.go:11-66` and `/Users/rocke_dong/codes/memos/store/db/postgres/memo.go:170-184`.
-- Calendar day/month to half-open local-time range: `/Users/rocke_dong/codes/memos/web/src/lib/calendar-utils.ts:19-72`.
-- CEL timestamp fields and range rendering: `/Users/rocke_dong/codes/memos/filter/schema.go:130-157` and `/Users/rocke_dong/codes/memos/filter/render.go:313-351`.
-- Access, state, filter, and pagination before relation hydration: `/Users/rocke_dong/codes/memos/server/api/v1/memo_service.go:81-154` and `/Users/rocke_dong/codes/memos/server/api/v1/memo_service_converter.go:224-332`.
+- Source `chat_time`, node lifecycle timestamps, archived-version `timespec`, and provenance model: `/Users/rocke_dong/codes/memos/src/memos/memories/textual/item.py:16-46,49-91,94-201`.
+- Public nested comparison filter and declared `reference_time`: `/Users/rocke_dong/codes/memos/src/memos/api/product_models.py:366-525`.
+- Core search adapter forwards `filter` but not `reference_time`: `/Users/rocke_dong/codes/memos/src/memos/search/search_service.py:21-99`.
+- Fast/fine query parsing and parallel vector/key/tag/BM25 candidate paths: `/Users/rocke_dong/codes/memos/src/memos/memories/textual/tree_text_memory/retrieve/task_goal_parser.py:18-105` and `/Users/rocke_dong/codes/memos/src/memos/memories/textual/tree_text_memory/retrieve/recall.py:81-184,242-570`.
+- PostgreSQL TIMESTAMPTZ storage, generic JSONB indexes, comparison-filter builder, and vector path that does not apply the rich `filter`: `/Users/rocke_dong/codes/memos/src/memos/graph_dbs/postgres.py:116-174,245-356,442-563,796-861`.
+- Inactive `FOLLOWS` construction and explicit time-sequence recall TODO: `/Users/rocke_dong/codes/memos/src/memos/memories/textual/tree_text_memory/organize/relation_reason_detector.py:20-86,156-170`.
 
 Hindsight `df7e126d88d8eec88a3d1804ba603315536ac174`:
 
