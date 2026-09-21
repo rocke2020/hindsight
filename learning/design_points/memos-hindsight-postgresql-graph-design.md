@@ -2,10 +2,33 @@
 
 ## Overview
 
-1. The specified checkout is MemTensor/MemOS, package `MemoryOS`. MemOS stores typed memory nodes and edges, supports vector and metadata recall, can build `PARENT` summary hierarchies when reorganization is enabled, and exposes a separate seeded subgraph API. Its ordinary search path, however, matches keys/tags and vector/BM25 candidates without traversing stored edges.
-2. Hindsight supplies the stronger bounded online retrieval core: fact-level units, pgvector and text-search seeds, canonical-entity postings, semantic and causal links, one-pass Link Expansion, rank fusion, and optional reranking. The useful MemOS contribution is asynchronous hierarchy/summary construction and a clear separation between ranked memory search and explicit subgraph inspection.
-3. PostgreSQL remains sufficient for the proposed workload because the online path is bounded: retrieve seeds, expand indexed entity/link/hierarchy branches, fuse ranks, then hydrate a capped candidate set. MemOS now includes a PostgreSQL + pgvector graph backend, but the inspected backend does not yet implement every interface used by TreeTextMemory and is not evidence that the complete MemOS search and reorganization path is production-equivalent to its default Neo4j Community + Qdrant deployment.
-4. “For high latency” is interpreted here as a deployment where embedding, extraction, reranking, or database round trips may be slow and the online path must remain predictable. The design removes generative LLM calls from recall, reuses semantic seeds, limits fan-out before hydration, and has explicit timeout degradation. No latency number in this document is a measured result; concrete budgets remain an acceptance-test decision.
+1. Hindsight provides the baseline: fact-level memory units, PostgreSQL/pgvector and text retrieval, entity postings, semantic and causal links, rank fusion, and optional reranking. Its ordinary graph arm expands once from query-selected starting facts, called seeds; newly found facts do not continue the traversal.
+2. MemTensor/MemOS supplies the reference for hierarchy construction: asynchronous reorganization can generate summary nodes and directed `PARENT` edges from summaries to children. Ordinary search retrieves candidates without expanding along those edges; a separate subgraph API supports multi-hop neighborhood queries.
+3. This document's sole objective is to extend Hindsight's PostgreSQL graph retrieval using MemOS-style hierarchy summaries. Preserve Hindsight as the main design, keep hierarchy retrieval on the fixed `child -> parent -> sibling` path, and extend only `caused_by` chains to at most two outgoing effect-to-cause hops.
+4. The design keeps slow model work in asynchronous indexing, recall free of generative model calls, and candidate expansion bounded before loading full text. Goals, flows, examples, and acceptance cases below describe this extension; the source comparison supplies its design inputs. Performance and quality remain unmeasured until the proposed path is implemented and evaluated.
+
+## 1. Design Goals and Non-Goals
+
+The sole objective is the Hindsight-based graph retrieval extension described here. Hindsight's retain/recall architecture is the foundation; MemOS supplies the hierarchy-summary construction reference. Summaries preserve their child evidence and explicit `parent -> child` direction. Retrieval keeps a fixed child-to-parent-to-sibling path and permits at most two outgoing `caused_by` hops, with no general recursive traversal.
+
+Goals:
+
+1. Preserve Hindsight's retain/recall and retrieval-fusion design, using PostgreSQL and pgvector as the only persistent query store.
+2. Generate MemOS-style hierarchy summaries with exact child provenance and explicit `parent -> child` direction; retrieve siblings through the fixed `child -> parent -> sibling` path.
+3. Expand `caused_by` only in the stored effect-to-cause direction, at most two edges from an original seed. Keep other expansion branches fixed.
+4. Keep model-derived summaries, facts, entities, semantic similarity, and causality distinguishable from authoritative source content.
+5. Keep slow model calls outside database transactions and generate summaries during indexing; graph traversal does not call a generative model at each hop.
+6. Bound intermediate work before hydration, use deterministic tie-breaking, and return useful base retrieval when optional graph or reranking work misses its deadline.
+7. Prevent a stale high-latency indexing job from publishing facts for an obsolete document revision.
+
+Non-goals for the first version:
+
+- General Cypher-like queries, arbitrary recursive traversal, BFS, PPR, or path discovery.
+- Activating MemOS's currently disabled relation-generation branches merely because helper functions exist.
+- Materializing an entity clique between every pair of units that mention the same entity.
+- Reverse cause-to-effect traversal, causal chains beyond two hops, recursively climbing further summary levels, or mixing relation types into multi-hop paths.
+- Building a separate partial HNSW index for every user or bank before scale measurements justify it.
+- Claiming that a hierarchy path, a cosine score, a shared entity, or an extracted causal edge proves truth.
 
 ## Terminology and Scope
 
@@ -15,13 +38,13 @@
 - **Entity posting**: A normalized many-to-many membership row connecting one memory unit to one canonical entity.
 - **Derived link**: A semantic, causal, or temporal edge computed from content rather than directly authored by a user.
 - **Seed**: A unit selected directly from the query by semantic or lexical retrieval before graph expansion.
-- **Link Expansion**: One bounded pass from a fixed seed set. Discovered candidates never become a new frontier.
+- **Link Expansion**: Hindsight's existing one-pass expansion from fixed seeds. This design adds only a second outgoing `caused_by` hop; other discovered candidates do not become a new frontier.
 - **Seeded subgraph inspection**: A separate operation that selects relevant center nodes, then returns their bounded neighborhoods and edge evidence. It is not the same contract as ordinary ranked recall.
 - **High-fan-out key**: An entity or node with enough neighbors that an uncapped join could dominate latency and memory.
 
 The comparison is a static source trace of Hindsight `93a32072f2285735e50a20cae418a3fb3b216a11` and MemOS `176d4f676a93e0e34ca9fd50091eff5ad3236506`. It does not claim a live PostgreSQL benchmark, model-quality result, or production SLO.
 
-## 1. Source-Backed Comparison
+## 2. Source-Backed Comparison
 
 Both repositories model memory as searchable nodes, but their graph paths differ. MemOS has an optional offline hierarchy builder and a separate multi-hop subgraph inspection API; Hindsight has a bounded graph arm integrated into ordinary ranked recall.
 
@@ -30,12 +53,12 @@ Both repositories model memory as searchable nodes, but their graph paths differ
 | Primary node | Typed textual-memory node with metadata, embedding, provenance, status, and history | Fact-level `memory_unit` | Keep documents authoritative; project current chunks, facts, and optional summaries as units |
 | Automatic graph | Optional model-derived `PARENT` summary hierarchy; additional relation-generation functions exist but are disabled in the inspected `process_node` path | Entity postings plus semantic, causal, and temporal links | Keep Hindsight links; evaluate bounded parent/child hierarchy as a distinct derived signal |
 | Query seeds | Query embedding, exact key/tag lookup, optional in-process BM25, and backend-dependent full text | Vector semantic and keyword arm; native default is PostgreSQL FTS | Reuse Hindsight semantic and lexical seeds |
-| Graph read | Ordinary search does not follow edges; `get_relevant_subgraph` separately seeds and requests neighborhoods to a caller-supplied depth | Semantic-seeded, one-pass entity/semantic/causal expansion | Keep one-pass ranked expansion; expose deeper path inspection separately if needed |
+| Graph read | Ordinary search does not follow edges; `get_relevant_subgraph` separately seeds and requests neighborhoods to a caller-supplied depth | Semantic-seeded, one-pass entity/semantic/causal expansion | Keep Hindsight expansion; allow at most two outgoing `caused_by` hops and a fixed child-to-parent-to-sibling path |
 | Ranking | Candidate union followed by configured reranking/dedup; no edge-path activation in ordinary search | Intra-graph activation, then fusion and optional reranking | Preserve per-arm ranks and fuse; do not compare unrelated raw score scales |
 | Recall generation | Fast query parsing is tokenization-only; fine mode invokes a dispatcher LLM | Ordinary recall can use non-generative retrieval and optional reranking | Default online path remains non-generative; generative graph work stays asynchronous |
 | Database | Default server configuration is Neo4j Community + Qdrant; alternate Neo4j, PolarDB, and PostgreSQL backends exist | PostgreSQL/pgvector by default; Oracle also exists | PostgreSQL + pgvector only for this design |
 
-### 1.1 MemOS
+### 2.1 MemOS
 
 MemOS TreeTextMemory stores textual-memory nodes with lifecycle type, status, key, tags, provenance sources, embeddings, timestamps, and version/history metadata. Its normal search runs several candidate paths in parallel: working-memory enumeration, vector recall, exact key/tag metadata lookup, optional in-process BM25, and backend-dependent full-text recall. Fast mode derives query tokens without an LLM; fine mode uses the dispatcher LLM to derive structured keys, tags, and a rephrased query. Candidate lists are deduplicated and reranked, but the ordinary `GraphMemoryRetriever` path does not traverse stored edges.
 
@@ -43,7 +66,7 @@ When `reorganize` is enabled, a background worker clusters eligible nodes, asks 
 
 `TreeTextMemory.get_relevant_subgraph` is a distinct inspection API: it selects center nodes by embedding or full text and asks the graph backend for neighborhoods to a caller-supplied depth. That is real query-seeded graph access on the Neo4j path, but it is not called by standard ranked search. The default server backend is `neo4j-community`, with Qdrant supplying vector search. A PostgreSQL + pgvector backend exists with `memories` and `edges` tables, recursive-CTE path/subgraph helpers, JSONB metadata, and an IVFFlat index; however, it lacks methods such as `get_edges`, `get_neighbors_by_tag`, and `search_by_fulltext`, and several method signatures/return shapes do not match TreeTextMemory callers. Its vector search also consumes only simple `search_filter` equality fields and ignores the richer `filter` argument. The repository therefore establishes a PostgreSQL starting point, not complete backend parity.
 
-### 1.2 Hindsight
+### 2.2 Hindsight
 
 Hindsight indexes fact-level `memory_units` with embeddings and text-search state, resolves canonical `entities`, records `unit_entities`, and stores semantic, causal, and temporal rows in `memory_links`. Retain performs expensive model and embedding work before or around a bounded database write, while semantic-link creation can be completed after committed facts in the streaming path.
 
@@ -53,35 +76,13 @@ Shared-entity activation is `tanh(distinct_shared_entity_count * 0.5)`; semantic
 
 Observation units have a separate, longer provenance path through their source facts before entity expansion; the ordinary fact path above is not a complete description of observation retrieval. The merged first version explicitly defers that observation-specific traversal.
 
-### 1.3 What Is Actually Worth Merging
+### 2.3 What Is Actually Worth Merging
 
 The MemOS contribution is offline hierarchy construction and the product distinction between ordinary ranked search and explicit subgraph inspection. Topic/concept summaries can bridge vocabulary gaps and provide a bounded parent-to-sibling retrieval signal, but they are model-derived projections and must retain child provenance, revision identity, and separate scoring. The inactive relation-detector branches and incomplete PostgreSQL backend are not copied as current capability.
 
-The Hindsight contribution is the online retrieval engine: pgvector/text seeds, entity postings, derived links, bounded expansion, rank fusion, and candidate caps. The merged design evaluates one additional hierarchy branch inside the existing bounded pass; it does not import MemOS's backend abstraction or place Neo4j/Qdrant on the request path.
+The Hindsight contribution is the online retrieval engine: pgvector/text seeds, entity postings, derived links, bounded expansion, rank fusion, and candidate caps. The merged design adds a fixed hierarchy branch and at most one further outgoing `caused_by` hop. It does not import MemOS's backend abstraction or place Neo4j/Qdrant on the request path.
 
 Three merged safeguards are improvements, not claims about current Hindsight: eligibility moves before every cap, incoming semantic degree receives its own per-seed cap, and one absolute deadline covers the primary query plus fallback. Current Hindsight filters tags after graph top-budget selection, aggregates incoming semantic edges without a per-seed cap, and issues its semantic/causal fallback without the first query's local timeout wrapper.
-
-## 2. Design Goals and Non-Goals
-
-The design keeps authoritative documents separate from derived facts, summaries, entities, and links. A MemOS-style summary is generated from a cluster of memories while a Hindsight link connects facts; silently treating the summary as source truth or mixing identifiers without typed provenance would invent semantics and create uncontrolled fan-out.
-
-Goals:
-
-1. Use PostgreSQL and pgvector as the only persistent query store; do not add Neo4j, a graph cache, or a second consistency domain.
-2. Preserve exact child provenance for every generated hierarchy summary and keep hierarchy direction explicit.
-3. Keep model-derived summaries, facts, entities, semantic similarity, and causality distinguishable from authoritative source content.
-4. Make external model latency affect indexing freshness or an optional rerank, not database transaction duration or graph traversal depth.
-5. Bound intermediate work before hydration, use deterministic tie-breaking, and return useful base retrieval when optional graph or reranking work misses its deadline.
-6. Prevent a stale high-latency indexing job from publishing facts for an obsolete document revision.
-
-Non-goals for the first version:
-
-- General Cypher-like queries, arbitrary recursive traversal, BFS, PPR, or path discovery.
-- Activating MemOS's currently disabled relation-generation branches merely because helper functions exist.
-- Materializing an entity clique between every pair of units that mention the same entity.
-- Making general recursive subgraph traversal part of ordinary ranked recall; deeper inspection remains a separate operation.
-- Building a separate partial HNSW index for every user or bank before scale measurements justify it.
-- Claiming that a hierarchy path, a cosine score, a shared entity, or an extracted causal edge proves truth.
 
 ## 3. PostgreSQL Data Model
 
@@ -156,7 +157,7 @@ This flow adapts MemOS's asynchronous summary hierarchy while retaining Hindsigh
 
 ## 5. Retrieval Flow
 
-The online path has no generative LLM call and performs one bounded expansion over fixed seeds.
+The online path has no generative LLM call. Expand from fixed seeds, allowing only `caused_by` to continue for a second outgoing hop; the hierarchy branch remains the fixed child-to-parent-to-sibling path.
 
 ```mermaid
 flowchart LR
@@ -169,7 +170,7 @@ flowchart LR
     G --> U[Entity unit links]
     G --> P[Hierarchy parent and siblings]
     G --> M[Semantic unit links]
-    G --> C[Requested causal direction]
+    G --> C[Effect to cause: at most 2 hops]
     U --> GA[Derived graph activation]
     M --> GA
     C --> GA
@@ -187,7 +188,7 @@ flowchart LR
 3. Submit the fixed seed IDs to one narrow graph SQL statement. Each branch returns candidate ID, source signal, seed ID, edge/entity identifier, direction, and raw contribution rather than full text payloads.
 4. Expand entity postings from seed unit to entity to eligible unit. Apply the eligibility predicate before the per-entity cap.
 5. Expand semantic links in both stored directions, with an independent per-seed/per-direction cap. A write-time outgoing top-k does not bound reverse degree, so the incoming branch must be capped separately.
-6. Expand `caused_by` in the requested direction: effect-to-cause for “why,” cause-to-effect for “what happened because of this,” or both for an explicitly general mode. Always preserve the stored direction in the returned explanation.
+6. Expand outgoing `caused_by` edges from each original seed to direct causes, then once more to their causes. Return eligible candidates at both hop counts and stop after two edges. Apply eligibility and neighbor caps at each hop, exclude repeated nodes within a path, and deduplicate returned candidates. Never reverse the edge or continue through another relation type. Two fixed joins inside the graph statement are sufficient; no general traversal loop is required. Preserve the full causal path in the explanation.
 7. Expand hierarchy evidence as `seed child -> parent summary -> eligible sibling child`, with independent caps on parents per seed and children per parent. Preserve both stored `parent -> child` edges in the explanation, exclude the summary itself from source evidence unless explicitly requested, and do not recursively climb another hierarchy level in ordinary recall.
 8. Fuse dense, lexical, derived-graph, and hierarchy-arm ranks with RRF. Use stable `(kind, id)` candidate keys, then a stable ID tie-break. Apply a per-document result cap before one batch hydration query.
 9. Run at most one optional reranker over the bounded hydrated set when the shared deadline has enough time remaining. Otherwise return the fused order.
@@ -201,23 +202,23 @@ Direction is part of the evidence and must survive storage, traversal, ranking, 
 
 | Relation | Stored meaning | Default read behavior | What it does not mean |
 |---|---|---|---|
-| `parent` | Derived summary A groups source-backed child B | From a child, inspect bounded parents and eligible siblings; from a requested summary, read bounded children | Every child entails the summary or every sibling is relevant |
+| `parent` | Derived summary A groups source-backed child B | Fixed child-to-parent-to-sibling path with bounded parents and children | Every child entails the summary or every sibling is relevant |
 | `semantic` | The indexer selected a similar-unit neighbor | Read both physical directions with independent caps | A symmetric truth relation |
-| `caused_by` | Effect unit A names earlier cause B | Outgoing for cause-seeking; incoming for effect-seeking | Calibrated causal probability |
+| `caused_by` | Effect unit A names earlier cause B | Outgoing effect-to-cause only, at most two hops from an original seed | Calibrated causal probability |
 | `unit_entity` | Unit A mentions canonical entity E | Traverse A -> E -> eligible unit | Same event, same claim, or causality |
 
-Use Hindsight's implemented graph activation for the derived graph arm:
+Keep Hindsight's additive graph activation. For the new two-hop causal case, multiply the edge weights along each eligible path and keep the strongest path contribution; a one-hop path retains its existing edge weight:
 
 ```text
 entity_contribution = tanh(distinct_shared_entity_count * 0.5)
 semantic_contribution = max(semantic_link_weight), else 0
-causal_contribution = max(causal_link_weight), else 0
+causal_contribution = max(product(edge_weights) for eligible causal paths of 1 or 2 hops), else 0
 
 derived_graph_activation =
     entity_contribution + semantic_contribution + causal_contribution
 ```
 
-This score orders the existing Hindsight-derived graph arm only. Do not implement the stale source comment that describes a causal `weight + 1.0`; current Hindsight code does not add that boost. The hierarchy arm remains separate: sibling candidates are ordered by parent rank, their own query relevance, and stable ID. RRF combines arm ranks instead of adding vector distance, lexical rank, graph activation, and hierarchy values as if they shared a calibrated scale.
+This score orders the Hindsight-derived graph arm only; the two-hop path contribution is a proposed extension, not current Hindsight behavior. Do not implement the stale source comment that describes a causal `weight + 1.0`; current Hindsight code does not add that boost. The hierarchy arm remains separate: sibling candidates are ordered by parent rank, their own query relevance, and stable ID. RRF combines arm ranks instead of adding vector distance, lexical rank, graph activation, and hierarchy values as if they shared a calibrated scale.
 
 Every equal-score order uses a stable ID tie-break. Each returned graph candidate records the seed, signal, stored direction, traversal direction, entity or edge identifier, and contribution. This evidence is an explanation of retrieval, not a truth score.
 
@@ -227,11 +228,12 @@ The latency strategy bounds external calls, database round trips, intermediate f
 
 ### 7.1 Starting caps
 
-The following are evaluation defaults, not measured optimal values:
+The two-hop causal ceiling is a design constraint. The other caps below are evaluation defaults, not measured optimal values:
 
 | Boundary | Starting value | Reason |
 |---|---:|---|
 | Graph seeds | 20 | Matches Hindsight's current seed ceiling |
+| `caused_by` hops from an original seed | 2 maximum | Effect-to-cause only; other branches keep their fixed paths |
 | Entities used per seed | 8 | Bounds units with excessive entity extraction |
 | Eligible units per entity | 64 | Bounds hub-entity fan-out before aggregation |
 | Edges per seed/type/direction | 16 | Separately bounds outgoing and reverse degree |
@@ -313,10 +315,10 @@ summary unit:
 
 For “Why did Maya move, and what cheaper option was noted?”, assume dense/lexical retrieval selects `U_MOVE` as a seed.
 
-1. The causal outgoing branch returns `U_RENT`, because `U_MOVE --caused_by--> U_RENT` is one hop. It does not recursively continue to `U_JOB`.
+1. The causal outgoing branch returns `U_RENT` at hop 1 and `U_JOB` at hop 2 through `U_MOVE --caused_by--> U_RENT --caused_by--> U_JOB`, then stops. It neither follows a third causal edge nor reverses an edge to find effects.
 2. The entity branch may return eligible units sharing `Maya` or `apartment`, subject to the per-entity cap.
 3. The hierarchy branch follows `U_MOVE <-parent- S_HOUSING -parent-> U_CHEAPER` inside one bounded compound branch. It can return `U_CHEAPER` without recursively expanding another summary level or importing every child in the cluster.
-4. The response explains that `U_RENT` arrived through an extracted causal edge and `U_CHEAPER` through a model-derived summary path. It does not describe hierarchy membership as a causal or truth assertion.
+4. The response explains the one-hop path to `U_RENT`, the two-hop path to `U_JOB`, and the model-derived summary path to `U_CHEAPER`. It does not describe hierarchy membership as a causal or truth assertion.
 5. If `D_BUDGET` is not readable, `U_CHEAPER` contributes nothing before ranking. If either document's revision changed while the summary job was running, the stale parent path is ineligible until rebuilt.
 
 ## 10. Incremental Delivery and Acceptance Gates
@@ -326,14 +328,15 @@ Delivery should prove one real PostgreSQL path before adding more graph machiner
 1. **Baseline and schema:** Capture current dense + lexical quality and latency on a fixed corpus. Add document revision, current source chunks, composite scope constraints, and direction-covering indexes for derived links.
 2. **Hierarchy slice:** Build one source-grounded summary cluster asynchronously, publish `parent` edges after revision checks, and implement `seed child -> bounded parent -> bounded eligible siblings` with permission-before-cap, deterministic RRF, narrow candidate rows, and one hydration query. This is the smallest genuinely merged user path.
 3. **Asynchronous projection:** Move slow extraction/embedding outside transactions, add revision compare-and-swap publication, and prove that an edit during indexing cannot publish or retrieve stale facts.
-4. **Derived graph hardening:** Reuse Hindsight entity, semantic, and `caused_by` expansion while adding reverse-degree caps, eligibility-before-cap, one absolute deadline, stable tie-breaking, and a single semantic-link neighbor setting.
+4. **Causal extension and graph bounds:** Preserve Hindsight entity and semantic expansion; extend outgoing `caused_by` to at most two hops. Apply eligibility and caps at both causal hops, alongside semantic reverse-degree caps, one absolute deadline, stable tie-breaking, and a single semantic-link neighbor setting.
 5. **Optional tail stages:** Enable reranking and any temporal feature only after the bounded base path is green and their incremental answer quality exceeds their tail-latency cost.
 
 Required fail-capable acceptance cases are:
 
-- A hierarchy sibling is found only through the expected child-to-parent-to-child witness, with both stored edge directions preserved.
+- A hierarchy sibling is found only through the expected child-to-parent-to-child witness, with both stored edge directions preserved; this branch neither climbs to a grandparent nor expands the returned sibling again.
 - A summary whose child is private, stale, deleted, or wrong-scope cannot leak the child, consume its cap, or boost another candidate.
-- Effect-to-cause and cause-to-effect queries follow only their requested direction; one-hop mode never silently becomes recursive.
+- With `A --caused_by--> B --caused_by--> C --caused_by--> D` and only `A` seeded, the causal branch returns `B` and `C`, never `D`. With only `C` seeded, it cannot return `B` or `A` through reverse causal traversal. Isolate the other recall arms in this fixture.
+- An ineligible intermediate cause blocks its path to the second-hop candidate. Repeated nodes cannot extend a path, and second-hop candidates retain both edge identifiers and directions.
 - A high-frequency entity and a high reverse-degree semantic node stay within intermediate caps.
 - A private or wrong-scope intermediate node neither appears nor changes another candidate's rank.
 - Updating a document while its slow index job is running makes the old projection ineligible and rejects the stale publish.
@@ -346,7 +349,7 @@ Required fail-capable acceptance cases are:
 
 Defer the following until a measured failure or quality gain requires them:
 
-- Recursive multi-hop traversal, PPR, path search, or Neo4j.
+- General recursive traversal beyond the fixed paths above, PPR, path search, or Neo4j.
 - Materialized entity-to-entity or unit-to-unit entity cliques.
 - Query-time generative entity extraction.
 - Hindsight observation-provenance traversal and temporal multi-hop spreading.
