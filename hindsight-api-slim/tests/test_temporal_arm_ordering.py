@@ -48,7 +48,7 @@ class _Reranker:
         ]
 
 
-def _temporal_result(unit_id: str, text: str, temporal_score: float) -> RetrievalResult:
+def _temporal_result(unit_id: str, text: str, temporal_score: float | None) -> RetrievalResult:
     return RetrievalResult(
         id=unit_id,
         text=text,
@@ -140,8 +140,7 @@ async def test_temporal_arm_is_ordered_by_temporal_score(monkeypatch):
 async def test_temporal_arm_orders_none_score_last(monkeypatch):
     """A result with no temporal_score (None) sorts below every scored result."""
     scored = _temporal_result("00000000-0000-0000-0000-000000000003", "scored", 0.4)
-    unscored = _temporal_result("00000000-0000-0000-0000-000000000004", "unscored", 0.9)
-    unscored.temporal_score = None
+    unscored = _temporal_result("00000000-0000-0000-0000-000000000004", "unscored", None)
 
     result_lists = await _run_recall(
         monkeypatch,
