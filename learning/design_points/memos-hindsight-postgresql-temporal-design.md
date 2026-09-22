@@ -2,12 +2,35 @@
 
 ## Overview
 
-1. The specified checkout is MemTensor/MemOS, package `MemoryOS`. MemOS preserves source-message `chat_time`, stores memory-node `created_at` / `updated_at`, exposes metadata comparison filters, and declares a search `reference_time`; however, the inspected core search does not consume `reference_time`, does not promote source time into a structured event interval, and does not perform temporal ranking or temporal-edge spreading.
-2. Hindsight separates event time (`occurred_start` / `occurred_end`), mention time (`mentioned_at`), and processing time, then adds a temporal recall arm. Its normal fact/event extraction during indexing is generative, while its current default recall window analyzer and retrieval path are non-generative.
-3. ANN semantic retrieval and multi-hop spreading are both required foundations of the first version. PostgreSQL with pgvector HNSW finds semantically relevant entry points; traversal of PostgreSQL temporal edges then discovers additional evidence without a fixed hop limit. Hop decay and a continuation threshold control which discovered nodes keep spreading; visited-node deduplication, the node budget, and the request deadline bound execution. A two-hop discovery is the minimum acceptance example, not the maximum supported depth.
-4. An allowlisted generative indexer may extract atomic facts, event/reference roles, and implicit or relative time during asynchronous indexing. Recall makes no generative call: it embeds the query once, retrieves ANN and FTS candidates, expands the temporal graph, fuses ranks, and returns evidence. An explicit `time_basis = event | referenced | mentioned | created | updated` and half-open window constrain seeds, every intermediate node, and final results.
+1. Hindsight provides the baseline: generative fact/event extraction during retain, distinct event and mention times, PostgreSQL temporal retrieval, temporal links, and bounded spreading. Its default recall window analysis and retrieval path are non-generative, but its window does not constrain every retrieval arm or spread target.
+2. MemTensor/MemOS supplies the reference for preserving source-message `chat_time`, keeping memory lifecycle timestamps separate, and exposing explicit metadata filters. Its inspected core search does not consume `reference_time`, promote source time into a structured event interval, rank by time, or spread through temporal edges.
+3. This document's sole objective is a new Hindsight-based PostgreSQL temporal design. It keeps Hindsight as the retrieval foundation, adopts MemOS's useful source-time provenance and timestamp separation, and adds a strict time-basis/window contract, source-grounded temporal projections, ANN entry selection, and multi-hop temporal discovery.
+4. The design puts generative work only in asynchronous indexing, keeps recall free of generative calls, and bounds traversal by eligibility, score continuation, nodes, and one deadline rather than a fixed hop limit. Performance and quality remain unmeasured until the proposed path is implemented and evaluated.
 
 This design incorporates the current flow and caveats documented in [`temproral-retrieval-flow.md`](./temproral-retrieval-flow.md), rechecked against the current source, and adopts the monotonic scoring rules in [`temporal-causal-propagation-scoring.md`](./temporal-causal-propagation-scoring.md). The latter is a proposed scoring contract, not current runtime behavior.
+
+## 1. Design Goals and Non-Goals
+
+The sole objective is the Hindsight-based temporal design described here. Hindsight's retain/recall architecture is the foundation; MemOS supplies source-time provenance and the distinction between source timestamps and memory lifecycle timestamps. The first version requires ANN-selected temporal entry points followed by actual multi-hop expansion. FTS and chronological browsing complement that path but cannot substitute for either capability.
+
+Goals:
+
+1. Use generative calls only in asynchronous indexing for source-grounded work that both creates reusable retrieval assets and cannot be completed reliably by deterministic rules. Reusable assets include persisted facts and experiences, consolidated insights/observations, and maintained user-profile projections that serve multiple later requests. This temporal indexing path directly creates grounded fact/experience units and time annotations through atomic fact boundaries, event-versus-reference classification, and implicit or relative-time resolution; insight consolidation and user-profile refresh remain separate asynchronous consumers. Recall makes no generative call; deterministic parsing, embeddings, and a scoring-only cross-encoder remain allowed.
+2. Keep event, referenced, mention, source-created, source-updated, and index time semantically separate.
+3. Make the query's time basis and half-open UTC window explicit, stable for the whole request, and strict across every retrieval arm.
+4. Use PostgreSQL as the only durable query store, with indexed interval overlap, point-time range filtering, FTS, required pgvector HNSW, canonical temporal-proximity edges, and allowlisted Hindsight-compatible directed graph links.
+5. Preserve source revision, exact timestamp origin, precision, timezone interpretation, and source span so every returned time is explainable.
+6. Reach semantically eligible evidence absent from the initial ANN/FTS pools through multiple temporal hops without a fixed depth limit; use decayed temporal scores for continuation and bound admitted nodes, eligible neighbors, and elapsed work before hydration.
+7. Keep chronological browsing and explicitly marked partial recall available during encoder or graph failures without calling that degraded path a complete v1 delivery.
+
+Non-goals for the first version:
+
+- Generating an answer or query at recall time, adding new causal inference, or synthesizing observations.
+- Treating source-created or source-updated time as event time.
+- Neo4j, entity/semantic/hierarchy expansion, or traversal without work budgets. V1 uses canonical same-basis temporal-proximity edges plus allowlisted outgoing Hindsight-compatible directed graph links in PostgreSQL, and has no fixed hop limit.
+- Exhaustive natural-language date understanding across all languages and domain calendars.
+- Bitemporal transaction-history queries, time travel over every edit, or a general audit ledger.
+- Automatically pulling evidence outside the requested time window because it is linked to an in-window unit.
 
 ## Terminology and Scope
 
@@ -21,19 +44,22 @@ This design incorporates the current flow and caveats documented in [`temproral-
 - **Temporal window**: A validated half-open UTC interval `[start, end)` applied to the selected time basis.
 - **Temporal coverage**: Deterministic selection across populated portions of a wide time window so one dense period does not monopolize every result.
 - **ANN semantic retrieval**: Approximate nearest-neighbor search over stored text embeddings, using pgvector HNSW and cosine distance to obtain the initial semantic candidate pool. HNSW's internal index graph is not the temporal graph.
-- **Temporal edge**: A stored proximity relation between two units under the same time basis, with supporting annotation IDs for event/reference time. It expresses temporal proximity, not causality.
-- **Multi-hop spreading**: Repeatedly expand a frontier of eligible units through temporal edges; a discovered node above the continuation threshold can discover another node at any later hop, including nodes absent from the initial ANN pool.
+- **Temporal-proximity edge**: A stored proximity relation between two units under the same time basis, with supporting annotation IDs for event/reference time. It is canonical and traversable from either endpoint; it expresses temporal proximity, not causality.
+- **Directed graph link**: An existing Hindsight-compatible outgoing `causes`, `caused_by`, `enables`, or `prevents` relation. It carries its stored direction and weight; v1 reuses it for temporal recall but does not add new causal inference.
+- **Temporal recall link**: Either a temporal-proximity edge or an allowlisted directed graph link. Both endpoints must satisfy the selected time basis/window; event/reference temporal-proximity edges additionally require their stored witnesses to overlap the window.
+- **Multi-hop spreading**: Repeatedly expand a frontier of eligible units through temporal recall links; a discovered node above the continuation threshold can discover another node at any later hop, including nodes absent from the initial ANN pool.
 - **Direct date proximity, `D(v)`**: The node's own selected-basis date score relative to the query-window midpoint, independent of its graph path.
-- **Propagated score, `P(u, v)`**: Parent traversal strength multiplied by edge weight and the fixed `0.7` hop decay; one edge cannot amplify inherited strength.
+- **Propagated score, `P(u, v)`**: Parent traversal strength multiplied by edge weight, fixed `0.7` hop decay, and the bounded relation factor; one edge cannot amplify inherited strength.
 - **Temporal score, `T(v)`**: The larger of direct date proximity and propagated score. It controls continuation and the spreading arm's order before rank fusion; it stays in `[0, 1]`.
 - **RRF**: Reciprocal rank fusion, which combines per-arm ranks rather than adding incomparable raw similarity and path scores.
 - **Deterministic analyzer**: Explicit date rules plus `dateparser`; it performs no token generation and makes no model call.
+- **Reusable retrieval asset**: A persisted, source-grounded unit or maintained projection reused across later requests instead of generated for one response. Product examples are experience memories, consolidated insights/observations, and user-profile mental models. This temporal design directly creates fact/experience units and temporal annotations that recall and those later asynchronous projections can consume; it does not bring insight or profile synthesis into temporal recall.
 - **Generative indexer**: An asynchronous, schema-constrained model call that derives atomic facts and temporal annotations from one source chunk. Its output is a rebuildable projection, never authoritative source text.
 - **Non-generative encoder**: An embedding or cross-encoder model that returns vectors or relevance scores rather than generated text. The embedding encoder is required for normal ranked recall; a scoring-only cross-encoder remains optional. Model identity is fixed per projection.
 
 Scope: Hindsight retrieval source rechecked at `df7e126d88d8eec88a3d1804ba603315536ac174`, using the current working-tree version of `temproral-retrieval-flow.md`; the MemOS comparison uses `176d4f676a93e0e34ca9fd50091eff5ad3236506`. This is a PostgreSQL design, not an implemented Hindsight change. No live database plan, latency, recall-quality, parser-accuracy, or multilingual evaluation is claimed.
 
-## 1. Source-Backed Comparison
+## 2. Source-Backed Comparison
 
 MemOS offers source-message time provenance, memory lifecycle timestamps, and general metadata filtering alongside relevance retrieval; Hindsight offers richer generative event/fact indexing and relevance-aware temporal retrieval. Neither current system exactly implements the proposed combination of targeted generative indexing and strict non-generative recall.
 
@@ -46,10 +72,10 @@ MemOS offers source-message time provenance, memory lifecycle timestamps, and ge
 | Query window | General metadata `filter`; `reference_time` is declared but not passed into core TreeTextMemory search | Explicit window or default non-generative dateparser analysis | Explicit window is authoritative; deterministic analysis is optional fallback |
 | Window meaning | Backend-dependent candidate filter, not a system-wide temporal contract; the PostgreSQL vector path ignores the rich `filter` argument | Seeds only the temporal arm; other arms and spread targets may be outside it | Strict eligibility for every arm, graph endpoint, supporting annotation, and hydrated result |
 | Relevance | Vector/key/tag candidates, optional BM25/full text, reranking/dedup | Vector-gated temporal entries, coverage selection, graph spreading, RRF/rerank | ANN + FTS + multi-hop spreading, RRF, optional final coverage and scoring-only rerank |
-| Graph behavior | Optional `PARENT` hierarchy; `FOLLOWS` generation is inactive and marked TODO for recall | Temporal/causal multi-hop spreading in PostgreSQL | Required same-basis multi-hop expansion without a fixed depth limit; score continuation plus node/deadline bounds |
+| Graph behavior | Optional `PARENT` hierarchy; `FOLLOWS` generation is inactive and marked TODO for recall | Temporal/causal multi-hop spreading in PostgreSQL | Same-basis temporal-proximity plus allowlisted outgoing directed graph links, with strict per-hop time eligibility, score continuation, and node/deadline bounds |
 | Generative call | Fast recall is non-generative; fine query parsing and optional reorganization use LLMs | Normal retain extraction uses an LLM; default recall date analysis does not | Allowed only during asynchronous indexing; prohibited during recall |
 
-### 1.1 MemOS
+### 2.1 MemOS
 
 MemOS preserves each chat source's caller/parser-supplied `chat_time` inside `SourceMessage` provenance. Tree memory nodes separately carry `created_at` and `updated_at`; the PostgreSQL backend stores those as TIMESTAMPTZ columns while retaining other metadata in JSONB. `MemoryManager` commonly refreshes `updated_at` when adding or updating a node, so node timestamps describe memory lifecycle, not necessarily when the represented event occurred.
 
@@ -59,7 +85,7 @@ Temporal filtering is also backend-dependent. Neo4j and PolarDB implement richer
 
 MemOS has graph-shaped temporal scaffolding but not an active temporal recall graph. `RelationAndReasoningDetector` defines a `FOLLOWS` builder based on node `updated_at`, yet the caller block is inactive and the code itself marks time-sequence recall TODO. Standard search ranks semantic/key/tag/BM25 candidates and does not spread through `FOLLOWS`. The design can reuse MemOS's provenance distinction and API-level filter vocabulary, but it cannot claim event intervals, date-proximity scoring, or multi-hop temporal discovery from the inspected revision.
 
-### 1.2 Hindsight
+### 2.2 Hindsight
 
 Hindsight's normal retain path asks a generative model to classify event facts and produce `occurred_start` / `occurred_end` relative to the source date. The writer stores those fields, stores `mentioned_at`, and derives compatibility `event_date` as `occurred_start` when present, otherwise `mentioned_at`. It also constructs bounded temporal-proximity links among same-bank, same-fact-type units.
 
@@ -79,7 +105,7 @@ The current window is not a strict result filter. Semantic, keyword, and ordinar
 
 Current temporal score metadata also has downstream gaps: the temporal list is not actually re-sorted by its `temporal_score`, and RRF keeps the first arm's result object for duplicate IDs without merging temporal proximity. The new design merges matching annotation evidence by ID and does not use a hidden midpoint multiplier.
 
-### 1.3 Reuse, Correct, and Omit
+### 2.3 What Is Actually Worth Merging
 
 Reuse from MemOS:
 
@@ -102,43 +128,9 @@ Correct in the new design:
 
 Omit from the first version:
 
-- Observation consolidation, causal inference/causal edges, and Hindsight's final temporal multiplier. Temporal edge construction, propagation decay, and actual multi-hop spreading are included in v1.
+- Observation consolidation, new causal inference, entity/semantic/hierarchy expansion, and Hindsight's final temporal multiplier. Temporal-proximity edge construction, reuse of allowlisted directed graph links, propagation decay, and actual multi-hop spreading are included in v1.
 
-Generative calls are permitted only in the indexing projection for grounded fact and temporal extraction. Generative query analysis, query rewriting, reranking, Reflect-style retrieval, and answer generation remain excluded from recall because they add request-path latency and nondeterminism.
-
-### 1.4 Mem0 Temporal and Graph Comparison
-
-Mem0 supplies useful timestamp and retrieval comparisons, but its hosted temporal feature and inspected open-source implementation are different evidence boundaries. The OSS checkout inspected here is `c7ee362aff94a369af70f13f2b4f853f6793ff4c`; hosted behavior below is limited to official documentation read on September 18, 2026.
-
-- **Hosted temporal behavior:** Platform v3 documents extraction of event dates/ranges and a ranking boost when they match the query's time. `timestamp` preserves an imported conversation's original time, and `reference_date` anchors relative dates for a search. This is documented temporal ranking, not evidence of a strict global event-window predicate or disclosed multi-hop algorithm. [Temporal Reasoning](https://docs.mem0.ai/platform/features/temporal-reasoning)
-- **OSS time grounding:** `Memory.add(timestamp=...)` and `Memory.search(reference_date=...)` reject non-null values. The extraction prompt supports an Observation Date, but the inspected add path supplies no timestamp, so it defaults to the current date; storing `metadata.created_at` does not pass that value into the prompt. Its generated fact text and `created_at`/`updated_at` payload do not implement this design's separate event/reference/mention range model. [Add, extraction, and stored metadata](https://github.com/mem0ai/mem0/blob/c7ee362aff94a369af70f13f2b4f853f6793ff4c/mem0/memory/main.py#L817), [prompt date resolution](https://github.com/mem0ai/mem0/blob/c7ee362aff94a369af70f13f2b4f853f6793ff4c/mem0/configs/prompts.py#L1007), [search validation](https://github.com/mem0ai/mem0/blob/c7ee362aff94a369af70f13f2b4f853f6793ff4c/mem0/memory/main.py#L1432)
-- **OSS candidate expansion:** `_search_vector_store` obtains `max(top_k * 4, 60)` semantic candidates and builds the final candidate set only from those rows. BM25 and entity-linked-memory scores change their ranking. `_compute_entity_boosts` maps matched query entities to linked memory IDs once; it does not expand a new memory frontier or add an absent memory to the candidate set. Vector retrieval plus these boosts therefore does not satisfy this design's second-hop discovery requirement. An actual ANN execution plan remains backend/runtime-dependent. [Candidate construction and entity boosts](https://github.com/mem0ai/mem0/blob/c7ee362aff94a369af70f13f2b4f853f6793ff4c/mem0/memory/main.py#L1628)
-- **Hosted graph boundary:** Official Graph Memory documentation describes shared-entity connections and retrieval boosts and says they support multi-hop questions. It does not expose hop-by-hop candidate expansion or prove the OSS and hosted implementations are identical. [Graph Memory](https://docs.mem0.ai/platform/features/graph-memory)
-
-The resulting design requirements are concrete: pass the source observation time into indexing-time relative-date normalization; keep event time separate from metadata timestamps; and demonstrate a new candidate reached through two edges outside the initial semantic/lexical pools. Hosted feature descriptions and graph-related scores alone cannot establish those properties. No Mem0 service or retrieval benchmark was run for this comparison.
-
-## 2. Design Goals and Non-Goals
-
-The first deliverable must exercise ANN selection followed by actual multi-hop expansion. FTS and chronological browsing complement that path but cannot substitute for either required capability.
-
-Goals:
-
-1. Use generative calls only for high-value asynchronous indexing work; execute the complete recall path without a generative model call. Deterministic parsing, embeddings, and a scoring-only cross-encoder remain allowed.
-2. Keep event, referenced, mention, source-created, source-updated, and index time semantically separate.
-3. Make the query's time basis and half-open UTC window explicit, stable for the whole request, and strict across every retrieval arm.
-4. Use PostgreSQL as the only durable query store, with indexed interval overlap, point-time range filtering, FTS, required pgvector HNSW, and temporal edges.
-5. Preserve source revision, exact timestamp origin, precision, timezone interpretation, and source span so every returned time is explainable.
-6. Reach semantically eligible evidence absent from the initial ANN/FTS pools through multiple temporal hops without a fixed depth limit; use decayed temporal scores for continuation and bound admitted nodes, eligible neighbors, and elapsed work before hydration.
-7. Keep chronological browsing and explicitly marked partial recall available during encoder or graph failures without calling that degraded path a complete v1 delivery.
-
-Non-goals for the first version:
-
-- Generating an answer or query at recall time, inferring causal graphs, or synthesizing observations.
-- Treating source-created or source-updated time as event time.
-- Neo4j, entity/causal graph expansion, or traversal without work budgets. V1 uses only same-basis temporal proximity edges in PostgreSQL and has no fixed hop limit.
-- Exhaustive natural-language date understanding across all languages and domain calendars.
-- Bitemporal transaction-history queries, time travel over every edit, or a general audit ledger.
-- Automatically pulling evidence outside the requested time window because it is linked to an in-window unit.
+For the temporal path described here, generative calls are permitted only in asynchronous projection work that creates reusable retrieval assets and cannot be completed reliably by deterministic rules. The temporal indexer performs grounded fact/experience and time extraction; separate insight-consolidation and user-profile workflows may consume those indexed assets but are not part of temporal recall. Generative query analysis, query rewriting, reranking, Reflect-style retrieval, and answer generation remain excluded from recall because they create per-request output and add request-path latency and nondeterminism.
 
 ## 3. PostgreSQL Data Model and Indexes
 
@@ -169,6 +161,10 @@ temporal_links
   left_annotation_id, right_annotation_id, gap_seconds, weight
   -- canonical pair: left_unit_id < right_unit_id; traversable from either end
   -- annotation IDs witness event/reference proximity; null for point-time bases
+
+graph_links
+  scope_id, from_unit_id, to_unit_id, link_type, weight
+  -- directed Hindsight-compatible links; temporal recall reads only an allowlist
 ```
 
 ### 3.1 Time columns
@@ -246,6 +242,9 @@ CREATE INDEX temporal_links_from_left
 
 CREATE INDEX temporal_links_from_right
   ON temporal_links (scope_id, time_basis, right_unit_id, weight DESC, left_unit_id);
+
+CREATE INDEX graph_links_temporal_recall_outgoing
+  ON graph_links (scope_id, from_unit_id, link_type, weight DESC, to_unit_id);
 ```
 
 An ANN-capable SQL shape orders directly by `embedding <=> $query_vector` ascending with `LIMIT`; declaring an index or calculating cosine does not prove ANN execution. pgvector applies other filters after scanning approximate-index candidates, so selective scope/ACL/time predicates can underfill the pool. Require pgvector 0.8.0 or later and bounded iterative scans; verify the real filtered plan and compare against exact search. A narrow window may legitimately use an exact plan, but release evidence must also demonstrate the HNSW path on a representative larger corpus. [pgvector indexing and filtering](https://github.com/pgvector/pgvector#filtering)
@@ -269,9 +268,15 @@ V1 stores an undirected proximity graph separately for each time basis. A canoni
 
 This is a bounded-proposal graph over indexed evidence, not an always-current exact K-nearest graph. SQL range filtering answers direct time membership; repeated traversal of these edges supplies the additional multi-hop discovery required by this design.
 
+### 3.4 Directed graph-link contract
+
+Temporal recall may also traverse existing directed `graph_links` with `link_type IN ('causes', 'caused_by', 'enables', 'prevents')`. It reads only from `from_unit_id` to `to_unit_id`; it never reverses a causal edge or treats a temporal-proximity edge as causal evidence. Both endpoints must pass the same scope, visibility, current-revision, selected-basis, and half-open-window checks before the per-source neighbor cap. This design changes neither causal extraction nor the stored direction.
+
+At query time, temporal-proximity links use relation factor `1.0`; active cause links (`causes` and `caused_by`) use `1.1`; legacy `enables` and `prevents` use `1.0`. The factor is an internal scoring constant, not stored data. With `weight <= 1` and hop decay `0.7`, even an active-cause hop retains at most `0.77` of its parent's inherited strength.
+
 ## 4. Hybrid Indexing Flow
 
-Indexing spends generative-model latency only where it adds durable retrieval value. All model work happens outside the user-facing recall path, and every derived unit remains traceable to immutable source evidence.
+Indexing spends generative-model latency only where the work both creates a reusable retrieval asset and cannot be completed reliably by deterministic rules. In this flow, those assets are grounded fact/experience units and temporal annotations that can support later recall, insight consolidation, and user-profile refresh. All model work happens outside the user-facing recall path, and every derived unit remains traceable to immutable source evidence.
 
 1. In one short transaction, authorize the write, lock the document, increment `current_revision`, store exact caller-supplied source-message/source-document timestamps plus their provenance, and enqueue an idempotent job for `(scope_id, document_id, revision, indexer_version)`.
 2. A worker claims the job and releases the database connection. It chunks the source deterministically by existing text/structured boundaries and prepares each raw chunk for publication as source evidence and a recall-eligible fallback unit. Once published, a chunk remains eligible even when only part of it is represented by accepted facts.
@@ -282,10 +287,10 @@ Indexing spends generative-model latency only where it adds durable retrieval va
 7. `mentioned_at` comes only from an explicit caller/source field. MemOS `SourceMessage.chat_time` may be normalized into a caller-declared mention time when parseable, but the original value and mapping are recorded; it is not silently treated as an event.
 8. Assign `unit_ordinal` in document order. Extracted facts link to their parent chunk and use a stable sub-ordinal. Equal timestamps retain their exact values and sort by ordinal/ID; unlike current Hindsight, indexing never adds artificial seconds to factual time. Raw chunks and accepted facts may both enter candidate retrieval: an extracted fact is preferred only when it represents the same source span and matched temporal annotation, while distinct or uncovered raw evidence remains independently eligible.
 9. Build the PostgreSQL text-search vector and one required embedding per unit with the fixed non-generative encoder. Generative extraction, deterministic parsing, and encoding happen outside the publish transaction. An encoding failure leaves the job unfinished; it must not mark an embedding-free projection ready for complete ranked recall.
-10. In one publish transaction, lock the document and compare its current revision with the job revision. A mismatch discards the stale projection. A match batch-inserts chunks, accepted facts, time annotations, and their bounded temporal-link proposals from Section 3.3, then marks the revision ready. Current neighbors in that transaction include units in the same batch and already published units. Concurrent publications need not discover each other; v1 promises bounded approximate adjacency, not a serially complete nearest-neighbor graph.
+10. In one publish transaction, lock the document and compare its current revision with the job revision. A mismatch discards the stale projection. A match batch-inserts chunks, accepted facts, time annotations, and their bounded temporal-link proposals from Section 3.3, then marks the revision ready. Existing directed graph links retain their own Hindsight indexing contract; this design only reads their allowlisted types during temporal recall. Current temporal neighbors in that transaction include units in the same batch and already published units. Concurrent publications need not discover each other; v1 promises bounded approximate adjacency, not a serially complete nearest-neighbor graph.
 11. Retry an unfinished publication through the existing indexing job: a rollback exposes no partial graph, and an already published revision is reused unchanged. No graph-building step runs inside recall. Old projection rows become ineligible immediately through `source_revision = documents.current_revision` and may be cleaned later together with incident edges.
 
-Generative extraction may be disabled or fail while raw chunks with caller times, deterministic references, embeddings, and same-basis edges still support ANN and spreading. FTS or chronological fallback is separately marked as degraded recall; it does not waive the two required v1 capabilities. No recall request starts indexing work.
+Generative extraction may be disabled or fail while raw chunks with caller times, deterministic references, embeddings, and temporal-proximity edges still support ANN and spreading. FTS or chronological fallback is separately marked as degraded recall; it does not waive the two required v1 capabilities. No recall request starts indexing work.
 
 ## 5. Non-Generative Recall Flow
 
@@ -333,8 +338,8 @@ flowchart TD
     Q --> F[Strict in-window FTS candidates]
     E --> A[pgvector ANN semantic pool]
     A --> S[Coverage-aware eligible seeds]
-    S --> H[Expand current frontier through eligible temporal edges]
-    L[(Same-basis temporal links)] --> H
+    S --> H[Expand current frontier through eligible temporal recall links]
+    L[(Temporal-proximity and directed graph links)] --> H
     H --> T[Compute decayed propagation and direct date score]
     T --> N{New nodes above continuation threshold and budget remains?}
     N -->|yes| H
@@ -360,7 +365,7 @@ Completed partial retrieval is returnable only when final eligibility/path check
 
 ### 5.3 Bounded multi-hop spreading
 
-Spreading processes complete breadth-first levels without a hop-count or batch-count limit. Database batches only split one level's work; newly discovered units above the continuation threshold become sources in the next level. The scoring rules follow Sections 4–5 of [`temporal-causal-propagation-scoring.md`](./temporal-causal-propagation-scoring.md), adapted to this design's strict time basis and temporal-only edges.
+Spreading processes complete breadth-first levels without a hop-count or batch-count limit. Database batches only split one level's work; newly discovered units above the continuation threshold become sources in the next level. The scoring rules follow Sections 4–5 of [`temporal-causal-propagation-scoring.md`](./temporal-causal-propagation-scoring.md), adapted to this design's strict selected time basis and temporal-proximity plus allowlisted directed graph links.
 
 For each eligible unit, obtain `basis_date(v)` from the representative time in Section 6. Event/reference time uses the midpoint of the deterministically selected matching annotation/window intersection; point-time bases use that basis's timestamp. Unlike the Hindsight-specific proposal, this design does not fall back across time bases or assign missing-date defaults: a unit without a matching basis time is ineligible.
 
@@ -370,10 +375,12 @@ D(v) = 1 - min(abs(basis_date(v) - window_midpoint) / window_half_width, 1)
 traversal_strength(seed) = 1.0
 temporal_score(seed)     = D(seed)
 
-P(u, v) = traversal_strength(u) * W(u, v) * gamma
+P(u, v) = traversal_strength(u) * W(u, v) * gamma * R(edge_type)
 T(v)    = max(D(v), P(u, v))
 
 gamma = 0.7
+R(causes or caused_by) = 1.1
+R(temporal, enables, or prevents) = 1.0
 continue from v only when T(v) > 0.2 and execution budget remains
 traversal_strength(v) = T(v) for a continuing node
 ```
@@ -381,7 +388,7 @@ traversal_strength(v) = T(v) for a continuing node
 The validated window has positive width. Scores and weights stay in `[0, 1]`; one edge cannot amplify its parent's inherited strength. Direct date evidence may refresh `T(v)` and let a deeper node rank higher or continue farther. Consequently decay alone is not a termination guarantee. Query cosine remains a separate eligibility gate and tie-break, not the seed's initial traversal strength or another propagation multiplier. There is no relation-type boost above `1.0`.
 
 1. Initialize every selected seed's traversal strength to `1.0`, record `D(seed)`, and set `visited` to the unique seed IDs. Seeds start regardless of their direct date score; the total node budget includes them.
-2. For every source in the current frontier, read both sides of canonical links of the selected basis. Join both endpoint units and documents, check current revision/ACL/time/witness eligibility, exclude already visited targets, require a finite stored embedding and `cosine(query, target) >= semantic_floor`, then keep at most `neighbors_per_source` targets ordered by edge weight, target cosine, and unit ID.
+2. For every source in the current frontier, read both sides of canonical temporal-proximity links for the selected basis and outgoing allowlisted directed graph links. Join both endpoint units and documents, check current revision/ACL/time eligibility, require temporal witnesses only for event/reference proximity links, exclude already visited targets, require a finite stored embedding and `cosine(query, target) >= semantic_floor`, then keep at most `neighbors_per_source` targets ordered by propagated-score inputs, target cosine, and unit ID.
 3. Compute each target's `D(v)`, proposed `P(u, v)`, and `T(v)`. Aggregate proposals across the entire level by target, choosing the highest temporal score, then highest propagated score, then stable seed and parent IDs. Record the chosen path's propagated score and the target's independent direct score. This exact cosine check on linked targets is not an ANN search, and proximity does not imply causality.
 4. Sort level proposals by `(-temporal_score, hop_depth, -similarity, unit_id)` and admit unique targets fitting the remaining node budget. Record their parent/path and mark them visited. Each admitted target counts once, including a target whose score is `<= 0.2`; only targets with `T(v) > 0.2` enter the next frontier. Never traverse through rejected, hidden, stale, wrong-basis, or out-of-window nodes.
 5. Stop when the next frontier is empty, the node budget is exhausted, or the shared deadline is reached. Report `frontier_exhausted`, `node_budget`, or `deadline` as the stop reason; only the latter two indicate work truncation. SQL batches share the remaining deadline; cancel an unfinished batch and discard that unfinished level's proposals, retaining only completed eligible levels and marking the response partial. Final validation still follows Section 5.2.
@@ -393,7 +400,8 @@ Initial index and retrieval limits below belong to their existing configuration 
 | Setting | Initial value | Meaning |
 |---|---:|---|
 | `link_proposals_per_unit` | 20 per available basis | Indexing-time proposals; not a bound on total undirected degree |
-| `link_horizon` | 24 hours | Maximum gap for an edge, independently of the recall window |
+| `link_horizon` | 24 hours | Maximum gap for a temporal-proximity edge, independently of the recall window |
+| `active_cause_factor` | 1.1 | Internal factor for `causes` / `caused_by`; temporal and legacy link types use `1.0` |
 | `ann_pool_limit` / `fts_pool_limit` | 60 / 60 | Eligible initial candidates per request scope |
 | `seed_limit` / `coverage_buckets` | 10 / 8 | ANN-derived graph entry selection |
 | `semantic_floor` | 0.1 | Query-cosine floor for seeds and every spread target |
@@ -523,9 +531,9 @@ For a separate scoring-only chain with full-weight edges and no direct-date refr
 
 The first vertical slice must prove PostgreSQL HNSW retrieval followed by actual multi-hop discovery, with a two-hop path as the minimum fixture and longer paths proving the absence of a fixed depth cutoff. Grounded extraction, full time-basis coverage, and failure behavior complete v1; optional reranking is not a prerequisite. An FTS-only or ANN-only demonstration cannot close this gate.
 
-1. **Small real ANN-plus-spreading path:** In an isolated authorized database scope, publish caller-dated units, fixed-model embeddings, and temporal links; run an ANN query, expand A→B→C, hydrate C, and independently inspect its dates, edge witnesses, path, and query plan. Use a corpus large enough to exercise HNSW, not only a three-row table with an exact scan. Keep this inspectable path ahead of a full baseline campaign or optional enrichment.
+1. **Small real ANN-plus-spreading path:** In an isolated authorized database scope, publish caller-dated units, fixed-model embeddings, and temporal-proximity links; run an ANN query, expand A→B→C, hydrate C, and independently inspect its dates, edge witnesses, path, and query plan. Repeat the fixture with directed `caused_by` links and verify stored-direction traversal. Use a corpus large enough to exercise HNSW, not only a three-row table with an exact scan. Keep this inspectable path ahead of a full baseline campaign or optional enrichment.
 2. **Complete strict temporal coverage:** Exercise event/reference ranges, mention/create/update timestamps, revisions, authorization, all-hop eligibility, graph budgets, FTS/RRF fusion, and time-only keyset browsing. Prove that a short/error path is reported accurately and cannot silently broaden the window.
-3. **Grounded generative indexing:** Add the bounded schema-constrained extractor and deterministic supplement. Validate source spans, observation/reference time, separate temporal roles, and raw-chunk fallback. Publish embeddings and temporal edges with the accepted revision. The recalled evidence must remain usable with a fail-on-call generative provider in the recall process.
+3. **Grounded generative indexing:** Add the bounded schema-constrained extractor and deterministic supplement. Validate source spans, observation/reference time, separate temporal roles, and raw-chunk fallback. Publish embeddings and temporal-proximity edges with the accepted revision; preserve existing directed graph-link indexing separately. The recalled evidence must remain usable with a fail-on-call generative provider in the recall process.
 4. **Quality and plan acceptance:** Compare a MemOS-like metadata-filtered vector/lexical baseline, ANN+FTS without spreading, and the complete ANN+FTS+multi-hop design on one frozen corpus. Compare filtered ANN neighbors with exact vector search, and record candidate recall, final evidence recall, per-hop contribution, score-based continuation, latency, and scanned rows. Include sparse scopes/ACLs and narrow/broad windows; document approximation and disconnected paths.
 5. **Optional scoring-only reranker:** Add it only after the complete v1 path works and measured relevance gains justify its deadline cost.
 
@@ -550,6 +558,8 @@ Required fail-capable cases are:
 - A→B→C has no A→C edge, and C is absent from the initial ANN/FTS pools. C is absent after the first expansion level and appears after the second through B, provided B passes continuation and result caps/deadline allow it; this checks intermediate traversal state without adding a public hop-limit control.
 - Extend the isolated chain to at least six hops, with only adjacent edges, each intermediate `T(v) > 0.2`, and sufficient budgets. The sixth-hop target must be discovered without a depth or five-batch cutoff. Section 8.2's 16-hour event spacing can continue through March 14 within the same window, keeping direct date evidence high.
 - With full-weight edges and no direct-date refresh, verify successive scores `0.7`, `0.49`, `0.343`, `0.2401`, `0.16807`; the last candidate is admitted but not expanded. At exactly `0.2` and immediately above it, admit both and expand only the latter.
+- With full-weight `caused_by` links and no direct-date refresh, verify successive scores `0.77`, `0.5929`, and `0.456533`; the directed causal path remains bounded and decays at every hop. `enables` and `prevents` use the neutral temporal factor, not a larger factor.
+- A directed graph link is traversed only from `from_unit_id` to `to_unit_id`; an in-window seed cannot reach a reverse causal predecessor. Both endpoints must satisfy the chosen basis/window, and no event/reference witness requirement is invented for a directed link that has none.
 - Verify direct-date refresh independently: every edge's propagated score is no greater than parent strength, while a deeper node may receive a higher temporal score from its own date evidence. All scores stay in `[0, 1]`, and final temporal ordering is `(-temporal_score, hop_depth, -similarity, unit_id)` before RRF.
 - Make B hidden, deleted, stale, wrong-scope, or out-of-window in that fixture: C cannot be reached through B. An event/reference edge whose stored witness is outside the window is rejected even if another annotation on the unit is inside it.
 - Within-batch and cross-batch link creation use the same horizon, weight, and bidirectional-read semantics. Retry/revision replacement creates no duplicate canonical pair and permits no stale bridge; post-delete disconnection is reported as a graph limitation rather than silently repaired in recall.
@@ -564,7 +574,7 @@ Functional v1 success requires demonstrated ANN execution, second-hop and longer
 
 Defer until measured evidence requires it:
 
-- Causal/entity edges, all-neighbor repair after deletion, and Neo4j. Temporal-proximity edges, multi-hop spreading without a fixed depth limit, and monotonic propagation with direct-date refresh are v1 requirements; traversal without node/deadline budgets is excluded.
+- New causal/entity edges, all-neighbor repair after deletion, and Neo4j. Temporal-proximity edges, reuse of allowlisted directed graph links, multi-hop spreading without a fixed depth limit, and monotonic propagation with direct-date refresh are v1 requirements; traversal without node/deadline budgets is excluded.
 - Automatic conflict resolution among caller, generative, and deterministic temporal annotations without evaluation evidence.
 - Recurring-event rules, business/fiscal calendars, timezone geocoding from place names, and Allen interval algebra.
 - Bitemporal history, valid-time corrections across every source revision, and a general lineage ledger.
@@ -572,7 +582,7 @@ Defer until measured evidence requires it:
 - Automatic expansion through MemOS hierarchy/scaffolded relations or Hindsight graph relations outside the requested strict window.
 - Recency decay as a universal relevance signal; chronology remains an explicit browse mode.
 
-Generative fact/date extraction is part of indexing. Observation consolidation, unused causal inference, generative query analysis, query rewriting, generative reranking, Reflect-style retrieval, and answer generation are outside the recall boundary and require a separate latency and product decision.
+Generative fact/date extraction is part of temporal indexing. Insight/observation consolidation and user-profile refresh are valid asynchronous reusable-asset workflows, but remain outside this temporal v1. Unused causal inference, generative query analysis, query rewriting, generative reranking, Reflect-style retrieval, and answer generation are outside the recall boundary and require a separate latency and product decision.
 
 ## 11. Final Comparison and Summary
 
@@ -585,14 +595,14 @@ The design combines Hindsight-style ANN entry selection and multi-hop temporal e
 | Generative work | Memory extraction and optional hierarchy/reorganization; not a structured temporal projection in the inspected path | Normal indexing uses it | Allowed only in asynchronous indexing for fact boundaries, temporal roles, and implicit/relative time |
 | Recall work | Fast vector/key/tag/optional BM25 recall is non-generative; fine parsing may call an LLM | Non-generative default query analysis plus semantic, keyword, graph, and temporal arms | Required pgvector ANN and multi-hop spreading, FTS/RRF, optional final coverage and scoring-only reranking |
 | Window contract | No closed system-wide temporal window contract; filtering varies by backend and arm | Temporal seeds are in-window, but other arms and spread targets may be outside | One explicit basis and window constrain every candidate-producing and hydration stage |
-| Temporal graph | `FOLLOWS` builder exists but is inactive and recall is TODO | Stored temporal links and bounded spreading | Same-basis canonical proximity edges, score-based continuation without a fixed hop limit, node/deadline budgets, and per-hop eligibility |
+| Temporal graph | `FOLLOWS` builder exists but is inactive and recall is TODO | Stored temporal and outgoing causal links with bounded spreading | Same-basis canonical proximity edges plus allowlisted outgoing directed graph links, score-based continuation without a fixed hop limit, node/deadline budgets, and per-hop eligibility |
 | Failure behavior | Missing temporal interpretation falls back to relevance retrieval, not strict temporal recall | Depends on configured retain mode and model extraction | Invalid extraction falls back to the raw chunk; recall remains available and does not invent event roles |
 
-The shared Hindsight components are asynchronous fact extraction, event intervals distinct from mention time, caller-supplied windows, non-generative date analysis, ANN and lexical relevance, temporal edges, spreading with decay, RRF, and coverage-aware selection. The differences are grounded annotations and raw fallback, separate time bases, strict eligibility at every hop, exact timestamps, symmetric proximity traversal, explicit breadth-first levels, and merged path evidence.
+The shared Hindsight components are asynchronous fact extraction, event intervals distinct from mention time, caller-supplied windows, non-generative date analysis, ANN and lexical relevance, temporal and outgoing causal links, spreading with decay, RRF, and coverage-aware selection. The differences are grounded annotations and raw fallback, separate time bases, strict eligibility at every hop, canonical symmetric proximity traversal plus preserved directed causal traversal, explicit breadth-first levels, and merged path evidence.
 
 For the Section 8 source, MemOS can preserve its message time and retrieve the node by semantic or metadata criteria, but the inspected core cannot distinguish the described 2024 discussion, referenced 2025 trip, and March 2026 meeting as separate temporal roles. Hindsight can extract the discussion and meeting, but a temporal query can still receive results from unconstrained arms or outside-window spread targets. The new design performs fact/time extraction during indexing, then an `event + March 2026` recall reaches only the stored meeting fact through PostgreSQL while `referenced + 2025` reaches only the trip reference; neither query invokes a generative model.
 
-For the A→B→C fixture, ANN supplies a relevant starting point and temporal spreading adds a result missing from direct retrieval. Mem0's inspected OSS entity boosts operate within its initial semantic pool; they do not replace this traversal. The proposed design uses both semantic similarity and temporal connectivity, with the caller's chosen time basis remaining authoritative throughout.
+For the A→B→C fixture, ANN supplies a relevant starting point and temporal spreading adds a result missing from direct retrieval. The proposed design uses both semantic similarity and temporal connectivity, with the caller's chosen time basis remaining authoritative throughout.
 
 ## 12. Source Map and Verification Boundary
 
@@ -620,11 +630,5 @@ Hindsight `df7e126d88d8eec88a3d1804ba603315536ac174`:
 - Temporal date indexes: `hindsight-api-slim/hindsight_api/alembic/versions/b3c4d5e6f7g8_add_temporal_date_indexes.py:1-68`.
 - ANN search settings and connection consumers: [`_vector_index.py`](../../hindsight-api-slim/hindsight_api/_vector_index.py), [`config.py`](../../hindsight-api-slim/hindsight_api/config.py), [`memory_engine.py`](../../hindsight-api-slim/hindsight_api/engine/memory_engine.py), and [`db/postgresql.py`](../../hindsight-api-slim/hindsight_api/engine/db/postgresql.py).
 - Temporal-link maintenance: [`memories/pg/graph.py`](../../hindsight-api-slim/hindsight_api/engine/memories/pg/graph.py).
-
-Mem0 OSS `c7ee362aff94a369af70f13f2b4f853f6793ff4c` and hosted documentation:
-
-- Current temporal inputs, indexing, candidate construction, and entity boosts: [`mem0/memory/main.py`](https://github.com/mem0ai/mem0/blob/c7ee362aff94a369af70f13f2b4f853f6793ff4c/mem0/memory/main.py).
-- Observation-date default and extraction prompt: [`mem0/configs/prompts.py`](https://github.com/mem0ai/mem0/blob/c7ee362aff94a369af70f13f2b4f853f6793ff4c/mem0/configs/prompts.py).
-- Hosted claims only: [Temporal Reasoning](https://docs.mem0.ai/platform/features/temporal-reasoning) and [Graph Memory](https://docs.mem0.ai/platform/features/graph-memory), read September 18, 2026.
 
 This document is a static source comparison and unimplemented design. No PostgreSQL migration, query plan, parser, embedding, service, latency test, or answer-quality evaluation was run. [UNVERIFIED ASSUMPTION] The proposed schema, index plans, edge construction, multi-hop implementation, numerical settings, and quality/latency acceptance gates require implementation and real isolated validation; the worked examples demonstrate the contract, not measured runtime behavior.
