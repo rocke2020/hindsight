@@ -17,7 +17,7 @@ Scope: static source trace of `dev@ef1179c65`, the built-in PostgreSQL and Oracl
 - **Graph seed**: A semantically matched memory unit used as the starting point for Link Expansion.
 - **Link Expansion**: The built-in one-pass graph retriever; candidates discovered during the pass do not become another frontier.
 - **Temporal spreading**: The separate PostgreSQL temporal-arm traversal that can add newly discovered candidates to a bounded frontier.
-- **Recall arm**: One ranked candidate list: semantic, BM25 keyword, graph, or temporal.
+- **Recall arm**: One ranked candidate list: semantic, keyword/full-text, graph, or temporal.
 - **Query analyzer**: The CPU component that converts a natural-language date expression into a temporal window. The default implementation uses explicit period rules followed by `dateparser`, not a generative LLM.
 - **ANN**: Approximate nearest-neighbor vector search, used for semantic recall and semantic-link construction.
 - **RRF**: Reciprocal rank fusion, which combines arm ranks without comparing their raw score scales.
@@ -53,7 +53,7 @@ flowchart TD
         Q --> QT[Optional keyword tokens]
         Q --> QD[Optional time-window analysis]
         QE --> S[Semantic candidates]
-        QT --> K[BM25 candidates]
+        QT --> K[Keyword/full-text candidates]
         F --> S
         F --> K
         S --> GS[Up to 20 graph seeds per fact type]
@@ -134,15 +134,17 @@ The final streaming ANN pass uses up to 20 same-type neighbors per seed and the 
 Recall computes the query embedding before entering the store-owned recall boundary. For the default PostgreSQL store, the apparent four-arm retrieval is physically ordered to respect connection ownership and seed dependencies.
 
 1. Optional time-window analysis runs before the store call.
-2. Semantic retrieval and enabled BM25 retrieval run as one combined SQL statement for all requested fact types.
-3. If a time window exists, temporal retrieval runs on the same database connection after the combined semantic/BM25 query.
+2. Semantic retrieval and enabled keyword retrieval run as one combined SQL statement for all requested fact types.
+3. If a time window exists, temporal retrieval runs on the same database connection after the combined semantic/keyword query.
 4. The connection is released.
 5. Graph retrieval runs concurrently across fact types, with one Link Expansion call per fact type.
-6. The returned semantic, BM25, graph, and optional temporal lists enter downstream fusion.
+6. The returned semantic, keyword, graph, and optional temporal lists enter downstream fusion.
 
-Semantic retrieval is the baseline arm. BM25, temporal retrieval, graph retrieval, and cross-encoder reranking are independently enabled by bank configuration and are enabled by default.
+Semantic retrieval is the baseline arm. Keyword retrieval, temporal retrieval, graph retrieval, and cross-encoder reranking are independently enabled by bank configuration and are enabled by default.
 
-The built-in default recall path makes no generative LLM call. Query embedding and optional cross-encoder reranking are model inference but not text generation; semantic, BM25, Link Expansion, temporal spreading, fusion, scoring, and token selection are retrieval or deterministic processing. If temporal retrieval is enabled without an explicit window, the default `DateparserQueryAnalyzer` resolves supported date expressions on CPU. A caller can explicitly inject `TransformerQueryAnalyzer`, which uses local FLAN-T5 generation, but that is an optional replacement rather than the default recall design.
+**Hindsight itself calls the keyword arm "BM25" in its code and documentation, even though its default PostgreSQL implementation does not use the BM25 algorithm.** The default `native` backend matches a `tsvector` with `@@ to_tsquery(...)` and ranks results with `ts_rank_cd(...)`, PostgreSQL [full-text cover-density ranking](https://www.postgresql.org/docs/current/textsearch-controls.html#TEXTSEARCH-RANKING). Internal names such as `RecallArms.bm25`, `bm25_score`, and `bm25_rank` identify this keyword arm, regardless of its scoring backend. Optional `vchord`, `pg_textsearch`, and `pg_search` backends use actual BM25 scoring; `pgroonga` uses its own full-text score, and Oracle uses `CONTAINS` and `SCORE`.
+
+The built-in default recall path makes no generative LLM call. Query embedding and optional cross-encoder reranking are model inference but not text generation; semantic, keyword, Link Expansion, temporal spreading, fusion, scoring, and token selection are retrieval or deterministic processing. If temporal retrieval is enabled without an explicit window, the default `DateparserQueryAnalyzer` resolves supported date expressions on CPU. A caller can explicitly inject `TransformerQueryAnalyzer`, which uses local FLAN-T5 generation, but that is an optional replacement rather than the default recall design.
 
 ### 3.1 Seed reuse and fallback
 
@@ -256,7 +258,7 @@ One current implementation caveat narrows the role of `temporal_score`: cross-fa
 Graph retrieval returns candidates, not answers. Every graph candidate must survive the shared downstream pipeline before it appears in a recall response.
 
 1. Optional per-arm candidate caps run before fusion; the default `0` disables this cap.
-2. RRF normally combines semantic, BM25, graph, and any temporal ranks using `1 / (60 + rank_in_arm)` per appearance. Interleave is an explicit alternative that round-robins the arm lists while preserving each arm's leading candidates.
+2. RRF normally combines semantic, keyword, graph, and any temporal ranks using `1 / (60 + rank_in_arm)` per appearance. Interleave is an explicit alternative that round-robins the arm lists while preserving each arm's leading candidates.
 3. Optional strategy boosts can change the pre-reranker ordering, then the effective reranker candidate cap trims the merged set. The default effective cap is 300, with optional per-budget overrides.
 4. Only surviving candidates are hydrated with full payloads.
 5. Cross-encoder mode reranks hydrated candidates. RRF passthrough mode skips the cross-encoder but still applies combined scoring seeded from RRF order.
@@ -272,7 +274,7 @@ For example, assume `recall_max_candidates_per_source = 2` and the four best-fir
 
 ```text
 semantic: [S1, S2, S3, S4]
-BM25:     [K1, K2, K3]
+keyword:  [K1, K2, K3]
 graph:    [G1, G2, G3]
 temporal: [T1]
 ```
@@ -281,7 +283,7 @@ The lists entering fusion become:
 
 ```text
 semantic: [S1, S2]
-BM25:     [K1, K2]
+keyword:  [K1, K2]
 graph:    [G1, G2]
 temporal: [T1]
 ```
@@ -290,13 +292,13 @@ Fusion therefore receives seven arm entries rather than all eleven. The cap keep
 
 ### 6.2 Interleave Example
 
-Interleave is an explicit alternative to RRF that gives every non-empty arm's leading candidates early positions. It visits the arm lists in fixed priority order—semantic, BM25, graph, then temporal—taking every available rank-1 item before every rank-2 item, and so on.
+Interleave is an explicit alternative to RRF that gives every non-empty arm's leading candidates early positions. It visits the arm lists in fixed priority order—semantic, keyword, graph, then temporal—taking every available rank-1 item before every rank-2 item, and so on.
 
 For example, assume the best-first lists entering fusion are:
 
 ```text
 semantic: [S1, S2, S3]
-BM25:     [K1, K2]
+keyword:  [K1, K2]
 graph:    [G1]
 temporal: [T1, T2]
 ```
@@ -309,9 +311,9 @@ rank 2: S2, K2,     T2
 rank 3: S3
 ```
 
-The fused order is `[S1, K1, G1, T1, S2, K2, T2, S3]`. This preserves the opportunity for each arm's top hit: `T1` receives the fourth position instead of sitting behind the rest of the longer semantic and BM25 lists.
+The fused order is `[S1, K1, G1, T1, S2, K2, T2, S3]`. This preserves the opportunity for each arm's top hit: `T1` receives the fourth position instead of sitting behind the rest of the longer semantic and keyword lists.
 
-Duplicate memory IDs are emitted only at their first interleave position while retaining rank metadata from every arm. For example, semantic `[X, S2]` plus BM25 `[K1, X]` produces `[X, K1, S2]`; `X` appears once at the semantic rank-1 position and records both `semantic_rank = 1` and `bm25_rank = 2`. Empty or shorter arms are simply skipped. Interleave mode then skips cross-encoder and combined-score reordering so this position-derived order remains authoritative through the later sorts, although final filters and budgets can still remove candidates.
+Duplicate memory IDs are emitted only at their first interleave position while retaining rank metadata from every arm. For example, semantic `[X, S2]` plus keyword `[K1, X]` produces `[X, K1, S2]`; `X` appears once at the semantic rank-1 position and records both `semantic_rank = 1` and `bm25_rank = 2`. Empty or shorter arms are simply skipped. Interleave mode then skips cross-encoder and combined-score reordering so this position-derived order remains authoritative through the later sorts, although final filters and budgets can still remove candidates.
 
 The default budget function is fixed: low, mid, and high map to thinking budgets of 100, 300, and 1000. Adaptive budget mapping is available but is not the default.
 
@@ -358,7 +360,7 @@ For the query “Why did Maya move to a cheaper apartment?”, assume `MU_MOVE` 
 
 `MU_RENT` is the direct causal candidate because `MU_MOVE --caused_by--> MU_RENT` is outgoing from the seed. Link Expansion does not continue from `MU_RENT` to `MU_JOB`; `MU_JOB` appears independently through the shared `Maya` entity. With a suitable time window, PostgreSQL temporal spreading could continue along the second causal edge in its own recall arm.
 
-The graph arm therefore returns `[MU_RENT, MU_OLD, MU_JOB]` for these assumed values. Fusion can reward candidates that also appear in semantic, BM25, or temporal results, and reranking, scoring, and token selection can still change or remove them.
+The graph arm therefore returns `[MU_RENT, MU_OLD, MU_JOB]` for these assumed values. Fusion can reward candidates that also appear in semantic, keyword, or temporal results, and reranking, scoring, and token selection can still change or remove them.
 
 ## 8. Controls and Failure Boundaries
 
@@ -397,6 +399,7 @@ Source paths are relative to `hindsight-api-slim/hindsight_api/`; test paths are
 
 - Retain extraction and writes: `engine/retain/fact_extraction.py`, `engine/retain/orchestrator.py`, `engine/retain/link_utils.py`.
 - Recall orchestration: `engine/memories/postgres.py`, `engine/search/retrieval.py`.
+- Keyword backend default and ranking: `config.py`, `engine/sql/postgresql.py`, `engine/sql/oracle.py`.
 - Temporal query analysis: `engine/query_analyzer.py`, `engine/temporal_periods.py`, `engine/chinese_temporal_periods.py`, `engine/search/temporal_extraction.py`.
 - Link Expansion: `engine/search/link_expansion_retrieval.py`.
 - PostgreSQL and Oracle expansion SQL: `engine/db/ops_postgresql.py`, `engine/db/ops_oracle.py`.
