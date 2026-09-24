@@ -12,9 +12,9 @@ command -v uv uvx npx
 git add .
 
 # Review the exact commit boundary.
-git diff --cached --name-status
-git diff --cached --check
-git diff --cached
+# git diff --cached --name-status
+# git diff --cached --check
+# git diff --cached
 
 # Commit; the repository pre-commit hook runs automatically.
 git commit -m "docs: describe the documentation update"
