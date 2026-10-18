@@ -16,7 +16,7 @@ import time
 from contextlib import AbstractAsyncContextManager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 from google import genai
 from google.genai import errors as genai_errors
@@ -26,6 +26,7 @@ from hindsight_api.engine.llm_interface import LLM_TOOL_CHOICE_AUTO, LLMInterfac
 from hindsight_api.engine.llm_trace import LLMResponseUsage, stash_response_usage
 from hindsight_api.engine.llm_wrapper import parse_llm_json
 from hindsight_api.engine.providers.llm_debug import dump_request_on_4xx
+from hindsight_api.engine.remote_retry import jittered_backoff
 from hindsight_api.engine.response_models import LLMToolCall, LLMToolCallResult, TokenUsage
 from hindsight_api.engine.structured_output import has_tagged_union, provider_json_schema
 from hindsight_api.metrics import get_metrics_collector
@@ -39,6 +40,12 @@ logger = logging.getLogger(__name__)
 # Set exclusively by ConfiguredLLMProvider.call() / call_with_tools() via token-based
 # set/reset, so it is properly scoped to each individual LLM call and never leaks.
 _safety_settings_ctx: ContextVar[list | None] = ContextVar("gemini_safety_settings", default=None)
+
+# Google's documented placeholder for functionCall parts that never had a thought
+# signature (history transferred from another model, or injected by hand). Gemini 3
+# requires a signature on every functionCall part of the current turn.
+# https://ai.google.dev/gemini-api/docs/thought-signatures
+_SKIP_THOUGHT_SIGNATURE_VALIDATOR = b"skip_thought_signature_validator"
 
 
 # Vertex AI imports (optional)
@@ -67,6 +74,7 @@ def _usage_from_gemini_response(response: Any) -> LLMResponseUsage:
         input_tokens=usage.prompt_token_count or 0,
         output_tokens=usage.candidates_token_count or 0,
         cached_tokens=getattr(usage, "cached_content_token_count", 0) or 0,
+        thoughts_tokens=getattr(usage, "thoughts_token_count", 0) or 0,
     )
 
 
@@ -227,6 +235,11 @@ def _convert_messages_to_gemini(msg_list: list[dict[str, Any]]) -> _GeminiConver
                     part_kwargs: dict[str, Any] = {"function_call": genai_types.FunctionCall(**fc_kwargs)}
                     if thought_signature:
                         part_kwargs["thought_signature"] = base64.b64decode(thought_signature)
+                    else:
+                        # Tool calls replayed from another provider (failover mid tool loop)
+                        # carry no signature, and Gemini 3 rejects the turn with HTTP 400.
+                        # Google documents this literal as the bypass for exactly that case.
+                        part_kwargs["thought_signature"] = _SKIP_THOUGHT_SIGNATURE_VALIDATOR
                     parts.append(genai_types.Part(**part_kwargs))
                 gemini_contents.append(genai_types.Content(role="model", parts=parts))
             else:
@@ -443,7 +456,7 @@ class GeminiLLM(LLMInterface):
 
         Returns:
         """
-        start_time = time.time()
+        start_time = time.perf_counter()
 
         # Convert OpenAI-style messages to Gemini format. We ALWAYS build
         # system_instruction (even when a cache is in use): the config builder
@@ -469,7 +482,8 @@ class GeminiLLM(LLMInterface):
                 gemini_contents.append(genai_types.Content(role="user", parts=_to_gemini_parts(content, genai_types)))
 
         def _system_instruction_with_schema() -> str:
-            schema = provider_json_schema(response_format)
+            # Only called when a response_format was supplied; the enclosing branch is the check.
+            schema = provider_json_schema(cast("type[BaseModel]", response_format))
             schema_msg = (
                 f"\n\nYou must respond with valid JSON matching this schema:\n"
                 f"{json.dumps(schema, indent=2, ensure_ascii=False)}"
@@ -543,7 +557,9 @@ class GeminiLLM(LLMInterface):
                     response = await asyncio.wait_for(
                         self._client.aio.models.generate_content(
                             model=self.model,
-                            contents=gemini_contents,
+                            # The SDK's union names the concrete part types; these are built with its
+                            # own `genai_types.Content` above.
+                            contents=cast("list", gemini_contents),
                             config=generation_config,
                         ),
                         timeout=self._request_timeout,
@@ -600,7 +616,7 @@ class GeminiLLM(LLMInterface):
                     cached_tokens = cached_input_tokens
 
                 # Record metrics
-                duration = time.time() - start_time
+                duration = time.perf_counter() - start_time
                 metrics = get_metrics_collector()
                 metrics.record_llm_call(
                     provider=self.provider,
@@ -651,6 +667,7 @@ class GeminiLLM(LLMInterface):
                     finish_reason=finish_reason,
                     error=None,
                     cached_tokens=cached_tokens,
+                    thoughts_tokens=thoughts_tokens,
                 )
 
                 # Log slow calls
@@ -695,26 +712,27 @@ class GeminiLLM(LLMInterface):
                     raise
 
             except genai_errors.APIError as e:
-                # Fast fail on auth errors - these won't recover with retries
-                if e.code in (401, 403):
-                    logger.error(f"Gemini auth error (HTTP {e.code}), not retrying: {str(e)}")
-                    raise
-
                 # Cached-request safety net: a stale/invalid/expired CachedContent
-                # (or an incompatibility like cache + tool_config) surfaces as a 400.
-                # Retrying the same cached request can't recover, so on the first
-                # such failure drop the cache, invalidate it so later operations
-                # recreate it, and retry THIS call inline with the prefix inlined.
-                # Caching must never break a request. Handled before the 400
-                # fail-fast below so a recoverable cache-400 isn't mistaken for a
-                # deterministic rejection.
-                if cache_active and e.code == 400:
-                    logger.warning(f"Gemini cached call failed (400); retrying uncached. Reason: {str(e)}")
+                # (or an incompatibility like cache + tool_config) surfaces as a 400,
+                # and a cache that was deleted or aged out as a 403 ("CachedContent
+                # not found (or permission denied)"). Retrying the same cached request
+                # can't recover, so on the first such failure drop the cache,
+                # invalidate it so later operations recreate it, and retry THIS call
+                # inline with the prefix inlined. Caching must never break a request.
+                # Handled before the auth and 400 fail-fasts below: a genuine auth 403
+                # still fails, one uncached attempt later.
+                if cache_active and e.code in (400, 403):
+                    logger.warning(f"Gemini cached call failed ({e.code}); retrying uncached. Reason: {str(e)}")
                     if self._cache_manager is not None and cached_prefix is not None:
                         self._cache_manager.invalidate(cached_prefix)
                     cache_active = False
                     generation_config = _build_generation_config(cache_active)
                     continue
+
+                # Fast fail on auth errors - these won't recover with retries
+                if e.code in (401, 403):
+                    logger.error(f"Gemini auth error (HTTP {e.code}), not retrying: {str(e)}")
+                    raise
 
                 # Diagnostic dump of the exact request behind any 4xx. Forced on for a
                 # non-recoverable 400 (see below) so its content-free structural profile
@@ -743,9 +761,7 @@ class GeminiLLM(LLMInterface):
                 if e.code in (429, 500, 502, 503, 504) or (e.code and e.code >= 500):
                     last_exception = e
                     if attempt < max_retries:
-                        backoff = min(initial_backoff * (2**attempt), max_backoff)
-                        jitter = backoff * 0.2 * (2 * (time.time() % 1) - 1)
-                        await asyncio.sleep(backoff + jitter)
+                        await asyncio.sleep(jittered_backoff(attempt, initial_backoff, max_backoff))
                     else:
                         logger.error(f"Gemini API error after {max_retries + 1} attempts: {str(e)}")
                         raise
@@ -834,7 +850,7 @@ class GeminiLLM(LLMInterface):
         Returns:
             LLMToolCallResult with content and/or tool_calls.
         """
-        start_time = time.time()
+        start_time = time.perf_counter()
         using_cache = cached_prefix is not None
 
         # Convert tools to Gemini format. While the cache is in use the tool
@@ -949,7 +965,7 @@ class GeminiLLM(LLMInterface):
                     response = await asyncio.wait_for(
                         self._client.aio.models.generate_content(
                             model=self.model,
-                            contents=active_contents,
+                            contents=cast("list", active_contents),
                             config=config,
                         ),
                         timeout=self._request_timeout,
@@ -975,7 +991,8 @@ class GeminiLLM(LLMInterface):
                                 tool_calls.append(
                                     LLMToolCall(
                                         id=f"gemini_{len(tool_calls)}",
-                                        name=fc.name,
+                                        # The SDK types the name optional; a function call always carries one.
+                                        name=cast(str, fc.name),
                                         arguments=dict(fc.args) if fc.args else {},
                                         thought_signature=thought_signature,
                                     )
@@ -997,7 +1014,7 @@ class GeminiLLM(LLMInterface):
                     thoughts_tokens = getattr(response.usage_metadata, "thoughts_token_count", 0) or 0
 
                 # Record metrics
-                duration = time.time() - start_time
+                duration = time.perf_counter() - start_time
                 metrics = get_metrics_collector()
                 metrics.record_llm_call(
                     provider=self.provider,
@@ -1034,6 +1051,7 @@ class GeminiLLM(LLMInterface):
                     error=None,
                     tool_calls=tool_calls_dict,
                     cached_tokens=cached_input_tokens,
+                    thoughts_tokens=thoughts_tokens,
                 )
 
                 return LLMToolCallResult(
@@ -1047,24 +1065,24 @@ class GeminiLLM(LLMInterface):
                 )
 
             except genai_errors.APIError as e:
-                # Fast fail on auth errors
-                if e.code in (401, 403):
-                    logger.error(f"Gemini auth error (HTTP {e.code}), not retrying: {str(e)}")
-                    raise
-
                 # Cached-request safety net (see ``call``): a stale/invalid cache or
-                # a cache+tool_config conflict surfaces as a 400. Drop the cache,
-                # invalidate it for later operations, and retry THIS call inline
-                # with the prefix + tools re-sent. Caching must never break a call.
-                # Handled before the 400 fail-fast below so a recoverable cache-400
-                # isn't mistaken for a deterministic rejection.
-                if cache_active and e.code == 400:
-                    logger.warning(f"Gemini cached tool call failed (400); retrying uncached. Reason: {str(e)}")
+                # a cache+tool_config conflict surfaces as a 400, a deleted or expired
+                # cache as a 403. Drop the cache, invalidate it for later operations,
+                # and retry THIS call inline with the prefix + tools re-sent. Caching
+                # must never break a call. Handled before the auth and 400 fail-fasts
+                # below so a recoverable cache error isn't mistaken for either.
+                if cache_active and e.code in (400, 403):
+                    logger.warning(f"Gemini cached tool call failed ({e.code}); retrying uncached. Reason: {str(e)}")
                     if self._cache_manager is not None and cached_prefix is not None:
                         self._cache_manager.invalidate(cached_prefix)
                     cache_active = False
                     config = _build_tools_config(cache_active)
                     continue
+
+                # Fast fail on auth errors
+                if e.code in (401, 403):
+                    logger.error(f"Gemini auth error (HTTP {e.code}), not retrying: {str(e)}")
+                    raise
 
                 # Diagnostic dump of the exact request behind any 4xx. Forced on for a
                 # non-recoverable 400 so its content-free structural profile is always
@@ -1283,7 +1301,8 @@ class GeminiLLM(LLMInterface):
 
         batch = await self._client.aio.batches.create(
             model=self.model,
-            src=uploaded.name,
+            # `name` is set on every uploaded file the SDK returns.
+            src=cast(str, uploaded.name),
             config=genai_types.CreateBatchJobConfig(display_name="hindsight-batch"),
         )
 
@@ -1343,7 +1362,8 @@ class GeminiLLM(LLMInterface):
                 f"(submit_batch always uses file mode, so this is unexpected)"
             )
 
-        content = await self._client.aio.files.download(file=dest.file_name)
+        # `file_name` is set on every destination the file-mode branch above produces.
+        content = await self._client.aio.files.download(file=cast(str, dest.file_name))
         text = content.decode("utf-8") if isinstance(content, (bytes, bytearray)) else str(content)
 
         # The output is a JSONL error file plus results merged into one stream;
@@ -1469,7 +1489,18 @@ class GeminiLLM(LLMInterface):
         prompt = meta.get("promptTokenCount") or meta.get("prompt_token_count") or 0
         completion = meta.get("candidatesTokenCount") or meta.get("candidates_token_count") or 0
         total = meta.get("totalTokenCount") or meta.get("total_token_count") or 0
-        return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total}
+        cached = meta.get("cachedContentTokenCount") or meta.get("cached_content_token_count") or 0
+        thoughts = meta.get("thoughtsTokenCount") or meta.get("thoughts_token_count") or 0
+        # Cached and thinking counts ride in OpenAI's detail blocks so the consumer
+        # reads them the way it reads a live call (#5487). Gemini's total already
+        # includes thoughts, which is the "unfolded" shape visible_token_usage expects.
+        return {
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "total_tokens": total,
+            "prompt_tokens_details": {"cached_tokens": cached},
+            "completion_tokens_details": {"reasoning_tokens": thoughts},
+        }
 
     @staticmethod
     def _normalize_state(state: Any) -> str:

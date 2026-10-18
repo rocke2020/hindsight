@@ -337,6 +337,7 @@ def _render_retain(config: "HindsightConfig") -> PromptPreview:
     from .retain.fact_extraction import (
         _DEFAULT_LANGUAGE_RULE,
         CAUSAL_RELATIONSHIPS_SECTION,
+        OPTIONAL_DIMENSIONS_SECTION,
         _build_labels_prompt_section,
         _retain_mission_preamble,
         build_chunk_prompt_parts,
@@ -399,6 +400,15 @@ def _render_retain(config: "HindsightConfig") -> PromptPreview:
             "retain_extract_causal_links",
             CAUSAL_RELATIONSHIPS_SECTION.strip() if config.retain_extract_causal_links else "",
             value=str(config.retain_extract_causal_links).lower(),
+            kind="boolean",
+        ),
+        # Reported like the causal flag, and for the same reason: it appends a
+        # section of its own. It also rewrites "N/A" wherever the rest of the
+        # prompt names it, which the rendered text above shows directly.
+        _setting(
+            "retain_optional_fact_dimensions",
+            OPTIONAL_DIMENSIONS_SECTION.strip() if config.retain_optional_fact_dimensions else "",
+            value=str(config.retain_optional_fact_dimensions).lower(),
             kind="boolean",
         ),
         # The labels section is decided by two settings, so it is reported as two:
@@ -514,7 +524,8 @@ def _render_reflect(
         budget=None,
         llm_output_language=config.llm_output_language,
     )
-    user_prompt = build_agent_user_prompt(PLACEHOLDER_REFLECT_QUERY, config.llm_output_language)
+    mission = (profile.get("mission") or "").strip()
+    user_prompt = build_agent_user_prompt(PLACEHOLDER_REFLECT_QUERY, config.llm_output_language, mission)
 
     # The identity head is the bank's own name and disposition traits, so it reads as
     # hardcoded prompt text unless it is called out. Both lines come from the prompt
@@ -531,13 +542,18 @@ def _render_reflect(
             build_directives_section(directives).strip() if directives else "",
             active=bool(directives),
         ),
-        _setting("reflect_mission", (profile.get("mission") or "").strip(), value=config.reflect_mission),
+        _setting("reflect_mission", mission, value=config.reflect_mission),
         *_language_blocks(config, _TOOLS_LANGUAGE_RULE),
+    ]
+    # The mission is restated after the question too (see build_agent_user_prompt).
+    user_pieces = [
+        _setting("reflect_mission", mission, value=config.reflect_mission),
+        *_language_blocks(config, ""),
     ]
     return PromptPreview(
         messages=[
             PromptMessage(role="system", blocks=_partition(system_prompt, system_pieces)),
-            PromptMessage(role="user", blocks=_partition(user_prompt, _language_blocks(config, ""))),
+            PromptMessage(role="user", blocks=_partition(user_prompt, user_pieces)),
         ],
     )
 

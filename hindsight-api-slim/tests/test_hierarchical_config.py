@@ -137,11 +137,13 @@ async def test_hierarchical_fields_categorization():
     assert "retain_strategies" in configurable
     assert "max_observations_per_scope" in configurable
     assert "observation_scope_limits" in configurable
+    assert "consolidation_strategies" in configurable
     assert "reflect_source_facts_max_tokens" in configurable
     assert "llm_gemini_safety_settings" in configurable
     assert "mcp_enabled_tools" in configurable
     assert "retain_chunk_batch_size" in configurable
     assert "enable_auto_consolidation" in configurable
+    assert "consolidation_use_decision_model" in configurable
     assert "consolidation_llm_parallelism" in configurable
     assert "audit_log_enabled" in configurable
     assert "store_document_text" in configurable
@@ -149,10 +151,13 @@ async def test_hierarchical_fields_categorization():
     assert "enable_temporal_retrieval" in configurable
     assert "enable_graph_retrieval" in configurable
     assert "enable_reranking" in configurable
+    assert "recall_prefer_observations" in configurable
     assert "mental_model_min_refresh_interval_seconds" in configurable
+    assert "knowledge_page_default_trigger" in configurable
+    assert "reflect_default_options" in configurable
 
     # Verify count is correct
-    assert len(configurable) == 48
+    assert len(configurable) == 55
 
     # Verify credential fields (NEVER exposed)
     assert "llm_api_key" in credentials
@@ -180,7 +185,7 @@ async def test_config_hierarchy_resolution(memory, request_context):
 
     try:
         # Ensure bank exists in database
-        await memory.get_bank_profile(bank_id, request_context=request_context)
+        await memory.ensure_bank_profile(bank_id, request_context=request_context)
 
         # Set up mock tenant extension with tenant-level config (use configurable fields only)
         tenant_config = {"retain_chunk_size": 5000, "retain_extraction_mode": "tenant-mode"}
@@ -494,7 +499,7 @@ async def test_config_validation_rejects_static_fields(memory, request_context):
 
     try:
         # Ensure bank exists in database
-        await memory.get_bank_profile(bank_id, request_context=request_context)
+        await memory.ensure_bank_profile(bank_id, request_context=request_context)
 
         resolver = ConfigResolver(backend=memory._backend)
 
@@ -538,7 +543,7 @@ async def test_config_validation_rejects_malformed_entity_labels(memory, request
     bank_id = "test-entity-labels-validation"
 
     try:
-        await memory.get_bank_profile(bank_id, request_context=request_context)
+        await memory.ensure_bank_profile(bank_id, request_context=request_context)
 
         resolver = ConfigResolver(backend=memory._backend)
 
@@ -575,7 +580,7 @@ async def test_config_freshness_across_updates(memory, request_context):
 
     try:
         # Ensure bank exists in database
-        await memory.get_bank_profile(bank1, request_context=request_context)
+        await memory.ensure_bank_profile(bank1, request_context=request_context)
 
         resolver = ConfigResolver(backend=memory._backend)
 
@@ -623,7 +628,7 @@ async def test_update_bank_config_rejects_missing_bank(memory, request_context):
     with pytest.raises(BankConfigPersistenceConflictError, match="does not exist"):
         await resolver.update_bank_config(bank_id, {"enable_observations": False}, request_context)
 
-    profile = await memory.get_bank_profile(bank_id, request_context=request_context, create_if_missing=False)
+    profile = await memory.get_bank_profile(bank_id, request_context=request_context)
     assert profile is None
 
 
@@ -634,7 +639,7 @@ async def test_config_reset_to_defaults(memory, request_context):
 
     try:
         # Ensure bank exists in database
-        await memory.get_bank_profile(bank_id, request_context=request_context)
+        await memory.ensure_bank_profile(bank_id, request_context=request_context)
 
         resolver = ConfigResolver(backend=memory._backend)
 
@@ -677,7 +682,7 @@ async def test_config_supports_both_key_formats(memory, request_context):
 
     try:
         # Ensure bank exists in database
-        await memory.get_bank_profile(bank_id, request_context=request_context)
+        await memory.ensure_bank_profile(bank_id, request_context=request_context)
 
         resolver = ConfigResolver(backend=memory._backend)
 
@@ -717,7 +722,7 @@ async def test_config_only_configurable_fields_stored(memory, request_context):
 
     try:
         # Ensure bank exists in database
-        await memory.get_bank_profile(bank_id, request_context=request_context)
+        await memory.ensure_bank_profile(bank_id, request_context=request_context)
 
         resolver = ConfigResolver(backend=memory._backend)
 
@@ -746,7 +751,7 @@ async def test_config_get_bank_config_no_static_or_credential_fields_leak(memory
 
     try:
         # Ensure bank exists in database
-        await memory.get_bank_profile(bank_id, request_context=request_context)
+        await memory.ensure_bank_profile(bank_id, request_context=request_context)
 
         resolver = ConfigResolver(backend=memory._backend)
 
@@ -798,7 +803,7 @@ async def test_config_get_bank_config_no_static_or_credential_fields_leak(memory
             assert field in config, f"Expected configurable field '{field}' missing from config"
 
         # Should have a small number of configurable fields (not hundreds)
-        assert len(config) < 50, f"Too many fields returned: {len(config)}"
+        assert len(config) < 60, f"Too many fields returned: {len(config)}"
 
     finally:
         await memory.delete_bank(bank_id, request_context=request_context)
@@ -835,7 +840,7 @@ async def test_config_permissions_system(memory, request_context):
 
     try:
         # Ensure bank exists in database
-        await memory.get_bank_profile(bank_id, request_context=request_context)
+        await memory.ensure_bank_profile(bank_id, request_context=request_context)
 
         # Test 1: None = allow all configurable fields
         extension = PermissionTenantExtension(allowed_fields=None)

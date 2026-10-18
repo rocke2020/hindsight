@@ -209,6 +209,10 @@ async def test_version_endpoint_reports_store_document_text(api_client, store_do
     resp = await api_client.get("/version")
     assert resp.status_code == 200, resp.text
     assert resp.json()["features"]["store_document_text"] is False
+    # The /v1 alias answers identically, so a /v1-only ingress can still reach it (#5286).
+    alias = await api_client.get("/v1/version")
+    assert alias.status_code == 200, alias.text
+    assert alias.json() == resp.json()
 
 
 def test_reflect_excludes_expand_tool_when_text_disabled():
@@ -242,8 +246,8 @@ async def test_store_document_text_per_bank_override(memory, request_context):
 
     try:
         # Both banks exist; disable raw-text storage on off_bank only.
-        await memory.get_bank_profile(bank_id=off_bank, request_context=request_context)
-        await memory.get_bank_profile(bank_id=on_bank, request_context=request_context)
+        await memory.ensure_bank_profile(bank_id=off_bank, request_context=request_context)
+        await memory.ensure_bank_profile(bank_id=on_bank, request_context=request_context)
         await memory._config_resolver.update_bank_config(off_bank, {"store_document_text": False})
 
         for bank_id in (off_bank, on_bank):

@@ -8,6 +8,8 @@ bank in scope or config resolution fails.
 """
 
 import asyncio
+import gc
+import weakref
 from datetime import datetime
 
 import httpx
@@ -174,6 +176,64 @@ async def test_audit_write_qualifies_schema_on_postgres(monkeypatch):
     assert '"tenant_x".audit_log' in sql
 
 
+# ── In-flight audit writes (no DB) ─────────────────────────────────────────
+
+
+def _capturing_logger(sink: list[str]) -> AuditLogger:
+    return AuditLogger(
+        pool_getter=lambda: _CapturingPool(sink),
+        schema_getter=lambda: "public",
+        enabled=True,
+        allowed_actions=[],
+    )
+
+
+@pytest.mark.asyncio
+async def test_in_flight_audit_write_is_not_garbage_collected():
+    # The event loop only holds weak references to tasks, so a write nothing else
+    # references can be collected mid-flight and its audit row is silently lost.
+    logger = _capturing_logger([])
+    waiters: list[weakref.ref[asyncio.Future[None]]] = []
+    finished = asyncio.Event()
+
+    async def write(entry: AuditEntry) -> None:
+        waiter: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        waiters.append(weakref.ref(waiter))
+        await waiter
+        finished.set()
+
+    logger._safe_log = write  # type: ignore[method-assign]
+    logger.log_fire_and_forget(AuditEntry(action="recall", transport="http", bank_id="b1"))
+    await asyncio.sleep(0)  # let the write start and suspend on its only future
+    gc.collect()
+
+    waiter = waiters[0]()
+    assert waiter is not None, "the in-flight audit write was garbage collected"
+    waiter.set_result(None)
+    await asyncio.wait_for(finished.wait(), timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_drain_completes_writes_scheduled_just_before_shutdown():
+    # close() tears the pool down right after the last request; a write scheduled
+    # just before it must land first, or the pool getter returns None and the row
+    # is dropped.
+    sink: list[str] = []
+    logger = _capturing_logger(sink)
+
+    logger.log_fire_and_forget(AuditEntry(action="recall", transport="http", bank_id="b1"))
+    assert sink == [], "the write has not run yet"
+
+    await logger.drain()
+
+    assert len(sink) == 1
+
+
+@pytest.mark.asyncio
+async def test_drain_returns_immediately_when_nothing_is_in_flight():
+    await _capturing_logger([]).drain()
+
+
 # ── AuditLogger decision logic (no DB) ─────────────────────────────────────
 
 
@@ -264,7 +324,7 @@ async def test_gating_ignores_config_permission_filter(memory, request_context):
             # audit_log_enabled deliberately absent: read-only for this user.
             return {"retain_chunk_size"}
 
-    await memory.get_bank_profile(bank_id, request_context=request_context)
+    await memory.ensure_bank_profile(bank_id, request_context=request_context)
 
     # Store the opt-in with an allow-all resolver (the write is a separate
     # concern from gating), then swap in the restrictive extension.

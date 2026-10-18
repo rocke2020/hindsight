@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any
 
 from ....config import get_config
@@ -182,7 +182,9 @@ async def observations_for_sources(
     ops,
     fq_table: Callable[[str], str],
     bank_id: str,
-    unit_ids: list[str | uuid.UUID],
+    # `Sequence`, not `list`: a list is invariant, so neither `list[str]` nor `list[UUID]` --
+    # what the two callers hold -- is a `list[str | UUID]`. Nothing here mutates it.
+    unit_ids: Sequence[str | uuid.UUID],
 ) -> list[StoredMemory]:
     """Observations consolidated from any of ``unit_ids``.
 
@@ -285,6 +287,25 @@ async def delete_stale_observations(
             if src_str not in deleted_set and src_str not in seen_remaining:
                 remaining_source_ids.append(uuid.UUID(src_str))
                 seen_remaining.add(src_str)
+
+    # Lock every row this sweep touches — the outgoing facts, the observations and their
+    # surviving co-sources, which belong to OTHER documents — in one id order before writing
+    # any of them. Two sweeps over a shared observation otherwise each hold rows the other
+    # writes next and deadlock (#4251). The engine's delete, edit and invalidate paths, which
+    # write their facts first, therefore also sweep before that write, so their locks are
+    # taken in this order too.
+    # The facts only need a writer lock here: their keys are unchanged until the
+    # caller's later delete. FOR UPDATE also blocks the relinker's FOR KEY SHARE
+    # parent locks while it holds graph_maintenance_queue rows that our caller
+    # next enqueues, forming a cross-table deadlock. NO KEY UPDATE still excludes
+    # concurrent sweeps and consolidation's FOR SHARE, but lets those FK guards
+    # finish; actual DELETEs acquire the stronger lock when they remove a row.
+    await conn.fetch(
+        f"SELECT id FROM {fq_table('memory_units')} WHERE bank_id = $1 AND id = ANY($2::uuid[]) "
+        "ORDER BY id FOR NO KEY UPDATE",
+        bank_id,
+        sorted({*fact_uuids, *obs_ids, *remaining_source_ids}),
+    )
 
     await conn.execute(
         f"DELETE FROM {fq_table('memory_units')} WHERE id = ANY($1::uuid[])",
@@ -408,7 +429,7 @@ async def invalidate_memory(*, conn, fq_table, bank_id: str, unit_id: str, reaso
     # Causal edges are retain-time extraction output the FK cascade would destroy for good —
     # unlike temporal/semantic links they can't be recomputed, so snapshot their descriptors onto
     # the archive row and revert rematerializes them (#2864).
-    from ...retain.link_utils import snapshot_causal_links
+    from .links import snapshot_causal_links
 
     causal_links = await snapshot_causal_links(conn, bank_id, str(unit_id))
     inserted = await conn.fetchval(
@@ -423,7 +444,11 @@ async def invalidate_memory(*, conn, fq_table, bank_id: str, unit_id: str, reaso
     )
     if inserted is None:
         return False
-    # The cascade prunes `unit_entities` and `memory_links` with the row.
+    # Links in lock order (see delete_unit_links) — after the causal snapshot above reads them.
+    from .graph import _ops_for
+
+    await _ops_for(conn).delete_unit_links(conn, fq_table("memory_links"), bank_id, [str(unit_id)])
+    # The cascade prunes `unit_entities` with the row.
     await conn.execute(f"DELETE FROM {mu} WHERE id = $1 AND bank_id = $2", str(unit_id), bank_id)
     return True
 
@@ -494,7 +519,7 @@ async def restore_memory(*, conn, fq_table, bank_id: str, unit_id: str) -> Store
     # Rematerialize the causal edges parked at invalidation (#2864). Edges whose peer is still
     # archived or permanently deleted are skipped — the peer keeps its own copy and recreates the
     # edge when it reverts, so the restore is order-independent and idempotent.
-    from ...retain.link_utils import rematerialize_causal_links
+    from .links import rematerialize_causal_links
 
     causal_json = await conn.fetchval(
         f"SELECT causal_links FROM {arch} WHERE id = $1 AND bank_id = $2", str(unit_id), bank_id
@@ -578,11 +603,10 @@ async def apply_edit(
     )
     # Drop only the DERIVED links — graph maintenance recomputes temporal/semantic. Causal edges
     # are retain-time extraction output that nothing recreates, so an edit preserves them (#2864).
-    await conn.execute(
-        f"DELETE FROM {ml} WHERE (from_unit_id = $1 OR to_unit_id = $1) AND NOT (link_type = ANY($2::text[]))",
-        str(unit_id),
-        list(CAUSAL_LINK_TYPES),
-    )
+    # In lock order, like every other link delete (see delete_unit_links).
+    from .graph import _ops_for
+
+    await _ops_for(conn).delete_unit_links(conn, ml, bank_id, [str(unit_id)], keep_link_types=list(CAUSAL_LINK_TYPES))
 
 
 __all__ = [

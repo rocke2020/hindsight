@@ -9,7 +9,8 @@ import logging
 import re
 import threading
 from abc import ABC, abstractmethod
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
+from typing import cast
 
 from dateparser.conf import Settings, apply_settings
 from pydantic import BaseModel, Field
@@ -21,6 +22,18 @@ from hindsight_api.engine.temporal_periods import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def default_reference_date() -> datetime:
+    """The anchor relative expressions resolve against when no caller supplies one.
+
+    UTC, not the server's local wall clock. ``event_date`` is stored in UTC and
+    ``retrieve_temporal_combined_sql`` stamps a naive window as UTC, so a window
+    built from local midnight names a different day for part of every day on a
+    server outside UTC. Naive, to keep the returned window's shape unchanged.
+    """
+    return datetime.now(UTC).replace(tzinfo=None)
+
 
 # dateparser.search_dates over-matches: short common words that happen to be
 # weekday/month abbreviations in *some* language ("we"/"me"/"did" -> a weekday,
@@ -253,7 +266,7 @@ class QueryAnalyzer(ABC):
 
         Args:
             query: Natural language query to analyze
-            reference_date: Reference date for relative terms (defaults to now)
+            reference_date: Reference date for relative terms (defaults to the current UTC time)
 
         Returns:
             QueryAnalysis containing extracted information
@@ -361,7 +374,10 @@ class DateparserQueryAnalyzer(QueryAnalyzer):
             # Settings populates its attributes dynamically, so this is a getattr
             # rather than a plain access: the name is not statically visible.
             default_languages = getattr(settings, "DEFAULT_LANGUAGES", None)
-            language = best_language(text, self._locales) or (default_languages[0] if default_languages else None)
+            # `_locales` starts as None and is filled during `load()`, which runs first.
+            language = best_language(text, cast("list", self._locales)) or (
+                default_languages[0] if default_languages else None
+            )
             if not language:
                 return None
             return self._exact_search.search_parse(language, text, settings=settings) or None
@@ -375,13 +391,13 @@ class DateparserQueryAnalyzer(QueryAnalyzer):
 
         Args:
             query: Natural language query (any language)
-            reference_date: Reference date for relative terms (defaults to now)
+            reference_date: Reference date for relative terms (defaults to the current UTC time)
 
         Returns:
             QueryAnalysis with temporal_constraint if found
         """
         if reference_date is None:
-            reference_date = datetime.now()
+            reference_date = default_reference_date()
 
         # Check for period expressions first (these need special handling)
         query_lower = query.lower()
@@ -493,17 +509,20 @@ class TransformerQueryAnalyzer(QueryAnalyzer):
                 "transformers is required for TransformerQueryAnalyzer. Install it with: pip install transformers"
             )
 
-        from .local_device import align_local_model_weights
+        from .local_device import LOCAL_MODEL_BUILD_LOCK, align_local_model_weights, prefetch_local_model
 
         logger.info(f"Loading query analyzer model: {self.model_name}...")
-        self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-        self._model = AutoModelForSeq2SeqLM.from_pretrained(self.model_name)
-        self._model.to(self.device)
-        self._model.eval()
-        # Zero-copy safetensors weights can land on a sub-element byte offset, which
-        # corrupts the CPU matmul (see engine/local_device.py). `.to()` is a no-op for a
-        # CPU model, so it does not launder the alignment.
-        align_local_model_weights(self._model, label=f"QueryAnalyzer[{self.model_name}]")
+        # Starts alongside the other local models; see LOCAL_MODEL_BUILD_LOCK.
+        prefetch_local_model(self.model_name)
+        with LOCAL_MODEL_BUILD_LOCK:
+            self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+            self._model = AutoModelForSeq2SeqLM.from_pretrained(self.model_name)
+            self._model.to(self.device)
+            self._model.eval()
+            # Zero-copy safetensors weights can land on a sub-element byte offset, which
+            # corrupts the CPU matmul (see engine/local_device.py). `.to()` is a no-op for a
+            # CPU model, so it does not launder the alignment.
+            align_local_model_weights(self._model, label=f"QueryAnalyzer[{self.model_name}]")
         logger.info("Query analyzer model loaded")
 
     def _load_model(self):
@@ -603,13 +622,13 @@ class TransformerQueryAnalyzer(QueryAnalyzer):
 
         Args:
             query: Natural language query
-            reference_date: Reference date for relative terms (defaults to now)
+            reference_date: Reference date for relative terms (defaults to the current UTC time)
 
         Returns:
             QueryAnalysis with temporal_constraint if found
         """
         if reference_date is None:
-            reference_date = datetime.now()
+            reference_date = default_reference_date()
 
         # Try rule-based extraction first (handles 90%+ of cases)
         result = self._extract_with_rules(query, reference_date)

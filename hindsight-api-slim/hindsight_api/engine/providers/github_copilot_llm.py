@@ -597,7 +597,7 @@ class GitHubCopilotLLM(LLMInterface):
         strict_schema: bool = False,
         attempt_context: Callable[[], AbstractAsyncContextManager[None]] | None = None,
     ) -> LLMCallResult:
-        start_time = time.time()
+        start_time = time.perf_counter()
 
         for attempt in range(max_retries + 1):
             try:
@@ -634,6 +634,7 @@ class GitHubCopilotLLM(LLMInterface):
                         input_tokens=invocation.usage.input_tokens,
                         output_tokens=invocation.usage.output_tokens,
                         cached_tokens=invocation.usage.cached_tokens,
+                        thoughts_tokens=invocation.usage.thoughts_tokens,
                     )
                 )
 
@@ -654,7 +655,7 @@ class GitHubCopilotLLM(LLMInterface):
                         raise RuntimeError("GitHub Copilot returned an empty response")
                     result = invocation.content
 
-                duration = time.time() - start_time
+                duration = time.perf_counter() - start_time
                 self._record_success(
                     messages=messages,
                     result=result,
@@ -702,7 +703,7 @@ class GitHubCopilotLLM(LLMInterface):
         tool_choice: LLMToolChoice = LLM_TOOL_CHOICE_AUTO,
         attempt_context: Callable[[], AbstractAsyncContextManager[None]] | None = None,
     ) -> LLMToolCallResult:
-        start_time = time.time()
+        start_time = time.perf_counter()
 
         for attempt in range(max_retries + 1):
             try:
@@ -750,6 +751,7 @@ class GitHubCopilotLLM(LLMInterface):
                         input_tokens=invocation.usage.input_tokens,
                         output_tokens=invocation.usage.output_tokens,
                         cached_tokens=invocation.usage.cached_tokens,
+                        thoughts_tokens=invocation.usage.thoughts_tokens,
                     )
                 )
 
@@ -760,7 +762,7 @@ class GitHubCopilotLLM(LLMInterface):
                 elif tool_choice.mode is LLMToolChoiceMode.REQUIRED and not invocation.tool_calls:
                     raise RuntimeError("GitHub Copilot did not call any tool when a tool call was required")
 
-                duration = time.time() - start_time
+                duration = time.perf_counter() - start_time
                 result = LLMToolCallResult(
                     content=invocation.content or None,
                     tool_calls=invocation.tool_calls,
@@ -835,6 +837,7 @@ class GitHubCopilotLLM(LLMInterface):
                 input_tokens=usage.input_tokens,
                 output_tokens=usage.output_tokens,
                 cached_tokens=usage.cached_tokens,
+                thoughts_tokens=usage.thoughts_tokens,
                 duration=duration,
                 finish_reason=invocation.finish_reason,
                 error=None,

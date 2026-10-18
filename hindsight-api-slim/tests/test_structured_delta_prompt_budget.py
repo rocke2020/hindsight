@@ -3,6 +3,7 @@
 from hindsight_api.engine.reflect.prompts import (
     STRUCTURED_DELTA_SYSTEM_PROMPT,
     _fit_structured_delta_prompt_parts,
+    build_mental_model_refresh_context,
     build_structured_delta_prompt,
 )
 from hindsight_api.engine.reflect.tokenization import count_prompt_tokens
@@ -16,7 +17,6 @@ def test_build_structured_delta_prompt_truncates_huge_document():
     )
     prompt = build_structured_delta_prompt(
         current_document_json=huge_doc,
-        candidate_markdown="short synthesis",
         supporting_facts=[{"id": "1", "text": "new fact", "type": "world"}],
         source_query="topic?",
         max_input_tokens=4000,
@@ -67,3 +67,95 @@ def test_retraction_prompt_does_not_transpose_surviving_and_retracted():
         "the surviving fact must appear under STILL-SUPPORTED, before the RETRACTED heading"
     )
     assert prompt.index("WITHDRAWN_MARKER") > retracted_heading, "the retracted fact must appear under RETRACTED FACTS"
+
+
+def test_delta_prompt_ends_with_the_date_order_rule():
+    """The date-order rule is the last thing the model reads.
+
+    Facts arrive out of date order, so a delta batch can bring an ownership change
+    OLDER than the owner the page records. Stated only in the system prompt, a
+    35B model kept the newer owner in 0 of 8 replays; the same rule at the end of
+    the user message, where it is read last, kept it in 7 of 8. So the position is
+    part of the contract, not just the wording.
+    """
+    prompt = build_structured_delta_prompt(
+        current_document_json='{"sections": []}',
+        supporting_facts=[{"id": "1", "text": "new fact", "type": "world"}],
+        source_query="topic?",
+        max_output_tokens=2000,
+    )
+    tail = prompt[prompt.index("## Task") :]
+    assert "latest-dated event is the current state" in tail
+    assert prompt.rstrip().endswith("only adds history.")
+    assert "later-DATED statement" in STRUCTURED_DELTA_SYSTEM_PROMPT
+
+
+def test_delta_prompt_asks_for_a_reread_of_the_opening_summary():
+    """The task tells the model to re-read the whole page, opening summary first.
+
+    #5228: a refresh fixed the block a new fact was about and left the opening summary
+    saying the old owner, with no change recorded. Its rate is graded end to end by
+    system-evals ``test_10``; this pins the instruction and its place before the
+    date-order rule.
+    """
+    prompt = build_structured_delta_prompt(
+        current_document_json='{"sections": []}',
+        supporting_facts=[{"id": "1", "text": "new fact", "type": "world"}],
+        source_query="topic?",
+    )
+    tail = prompt[prompt.index("## Task") :]
+    assert "opening summary (section id 'preamble')" in tail
+    assert tail.index("re-read CURRENT DOCUMENT") < tail.index("Facts arrive out of date order")
+
+
+def test_refresh_context_asks_full_refresh_for_dates_and_delta_for_events():
+    """Full and delta refreshes get opposite advice about "current".
+
+    A full refresh writes the page, so it must record since when each state holds —
+    without that date a backfilled event cannot be ordered against it. A delta
+    synthesis sees only the new batch; asked the same thing it writes "X owns it as
+    of April 2024", which the delta step reads as superseding a newer owner. So the
+    delta synthesis reports dated events and never calls anything current.
+    """
+    full = build_mental_model_refresh_context("Ownership", delta=False)
+    delta = build_mental_model_refresh_context("Ownership", delta=True)
+
+    for context in (full, delta):
+        assert context.startswith('You are writing a document called "Ownership".')
+    assert "say since when it has been true" in full
+    assert "Do NOT say what is current" not in full
+    assert "Do NOT say what is current" in delta
+    assert "say since when it has been true" not in delta
+
+
+def test_delta_prompt_carries_no_batch_synthesis():
+    """The ops call sees the document and the new facts, never the batch-only synthesis.
+
+    The synthesis is written from the new batch alone, so "no release was deployed"
+    in it describes the batch — and two models read it as a statement about the
+    topic and overwrote a release recorded one wave earlier, despite the prompt
+    calling it untrusted (#5272). Nothing in the prompt may invite that reading.
+    """
+    prompt = build_structured_delta_prompt(
+        current_document_json='{"sections": []}',
+        supporting_facts=[{"id": "1", "text": "new fact", "type": "world"}],
+        source_query="topic?",
+    )
+    for text in (prompt, STRUCTURED_DELTA_SYSTEM_PROMPT):
+        assert "SYNTHESIS" not in text.upper()
+
+
+def test_an_empty_candidate_slot_gives_its_budget_to_the_document():
+    """The refresh no longer sends a synthesis, so its share must not sit unused."""
+    doc = "word " * 20_000
+    kwargs = {
+        "source_query": "q",
+        "current_document_json": doc,
+        "facts_block": "fact",
+        "budget_hint": "",
+        "task_footer": "## Task",
+        "max_input_tokens": 8000,
+    }
+    with_candidate = _fit_structured_delta_prompt_parts(candidate_markdown="surviving facts", **kwargs)
+    without = _fit_structured_delta_prompt_parts(candidate_markdown="", **kwargs)
+    assert len(without.document_json) > len(with_candidate.document_json) * 1.4

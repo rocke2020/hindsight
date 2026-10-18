@@ -1,5 +1,8 @@
 """Tests for metrics instrumentation."""
 
+import itertools
+import time
+
 import pytest
 from unittest.mock import MagicMock, patch
 
@@ -11,7 +14,6 @@ from hindsight_api.metrics import (
     get_token_bucket,
     create_metrics_collector,
     initialize_metrics,
-    normalize_http_endpoint,
 )
 
 
@@ -103,6 +105,26 @@ class TestMetricsCollector:
         assert "bank_id" not in attributes  # excluded by default to avoid high-cardinality OTel growth
         assert attributes["source"] == "api"
         assert attributes["success"] == "true"
+
+    @pytest.fixture
+    def wall_clock_steps_back(self, monkeypatch):
+        """Each time.time() reading is a second earlier than the last, as across an NTP step back."""
+        readings = itertools.count(1_790_897_894.0, -1.0)
+        monkeypatch.setattr(time, "time", lambda: next(readings))
+
+    def test_operation_duration_stays_non_negative_when_the_wall_clock_steps_back(
+        self, collector, wall_clock_steps_back
+    ):
+        with collector.record_operation("recall", bank_id="test_bank", source="api"):
+            pass
+
+        assert collector.operation_duration.record.call_args[0][0] >= 0
+
+    def test_http_duration_stays_non_negative_when_the_wall_clock_steps_back(self, collector, wall_clock_steps_back):
+        with collector.record_http_request("POST", "/v1/default/banks/b/memories/recall", lambda: 200):
+            pass
+
+        assert collector.http_request_duration.record.call_args[0][0] >= 0
 
     def test_record_operation_records_failure_on_exception(self, collector):
         """Test that record_operation records failure when exception occurs."""
@@ -264,6 +286,58 @@ class TestMetricsCollector:
         attributes = collector.operation_duration.record.call_args[0][1]
         assert attributes["bank_id"] == "test_bank"
 
+    def test_tenant_label_excluded_by_default(self):
+        """The per-tenant (schema) label is high-cardinality and off by default.
+
+        metrics_include_tenant=False must strip ``tenant`` from every always-on instrument.
+        Regression for OTel metric blow-up on deployments with many tenant schemas: one series
+        set per tenant, multiplied through every histogram bucket.
+        """
+        from hindsight_api.config import DEFAULT_METRICS_INCLUDE_TENANT
+
+        assert DEFAULT_METRICS_INCLUDE_TENANT is False
+        mock_config = MagicMock()
+        mock_config.metrics_include_bank_id = False
+        mock_config.metrics_include_tenant = False
+        mock_config.recall_diagnostic_phases = True
+        mock_config.recall_phase_sample_every = 1
+        with (
+            patch("hindsight_api.metrics.get_meter", return_value=MagicMock()),
+            patch("hindsight_api.config.get_config", return_value=mock_config),
+            patch("hindsight_api.metrics._get_tenant", return_value="tenant_abc"),
+        ):
+            collector = MetricsCollector()
+
+        collector.record_operation_result("recall", "test_bank", success=True, duration=0.1)
+        collector.record_recall_phase("engine_auth", 0.01)
+        collector.record_retain_phase("write", 0.01)
+
+        op_attrs = collector.operation_duration.record.call_args[0][1]
+        recall_attrs = collector.recall_phase_duration.record.call_args[0][1]
+        retain_attrs = collector.retain_phase_duration.record.call_args[0][1]
+        assert "tenant" not in op_attrs
+        assert "tenant" not in recall_attrs
+        assert "tenant" not in retain_attrs
+
+    def test_tenant_label_included_when_enabled(self):
+        """metrics_include_tenant=True restores the ``tenant`` label for small deployments."""
+        mock_config = MagicMock()
+        mock_config.metrics_include_bank_id = False
+        mock_config.metrics_include_tenant = True
+        mock_config.recall_diagnostic_phases = True
+        mock_config.recall_phase_sample_every = 1
+        with (
+            patch("hindsight_api.metrics.get_meter", return_value=MagicMock()),
+            patch("hindsight_api.config.get_config", return_value=mock_config),
+            patch("hindsight_api.metrics._get_tenant", return_value="tenant_abc"),
+        ):
+            collector = MetricsCollector()
+            # _get_tenant is read at record time, so the phase must be recorded inside the patch.
+            collector.record_recall_phase("engine_auth", 0.01)
+
+        recall_attrs = collector.recall_phase_duration.record.call_args[0][1]
+        assert recall_attrs["tenant"] == "tenant_abc"
+
     @pytest.mark.parametrize("enabled", [True, False])
     def test_recall_diagnostic_phases_follow_config(self, enabled):
         """Diagnostic phases are dropped when disabled; ordinary phases are always recorded, once."""
@@ -387,24 +461,6 @@ class TestGetTokenBucket:
         assert get_token_bucket(50000) == "50k+"
         assert get_token_bucket(100000) == "50k+"
         assert get_token_bucket(1000000) == "50k+"
-
-
-class TestNormalizeHttpEndpoint:
-    """Tests for normalize_http_endpoint (low-cardinality HTTP metric labels)."""
-
-    def test_templates_high_cardinality_segments(self):
-        """Bank ids (incl. non-numeric), UUIDs, and numeric ids collapse to placeholders."""
-        cases = [
-            ("/v1/default/banks/user-1680/memories/recall", "/v1/default/banks/{bank_id}/memories/recall"),
-            ("/v1/default/banks/tenant-acme/memories", "/v1/default/banks/{bank_id}/memories"),
-            ("/v1/default/banks/user-1680", "/v1/default/banks/{bank_id}"),
-            ("/v1/default/banks/3f8c1e2a-1111-2222-3333-444455556666/config", "/v1/default/banks/{bank_id}/config"),
-            ("/v1/default/banks/42/config", "/v1/default/banks/{bank_id}/config"),
-            ("/v1/default/banks", "/v1/default/banks"),
-            ("/health", "/health"),
-        ]
-        for raw, expected in cases:
-            assert normalize_http_endpoint(raw) == expected, raw
 
 
 class TestLLMMetrics:

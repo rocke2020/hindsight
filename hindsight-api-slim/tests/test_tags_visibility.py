@@ -28,6 +28,8 @@ from hindsight_api.engine.search.tags import (
     build_tags_where_clause_simple,
     filter_results_by_tag_groups,
     filter_results_by_tags,
+    strict_tag_group,
+    strict_tags_match,
 )
 
 # ============================================================================
@@ -772,6 +774,44 @@ class TestFilterResultsByTagGroups:
 # ============================================================================
 
 
+class TestStrictTagsMatch:
+    """The staleness scope of a tagged mental model drops untagged rows (#4857)."""
+
+    @pytest.mark.parametrize(
+        "match,expected",
+        [
+            ("any", "any_strict"),
+            ("all", "all_strict"),
+            ("any_strict", "any_strict"),
+            ("all_strict", "all_strict"),
+            ("exact", "exact"),
+        ],
+    )
+    def test_strict_tags_match(self, match, expected):
+        assert strict_tags_match(match) == expected
+
+    def test_strict_tag_group_rewrites_every_leaf(self):
+        group = TagGroupAnd(
+            filters=[
+                TagGroupLeaf(tags=["a"], match="any", resolve="fuzzy"),
+                TagGroupOr(filters=[TagGroupLeaf(tags=["b"], match="all"), TagGroupLeaf(tags=[], match="exact")]),
+                TagGroupNot(filter=TagGroupLeaf(tags=["c"], match="any")),
+            ]
+        )
+
+        assert strict_tag_group(group) == TagGroupAnd(
+            filters=[
+                TagGroupLeaf(tags=["a"], match="any_strict", resolve="fuzzy"),
+                TagGroupOr(
+                    filters=[TagGroupLeaf(tags=["b"], match="all_strict"), TagGroupLeaf(tags=[], match="exact")]
+                ),
+                TagGroupNot(filter=TagGroupLeaf(tags=["c"], match="any_strict")),
+            ]
+        )
+        # The input is left alone: the refresh still reads through the original.
+        assert group.filters[0].match == "any"
+
+
 @pytest_asyncio.fixture
 async def api_client(memory):
     """Create an async test client for the FastAPI app."""
@@ -1419,7 +1459,7 @@ async def test_list_tags_empty_bank(api_client, memory):
     """Test that list_tags returns empty for bank with no tags."""
     bank_id = f"list_tags_empty_test_{datetime.now().timestamp()}"
     # The bank has to exist: a bank nobody created is a 404, not an empty list (#4175).
-    await memory.get_bank_profile(bank_id, request_context=RequestContext())
+    await memory.ensure_bank_profile(bank_id, request_context=RequestContext())
 
     # List tags without storing anything
     response = await api_client.get(f"/v1/default/banks/{bank_id}/tags")
@@ -1826,7 +1866,7 @@ async def test_tag_groups_nested_and_containing_or(api_client):
 async def _create_mental_model_via_engine(memory, *, bank_id, name, tags, request_context):
     """Helper that creates a mental model directly through the engine without an LLM call."""
     # Ensure the bank exists (mental_models has a FK to banks).
-    await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+    await memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
     return await memory.create_mental_model(
         bank_id=bank_id,
         name=name,
@@ -2152,3 +2192,11 @@ async def test_fuzzy_all_requires_one_spelling_of_every_token(api_client):
     assert response.status_code == 200
     texts = [r["text"] for r in response.json()["results"]]
     assert not any("billing" in t for t in texts), "A memory carrying only one of the two tokens must not match"
+
+
+def test_parse_tags_match_rejects_unknown_mode():
+    """#5371: the shared parser fails loud instead of widening an unknown mode to "any"."""
+    from hindsight_api.engine.search.tags import _parse_tags_match
+
+    with pytest.raises(ValueError, match="any-strict"):
+        _parse_tags_match("any-strict")  # type: ignore[arg-type]

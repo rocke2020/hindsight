@@ -16,18 +16,6 @@
       ]
     }
   },
-  "contracts": {
-    "tools": [
-      "agent_knowledge_list_pages",
-      "agent_knowledge_get_page",
-      "agent_knowledge_create_page",
-      "agent_knowledge_update_page",
-      "agent_knowledge_delete_page",
-      "agent_knowledge_recall",
-      "agent_knowledge_reflect",
-      "agent_knowledge_ingest"
-    ]
-  },
   "configSchema": {
     "type": "object",
     "properties": {
@@ -43,8 +31,7 @@
       },
       "bankMission": {
         "type": "string",
-        "description": "Mission stamped onto the bank's reflect_mission column on first use. Only affects the /reflect operation — does not steer retain or recall. Leave unset (or empty) to manage missions out-of-band via PATCH /banks/{id}.",
-        "default": "You are an AI assistant helping users across multiple communication channels (Telegram, Slack, Discord, etc.). Remember user preferences, instructions, and important context from conversations to provide personalized assistance."
+        "description": "Mission stamped onto the bank's reflect_mission column on first use. Only affects the /reflect operation — does not steer retain or recall. Leave unset (or empty) to manage missions out-of-band via PATCH /banks/{id}."
       },
       "retainMission": {
         "type": "string",
@@ -139,6 +126,13 @@
       "bankIdPrefix": {
         "type": "string",
         "description": "Optional prefix for bank IDs (e.g., 'prod' results in 'prod-slack-U123'). Useful for separating environments."
+      },
+      "agentBankMap": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "string"
+        },
+        "description": "Explicit agentId -> bankId routing, checked before static/dynamic derivation. Lets a group of agents share one named bank while other agents keep their derived banks. Mapped names are used exactly as given (bankIdPrefix is not applied)."
       },
       "retainTags": {
         "type": "array",
@@ -352,7 +346,7 @@
       },
       "enableKnowledgeTools": {
         "type": "boolean",
-        "description": "Register agent_knowledge_* tools for explicit lookup, reflection, ingest, and knowledge-page management. Set automatically by the self-driving-agents CLI.",
+        "description": "Deprecated and ignored: the agent_knowledge_* tools were removed",
         "default": false
       },
       "senderPrefixPattern": {
@@ -460,6 +454,10 @@
     "bankIdPrefix": {
       "label": "Bank ID Prefix",
       "placeholder": "e.g., prod, staging (optional)"
+    },
+    "agentBankMap": {
+      "label": "Agent Bank Map",
+      "placeholder": "e.g. {\"inbound\": \"ps-technology\", \"limpieza\": \"ps-limpieza\"}"
     },
     "retainTags": {
       "label": "Retain Tags",
@@ -573,7 +571,7 @@
     },
     "enableKnowledgeTools": {
       "label": "Enable Knowledge Tools",
-      "placeholder": "false (default) — enable agent_knowledge_* tools, including reflect"
+      "placeholder": "deprecated, ignored"
     },
     "retainQueuePath": {
       "label": "Retain Queue File Path",

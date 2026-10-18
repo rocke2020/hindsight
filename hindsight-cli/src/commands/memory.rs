@@ -318,7 +318,7 @@ pub fn recall(
     tags: Vec<String>,
     tags_match: Option<String>,
     query_timestamp: Option<String>,
-    prefer_observations: bool,
+    prefer_observations: Option<bool>,
     window_start: Option<String>,
     window_end: Option<String>,
     verbose: bool,
@@ -356,6 +356,7 @@ pub fn recall(
         max_tokens,
         trace,
         query_timestamp,
+        // None: let the bank's recall_prefer_observations default decide.
         prefer_observations,
         include,
         tags: if tags.is_empty() { None } else { Some(tags) },
@@ -458,6 +459,10 @@ pub fn reflect(
         fact_types: mapped_fact_types,
         exclude_mental_models,
         exclude_mental_model_ids,
+        // Per-call overrides of the bank's reflect_default_options. The CLI does not
+        // expose them (operators set them once per bank), so the bank default applies.
+        reflect_search_observations_max_tokens: None,
+        reflect_search_observations_include_entities: None,
     };
 
     let response = client.reflect(agent_id, &request, verbose);

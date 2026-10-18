@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from hindsight_api.engine.memory_engine import BankLlmHealthInfo, Budget
     from hindsight_api.engine.response_models import RecallResult, ReflectResult
-    from hindsight_api.engine.search.tags import TagsMatch
+    from hindsight_api.engine.search.tags import TagGroup, TagsMatch
     from hindsight_api.extensions import BankWriteOperation
     from hindsight_api.models import RequestContext
 
@@ -185,22 +185,36 @@ class MemoryEngineInterface(ABC):
         bank_id: str,
         *,
         request_context: "RequestContext",
-        create_if_missing: bool = True,
     ) -> dict[str, Any] | None:
         """
-        Get bank profile including disposition and mission.
+        Read bank profile including disposition and mission. Never creates.
 
         Args:
             bank_id: The memory bank ID.
             request_context: Request context for authentication.
-            create_if_missing: If True (default), the bank is auto-created
-                with defaults if it does not exist. Pass False to make this
-                a strict read — returns None if the bank does not exist.
 
         Returns:
             Bank profile dict with bank_id, name, disposition, and mission,
-            or None when create_if_missing=False and the bank does not
-            exist.
+            or None when the bank does not exist.
+        """
+        ...
+
+    @abstractmethod
+    async def ensure_bank_profile(
+        self,
+        bank_id: str,
+        *,
+        request_context: "RequestContext",
+    ) -> dict[str, Any]:
+        """
+        Get bank profile, creating the bank with defaults if it does not exist.
+
+        Args:
+            bank_id: The memory bank ID.
+            request_context: Request context for authentication.
+
+        Returns:
+            Bank profile dict with bank_id, name, disposition, and mission.
         """
         ...
 
@@ -332,6 +346,9 @@ class MemoryEngineInterface(ABC):
         search_query: str | None = None,
         entity_id: str | None = None,
         created_before: datetime | None = None,
+        time_field: str | None = None,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
         limit: int = 100,
         offset: int = 0,
         request_context: "RequestContext",
@@ -346,6 +363,11 @@ class MemoryEngineInterface(ABC):
             search_query: Full-text search query.
             entity_id: Filter to memory units linked to this entity ID.
             created_before: Keep units with ``created_at`` before this instant.
+            time_field: Time axis to filter and order by (see
+                :mod:`hindsight_api.engine.time_filter`). Units with no value on
+                that axis are excluded.
+            start_date: Inclusive lower bound on ``time_field``.
+            end_date: Exclusive upper bound on ``time_field``.
             limit: Maximum results.
             offset: Pagination offset.
             request_context: Request context for authentication.
@@ -390,6 +412,9 @@ class MemoryEngineInterface(ABC):
         search_query: str | None = None,
         tags: list[str] | None = None,
         tags_match: "TagsMatch" = "any_strict",
+        time_field: str | None = None,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
         limit: int = 100,
         offset: int = 0,
         request_context: "RequestContext",
@@ -399,9 +424,13 @@ class MemoryEngineInterface(ABC):
 
         Args:
             bank_id: The memory bank ID.
-            search_query: Case-insensitive substring filter on document ID.
+            search_query: Case-insensitive substring filter on document ID or text (unindexed, for browsing).
             tags: Filter by tags.
             tags_match: How to match tags (any, all, any_strict, all_strict).
+            time_field: Time axis to filter and order by — ``created_at`` or
+                ``updated_at`` (see :mod:`hindsight_api.engine.time_filter`).
+            start_date: Inclusive lower bound on ``time_field``.
+            end_date: Exclusive upper bound on ``time_field``.
             limit: Maximum results.
             offset: Pagination offset.
             request_context: Request context for authentication.
@@ -481,6 +510,9 @@ class MemoryEngineInterface(ABC):
         self,
         bank_id: str,
         *,
+        tags: list[str] | None = None,
+        tags_match: "TagsMatch" = "any",
+        tag_groups: "list[TagGroup] | None" = None,
         limit: int = 100,
         offset: int = 0,
         request_context: "RequestContext",
@@ -490,6 +522,9 @@ class MemoryEngineInterface(ABC):
 
         Args:
             bank_id: The memory bank ID.
+            tags: Optional tag filter on the memories that mention each entity.
+            tags_match: How ``tags`` match.
+            tag_groups: Compound tag filter, AND-ed with ``tags``.
             limit: Maximum results.
             offset: Offset for pagination.
             request_context: Request context for authentication.
@@ -570,6 +605,9 @@ class MemoryEngineInterface(ABC):
         bank_id: str,
         entity_id: str,
         *,
+        tags: list[str] | None = None,
+        tags_match: "TagsMatch" = "any",
+        tag_groups: "list[TagGroup] | None" = None,
         request_context: "RequestContext",
     ) -> dict[str, Any] | None:
         """

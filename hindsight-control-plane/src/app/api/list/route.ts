@@ -1,6 +1,17 @@
 import { NextRequest, NextResponse } from "next/server";
 import { localizeApiErrorPayload } from "@/lib/i18n/api-errors";
 import { hindsightClient } from "@/lib/hindsight-client";
+import { readTagFilter } from "@/lib/tag-filter-params";
+
+// Time axes accepted by the dataplane's list_memories endpoint.
+type TimeField = "created_at" | "updated_at" | "mentioned_at" | "occurred_start" | "occurred_end";
+const TIME_FIELDS = new Set<string>([
+  "created_at",
+  "updated_at",
+  "mentioned_at",
+  "occurred_start",
+  "occurred_end",
+]);
 
 export async function GET(request: NextRequest) {
   try {
@@ -33,6 +44,15 @@ export async function GET(request: NextRequest) {
     const state = stateParam === "valid" || stateParam === "invalidated" ? stateParam : undefined;
     const documentId = searchParams.get("document_id") || undefined;
     const entityId = searchParams.get("entity_id") || undefined;
+    // Validated against the dataplane's enum here so a typo is a dropped parameter
+    // rather than a 422 surfacing as a generic 500 from the catch below.
+    const timeFieldParam = searchParams.get("time_field");
+    const timeField = TIME_FIELDS.has(timeFieldParam ?? "")
+      ? (timeFieldParam as TimeField)
+      : undefined;
+    const startDate = searchParams.get("start_date") || undefined;
+    const endDate = searchParams.get("end_date") || undefined;
+    const tagFilter = readTagFilter(searchParams);
 
     const response = await hindsightClient.listMemories(bankId, {
       limit,
@@ -43,6 +63,11 @@ export async function GET(request: NextRequest) {
       state,
       documentId,
       entityId,
+      timeField,
+      startDate,
+      endDate,
+      tags: tagFilter.tags,
+      tagsMatch: tagFilter.tags_match,
     });
 
     return NextResponse.json(response, { status: 200 });

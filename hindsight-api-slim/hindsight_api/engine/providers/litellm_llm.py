@@ -31,6 +31,8 @@ from hindsight_api.engine.llm_interface import (
 from hindsight_api.engine.llm_trace import LLMResponseUsage, stash_response_usage
 from hindsight_api.engine.llm_wrapper import parse_llm_json
 from hindsight_api.engine.providers.llm_debug import dump_request_on_4xx
+from hindsight_api.engine.providers.openai_compatible_llm import _strip_code_fences, visible_token_usage
+from hindsight_api.engine.remote_retry import is_transient_remote_error, jittered_backoff
 from hindsight_api.engine.response_models import LLMToolCall, LLMToolCallResult, TokenUsage
 from hindsight_api.engine.structured_output import provider_json_schema, strict_json_schema
 from hindsight_api.metrics import get_metrics_collector
@@ -73,18 +75,13 @@ _STRUCTURED_TOOL_NAME = "structured_response"
 
 
 def _usage_from_litellm_response(response: Any) -> LLMResponseUsage:
-    """Extract prompt/completion/cached token counts from a LiteLLM (OpenAI-shaped) usage block."""
-    usage = getattr(response, "usage", None)
-    if not usage:
-        return LLMResponseUsage()
-    cached_tokens = 0
-    details = getattr(usage, "prompt_tokens_details", None)
-    if details:
-        cached_tokens = getattr(details, "cached_tokens", 0) or 0
+    """Extract input / visible-output / cached / reasoning counts from a LiteLLM (OpenAI-shaped) usage block."""
+    usage = visible_token_usage(response)
     return LLMResponseUsage(
-        input_tokens=getattr(usage, "prompt_tokens", 0) or 0,
-        output_tokens=getattr(usage, "completion_tokens", 0) or 0,
-        cached_tokens=cached_tokens,
+        input_tokens=usage.input_tokens,
+        output_tokens=usage.output_tokens,
+        cached_tokens=usage.cached_tokens,
+        thoughts_tokens=usage.thoughts_tokens,
     )
 
 
@@ -102,6 +99,32 @@ def _forced_tool_arguments(message: Any) -> str | None:
         arguments = tool_call.function.arguments
         return arguments if isinstance(arguments, str) else json.dumps(arguments)
     return None
+
+
+# LiteLLM backends that authenticate with the ``api_key`` of the call (see
+# LiteLLMLLM.supports_request_overrides).
+_KEYED_LITELLM_BACKENDS = frozenset(
+    {
+        "openai",
+        "text-completion-openai",
+        "azure",
+        "anthropic",
+        "gemini",
+        "openrouter",
+        "litellm_proxy",
+        "groq",
+        "mistral",
+        "deepseek",
+        "together_ai",
+        "fireworks_ai",
+        "xai",
+        "cohere",
+        "cohere_chat",
+        "perplexity",
+        "deepinfra",
+        "hosted_vllm",
+    }
+)
 
 
 class LiteLLMLLM(LLMInterface):
@@ -233,6 +256,18 @@ class LiteLLMLLM(LLMInterface):
         if self._default_headers:
             kwargs.setdefault("extra_headers", dict(self._default_headers))
 
+        # Credentials an LLM request extension chose for this call (see
+        # supports_request_overrides). Lazy: importing the extensions package here
+        # would be circular.
+        from hindsight_api.extensions.llm_request import current_llm_request_overrides
+
+        overrides = current_llm_request_overrides()
+        if overrides is not None:
+            if overrides.api_key is not None:
+                kwargs["api_key"] = overrides.api_key
+            if overrides.headers:
+                kwargs["extra_headers"] = {**kwargs.get("extra_headers", {}), **overrides.headers}
+
         # Bedrock service tier: flex (50% cheaper), priority, or reserved
         if self.model.startswith("bedrock/") and self.bedrock_service_tier is not None:
             kwargs["service_tier"] = self.bedrock_service_tier
@@ -299,7 +334,7 @@ class LiteLLMLLM(LLMInterface):
         strict_schema: bool = False,
         attempt_context: Callable[[], AbstractAsyncContextManager[None]] | None = None,
     ) -> LLMCallResult:
-        start_time = time.time()
+        start_time = time.perf_counter()
 
         call_kwargs = self._build_common_kwargs(messages, max_completion_tokens, temperature)
 
@@ -338,6 +373,8 @@ class LiteLLMLLM(LLMInterface):
                 }
 
         last_exception = None
+        # Kept outside the try so the final invalid-JSON log can name it (#5443).
+        finish_reason = None
 
         for attempt in range(max_retries + 1):
             try:
@@ -370,27 +407,20 @@ class LiteLLMLLM(LLMInterface):
                     raise OutputTooLongError("LiteLLM response was truncated due to token limit")
 
                 if response_format is not None:
-                    # Strip markdown code fences if present
-                    clean_content = content
-                    if "```json" in content:
-                        clean_content = content.split("```json")[1].split("```")[0].strip()
-                    elif "```" in content:
-                        clean_content = content.split("```")[1].split("```")[0].strip()
-
+                    # Fences are stripped line-based by the shared helper, so a
+                    # JSON value that itself contains the text "```json" is no
+                    # longer truncated mid-payload (#4819).
                     try:
-                        json_data = json.loads(clean_content)
+                        json_data = json.loads(_strip_code_fences(content))
                     except json.JSONDecodeError:
-                        try:
-                            json_data = json.loads(content)
-                        except json.JSONDecodeError:
-                            if attempt < max_retries:
-                                # Prefer a clean re-roll first — a fresh generation
-                                # usually beats repairing a malformed one.
-                                raise
-                            # Retry budget spent: structural repair as a last
-                            # resort (#2547/#2544). Raises again if unrecoverable,
-                            # which the outer handler surfaces loudly.
-                            json_data = parse_llm_json(content)
+                        if attempt < max_retries:
+                            # Prefer a clean re-roll first — a fresh generation
+                            # usually beats repairing a malformed one.
+                            raise
+                        # Retry budget spent: structural repair as a last
+                        # resort (#2547/#2544). Raises again if unrecoverable,
+                        # which the outer handler surfaces loudly.
+                        json_data = parse_llm_json(content)
 
                     if skip_validation:
                         result = json_data
@@ -403,10 +433,11 @@ class LiteLLMLLM(LLMInterface):
                 response_usage = _usage_from_litellm_response(response)
                 input_tokens = response_usage.input_tokens
                 output_tokens = response_usage.output_tokens
+                thoughts_tokens = response_usage.thoughts_tokens
                 total_tokens = input_tokens + output_tokens
 
                 # Record metrics
-                duration = time.time() - start_time
+                duration = time.perf_counter() - start_time
                 metrics = get_metrics_collector()
                 metrics.record_llm_call(
                     provider=self.provider,
@@ -416,6 +447,8 @@ class LiteLLMLLM(LLMInterface):
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     success=True,
+                    cached_input_tokens=response_usage.cached_tokens,
+                    thoughts_tokens=thoughts_tokens,
                 )
 
                 # Record trace span
@@ -433,6 +466,8 @@ class LiteLLMLLM(LLMInterface):
                     duration=duration,
                     finish_reason=finish_reason,
                     error=None,
+                    cached_tokens=response_usage.cached_tokens,
+                    thoughts_tokens=thoughts_tokens,
                 )
 
                 if duration > 10.0:
@@ -446,6 +481,8 @@ class LiteLLMLLM(LLMInterface):
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     total_tokens=total_tokens,
+                    cached_tokens=response_usage.cached_tokens,
+                    thoughts_tokens=thoughts_tokens,
                 )
                 return LLMCallResult(content=result, usage=token_usage)
 
@@ -460,7 +497,12 @@ class LiteLLMLLM(LLMInterface):
                     await asyncio.sleep(backoff)
                     continue
                 else:
-                    logger.error(f"LiteLLM returned invalid JSON after {max_retries + 1} attempts")
+                    # finish_reason and a content prefix tell a prose reply ("stop",
+                    # "No facts found...") apart from truncation or an empty body (#5443).
+                    logger.error(
+                        f"LiteLLM returned invalid JSON after {max_retries + 1} attempts "
+                        f"(finish_reason={finish_reason!r}, content={e.doc[:200]!r})"
+                    )
                     raise
 
             except (TimeoutError, asyncio.TimeoutError, _litellm_timeout_exc()) as e:
@@ -483,27 +525,19 @@ class LiteLLMLLM(LLMInterface):
                 raise
 
             except Exception as e:
-                error_str = str(e).lower()
-                # Fast fail on auth errors
-                if "401" in error_str or "403" in error_str or "unauthorized" in error_str:
-                    logger.error(f"LiteLLM auth error, not retrying: {e}")
-                    raise
-
                 # Diagnostic dump (opt-in) of the exact request behind any 4xx.
                 dump_request_on_4xx(scope=scope, provider=self.provider, model=self.model, err=e, request=call_kwargs)
 
                 last_exception = e
-                if attempt < max_retries:
-                    # Retry on rate limits, connection errors, server errors
-                    is_retryable = any(
-                        keyword in error_str
-                        for keyword in ("rate", "limit", "timeout", "connection", "500", "502", "503", "529")
-                    )
-                    if is_retryable:
-                        backoff = min(initial_backoff * (2**attempt), max_backoff)
-                        jitter = backoff * 0.2 * (2 * (time.time() % 1) - 1)
-                        await asyncio.sleep(backoff + jitter)
-                        continue
+                # Retry on the HTTP status LiteLLM maps onto every provider error
+                # (``status_code``): 408/409/425/429 and 5xx retry, other 4xx fail fast.
+                # This used to search the message for rate/limit/timeout/500/503/...,
+                # but the message often omits the status -- Bedrock's transient 503
+                # failed on its first attempt -- and a 400 mentioning a "limit" was
+                # retried (#5009).
+                if attempt < max_retries and is_transient_remote_error(e):
+                    await asyncio.sleep(jittered_backoff(attempt, initial_backoff, max_backoff))
+                    continue
 
                 logger.error(f"LiteLLM API error after {attempt + 1} attempts: {e}")
                 raise
@@ -525,7 +559,7 @@ class LiteLLMLLM(LLMInterface):
         tool_choice: LLMToolChoice = LLM_TOOL_CHOICE_AUTO,
         attempt_context: Callable[[], AbstractAsyncContextManager[None]] | None = None,
     ) -> LLMToolCallResult:
-        start_time = time.time()
+        start_time = time.perf_counter()
 
         call_kwargs = self._build_common_kwargs(messages, max_completion_tokens, temperature)
         call_kwargs["tools"] = tools
@@ -577,11 +611,13 @@ class LiteLLMLLM(LLMInterface):
                         )
 
                 # Extract usage
-                input_tokens = getattr(response.usage, "prompt_tokens", 0) or 0
-                output_tokens = getattr(response.usage, "completion_tokens", 0) or 0
+                response_usage = _usage_from_litellm_response(response)
+                input_tokens = response_usage.input_tokens
+                output_tokens = response_usage.output_tokens
+                thoughts_tokens = response_usage.thoughts_tokens
 
                 # Record metrics
-                duration = time.time() - start_time
+                duration = time.perf_counter() - start_time
                 metrics = get_metrics_collector()
                 metrics.record_llm_call(
                     provider=self.provider,
@@ -591,6 +627,8 @@ class LiteLLMLLM(LLMInterface):
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     success=True,
+                    cached_input_tokens=response_usage.cached_tokens,
+                    thoughts_tokens=thoughts_tokens,
                 )
 
                 # Record trace span
@@ -614,6 +652,8 @@ class LiteLLMLLM(LLMInterface):
                     finish_reason=finish_reason,
                     error=None,
                     tool_calls=tool_calls_dict,
+                    cached_tokens=response_usage.cached_tokens,
+                    thoughts_tokens=thoughts_tokens,
                 )
 
                 return LLMToolCallResult(
@@ -622,6 +662,8 @@ class LiteLLMLLM(LLMInterface):
                     finish_reason=finish_reason or ("tool_calls" if tool_calls else "stop"),
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
+                    cached_tokens=response_usage.cached_tokens,
+                    thoughts_tokens=thoughts_tokens,
                 )
 
             except (TimeoutError, asyncio.TimeoutError, _litellm_timeout_exc()) as e:
@@ -642,22 +684,14 @@ class LiteLLMLLM(LLMInterface):
                 raise
 
             except Exception as e:
-                error_str = str(e).lower()
-                if "401" in error_str or "403" in error_str or "unauthorized" in error_str:
-                    raise
-
                 # Diagnostic dump (opt-in) of the exact request behind any 4xx.
                 dump_request_on_4xx(scope=scope, provider=self.provider, model=self.model, err=e, request=call_kwargs)
 
                 last_exception = e
-                if attempt < max_retries:
-                    is_retryable = any(
-                        keyword in error_str
-                        for keyword in ("rate", "limit", "timeout", "connection", "500", "502", "503", "529")
-                    )
-                    if is_retryable:
-                        await asyncio.sleep(min(initial_backoff * (2**attempt), max_backoff))
-                        continue
+                # Status-based, same as call() (#5009).
+                if attempt < max_retries and is_transient_remote_error(e):
+                    await asyncio.sleep(min(initial_backoff * (2**attempt), max_backoff))
+                    continue
 
                 logger.error(f"LiteLLM tool call error after {attempt + 1} attempts: {e}")
                 raise
@@ -669,6 +703,19 @@ class LiteLLMLLM(LLMInterface):
     async def cleanup(self) -> None:
         """Clean up resources."""
         pass
+
+    def supports_request_overrides(self) -> bool:
+        # Decided by the backend LiteLLM routes the model to, not by our provider name:
+        # Bedrock, Vertex AI, SageMaker, ... authenticate with cloud credentials and
+        # ignore ``api_key``, which would send the call on the server's account. So an
+        # allowlist of backends known to read it; an unknown backend refuses.
+        if self.provider == "bedrock":
+            return False
+        try:
+            backend = self._litellm.get_llm_provider(self.model, api_base=self.base_url or None)[1]
+        except Exception:
+            return False
+        return backend in _KEYED_LITELLM_BACKENDS
 
     def supports_attempt_scoped_concurrency(self) -> bool:
         return True

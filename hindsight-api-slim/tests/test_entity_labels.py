@@ -814,7 +814,9 @@ def test_extraction_schema_includes_labels_model():
     config.retain_mission = None
     config.retain_custom_instructions = None
 
-    prompt, schema = _build_extraction_prompt_and_schema(config)
+    extraction_prompt = _build_extraction_prompt_and_schema(config)
+    prompt = extraction_prompt.system_prompt
+    schema = extraction_prompt.response_schema
 
     # Schema should be a dynamic response model
     json_schema = schema.model_json_schema()
@@ -862,7 +864,7 @@ def test_extraction_schema_labels_in_required():
     config.retain_mission = None
     config.retain_custom_instructions = None
 
-    _, schema = _build_extraction_prompt_and_schema(config)
+    schema = _build_extraction_prompt_and_schema(config).response_schema
     fact_schema = schema.model_json_schema()["$defs"]["LabelsFact"]
     assert "labels" in fact_schema["required"]
 
@@ -883,7 +885,7 @@ def test_extraction_schema_no_labels_when_unconfigured():
     config.retain_mission = None
     config.retain_custom_instructions = None
 
-    _, schema = _build_extraction_prompt_and_schema(config)
+    schema = _build_extraction_prompt_and_schema(config).response_schema
     # No labels field in schema — it's a plain base response model
     json_schema = schema.model_json_schema()
     # Verify 'labels' is NOT a required or present field in any fact definition
@@ -903,11 +905,11 @@ async def test_retain_extracts_single_value_label(memory_real_llm, request_conte
     Verify that the LLM assigns the label and it ends up as a key:value entity on the memory unit.
     """
     memory = memory_real_llm
-    from hindsight_api.engine.memory_engine import fq_table
+    from hindsight_api.engine.schema import fq_store_table
 
     bank_id = f"test-labels-single-{uuid.uuid4().hex[:8]}"
     try:
-        await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+        await memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
 
         # Configure entity_labels on the bank
         await memory._config_resolver.update_bank_config(
@@ -945,8 +947,8 @@ async def test_retain_extracts_single_value_label(memory_real_llm, request_conte
             rows = await conn.fetch(
                 f"""
                 SELECT e.canonical_name
-                FROM {fq_table("unit_entities")} ue
-                JOIN {fq_table("entities")} e ON e.id = ue.entity_id
+                FROM {fq_store_table("unit_entities")} ue
+                JOIN {fq_store_table("entities")} e ON e.id = ue.entity_id
                 WHERE ue.unit_id = ANY($1::uuid[])
                 """,
                 [u for u in unit_ids],
@@ -970,11 +972,11 @@ async def test_retain_extracts_multi_value_label(memory_real_llm, request_contex
     Verify that multiple label values can be assigned to a single fact.
     """
     memory = memory_real_llm
-    from hindsight_api.engine.memory_engine import fq_table
+    from hindsight_api.engine.schema import fq_store_table
 
     bank_id = f"test-labels-multi-{uuid.uuid4().hex[:8]}"
     try:
-        await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+        await memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
 
         await memory._config_resolver.update_bank_config(
             bank_id=bank_id,
@@ -1013,8 +1015,8 @@ async def test_retain_extracts_multi_value_label(memory_real_llm, request_contex
             rows = await conn.fetch(
                 f"""
                 SELECT e.canonical_name
-                FROM {fq_table("unit_entities")} ue
-                JOIN {fq_table("entities")} e ON e.id = ue.entity_id
+                FROM {fq_store_table("unit_entities")} ue
+                JOIN {fq_store_table("entities")} e ON e.id = ue.entity_id
                 WHERE ue.unit_id = ANY($1::uuid[])
                 """,
                 [u for u in unit_ids],
@@ -1037,11 +1039,11 @@ async def test_retain_extracts_free_values_label(memory_real_llm, request_contex
     (not constrained to a predefined enum list).
     """
     memory = memory_real_llm
-    from hindsight_api.engine.memory_engine import fq_table
+    from hindsight_api.engine.schema import fq_store_table
 
     bank_id = f"test-labels-free-{uuid.uuid4().hex[:8]}"
     try:
-        await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+        await memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
 
         await memory._config_resolver.update_bank_config(
             bank_id=bank_id,
@@ -1075,8 +1077,8 @@ async def test_retain_extracts_free_values_label(memory_real_llm, request_contex
             rows = await conn.fetch(
                 f"""
                 SELECT e.canonical_name
-                FROM {fq_table("unit_entities")} ue
-                JOIN {fq_table("entities")} e ON e.id = ue.entity_id
+                FROM {fq_store_table("unit_entities")} ue
+                JOIN {fq_store_table("entities")} e ON e.id = ue.entity_id
                 WHERE ue.unit_id = ANY($1::uuid[])
                 """,
                 [u for u in unit_ids],
@@ -1101,11 +1103,11 @@ async def test_retain_extracts_map_type_entities(memory_real_llm, request_contex
     End-to-end: retain content with a map-type entity_labels group.
     Verify that structured entity fields are extracted as key:field:value entity strings.
     """
-    from hindsight_api.engine.memory_engine import fq_table
+    from hindsight_api.engine.schema import fq_store_table
 
     bank_id = f"test-labels-map-{uuid.uuid4().hex[:8]}"
     try:
-        await memory_real_llm.get_bank_profile(bank_id=bank_id, request_context=request_context)
+        await memory_real_llm.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
 
         # Configure a map-type entity label
         await memory_real_llm._config_resolver.update_bank_config(
@@ -1143,8 +1145,8 @@ async def test_retain_extracts_map_type_entities(memory_real_llm, request_contex
             rows = await conn.fetch(
                 f"""
                 SELECT e.canonical_name
-                FROM {fq_table("unit_entities")} ue
-                JOIN {fq_table("entities")} e ON e.id = ue.entity_id
+                FROM {fq_store_table("unit_entities")} ue
+                JOIN {fq_store_table("entities")} e ON e.id = ue.entity_id
                 WHERE ue.unit_id = ANY($1::uuid[])
                 """,
                 [u for u in unit_ids],
@@ -1919,7 +1921,7 @@ async def test_retain_multivalue_tag_entities_all_stored(memory_real_llm, reques
 
     bank_id = f"test-1558-multivalue-tag-{uuid.uuid4().hex[:8]}"
     try:
-        await memory_real_llm.get_bank_profile(bank_id=bank_id, request_context=request_context)
+        await memory_real_llm.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
 
         # Configure entity labels matching the bug report scenario:
         # - multi-values type
@@ -2009,7 +2011,7 @@ async def test_retain_multivalue_tag_entities_second_retain(memory_real_llm, req
 
     bank_id = f"test-1558-second-{uuid.uuid4().hex[:8]}"
     try:
-        await memory_real_llm.get_bank_profile(bank_id=bank_id, request_context=request_context)
+        await memory_real_llm.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
 
         await memory_real_llm._config_resolver.update_bank_config(
             bank_id=bank_id,
@@ -2081,6 +2083,8 @@ async def test_retain_multivalue_tag_entities_second_retain(memory_real_llm, req
 
 
 @pytest.mark.asyncio
+# Same as test_entity_intrabatch_dedup: the merging under test is the Postgres resolver's.
+@pytest.mark.memory_backend_incompatible
 async def test_entity_resolution_does_not_merge_distinct_label_values(memory, request_context):
     """
     GH-1558 reproducer (deterministic): directly test that entity resolution
@@ -2090,20 +2094,20 @@ async def test_entity_resolution_does_not_merge_distinct_label_values(memory, re
     With the 0.6 merge threshold and temporal/co-occurrence boosts, the resolver
     might incorrectly merge them into a single entity.
     """
-    from hindsight_api.engine.memory_engine import fq_table
+    from hindsight_api.engine.schema import fq_store_table
     from hindsight_api.engine.retain.entity_processing import resolve_entities
     from hindsight_api.engine.retain.types import EntityRef, ProcessedFact
 
     bank_id = f"test-1558-resolve-{uuid.uuid4().hex[:8]}"
     try:
-        await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+        await memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
 
         # First, insert a "use:use-001" entity into the bank so that
         # entity resolution has an existing entity to match against
         async with memory._pool.acquire() as conn:
             await conn.execute(
                 f"""
-                INSERT INTO {fq_table("entities")} (bank_id, canonical_name, first_seen, last_seen, mention_count)
+                INSERT INTO {fq_store_table("entities")} (bank_id, canonical_name, first_seen, last_seen, mention_count)
                 VALUES ($1, $2, now(), now(), 1)
                 ON CONFLICT DO NOTHING
                 """,
@@ -2307,7 +2311,7 @@ async def test_retain_application_tags_extract_complete_pairs(memory_real_llm, r
     chunk. This test fails when any expected pair is incomplete, surfacing that
     inconsistency.
     """
-    from hindsight_api.engine.memory_engine import fq_table
+    from hindsight_api.engine.schema import fq_store_table
 
     bank_id = f"test-app-pairs-{uuid.uuid4().hex[:8]}"
     # Three tagged elements in ONE chunk, with surface forms that differ from the
@@ -2323,7 +2327,7 @@ async def test_retain_application_tags_extract_complete_pairs(memory_real_llm, r
         for name in elements
     }
     try:
-        await memory_real_llm.get_bank_profile(bank_id=bank_id, request_context=request_context)
+        await memory_real_llm.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
         await memory_real_llm._config_resolver.update_bank_config(
             bank_id=bank_id,
             updates=_build_application_label_config(),
@@ -2351,8 +2355,8 @@ async def test_retain_application_tags_extract_complete_pairs(memory_real_llm, r
             entity_rows = await conn.fetch(
                 f"""
                 SELECT e.canonical_name
-                FROM {fq_table("unit_entities")} ue
-                JOIN {fq_table("entities")} e ON e.id = ue.entity_id
+                FROM {fq_store_table("unit_entities")} ue
+                JOIN {fq_store_table("entities")} e ON e.id = ue.entity_id
                 WHERE ue.unit_id = ANY($1::uuid[])
                 """,
                 [u for u in unit_ids],
@@ -2543,7 +2547,7 @@ async def test_retain_extracts_multi_text_label(memory_real_llm, request_context
 
     bank_id = f"test-labels-multi-text-{uuid.uuid4().hex[:8]}"
     try:
-        await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+        await memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
 
         await memory._config_resolver.update_bank_config(
             bank_id=bank_id,

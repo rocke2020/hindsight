@@ -33,6 +33,7 @@ from hindsight_api.engine.consolidation.consolidator import (
     _TemporalBounds,
     run_consolidation_job,
 )
+from hindsight_api.engine.memories import MemoriesExtension
 from hindsight_api.engine.memory_engine import MemoryEngine
 from hindsight_api.engine.response_models import MemoryFact
 
@@ -149,7 +150,7 @@ async def test_dedup_create_fold_widens_bounds_of_the_twin(memory: MemoryEngine,
     ``occurred_start``/``occurred_end`` as NULL — the exact shape reported in the issue.
     """
     bank_id = f"test-temporal-fold-{uuid.uuid4().hex[:8]}"
-    await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+    await memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
 
     undated_fact = await _retain_fact(
         memory, request_context, observations_enabled, bank_id, "Alice moved to Berlin for work.", "Alice"
@@ -192,7 +193,7 @@ async def test_dedup_create_fold_widens_bounds_of_the_twin(memory: MemoryEngine,
 async def test_update_widens_bounds_from_its_source_facts(memory: MemoryEngine, request_context, observations_enabled):
     """The ordinary UPDATE path inherits every temporal field from its sources, event_date included."""
     bank_id = f"test-temporal-update-{uuid.uuid4().hex[:8]}"
-    await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+    await memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
 
     undated_fact = await _retain_fact(
         memory, request_context, observations_enabled, bank_id, "Bob plays the cello.", "cello"
@@ -246,7 +247,7 @@ async def test_dedup_update_fold_unions_the_bounds_of_both_rows(
 ):
     """The UPDATE-time fold deletes the folded-from row, so the survivor must absorb its dates."""
     bank_id = f"test-temporal-updfold-{uuid.uuid4().hex[:8]}"
-    await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+    await memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
 
     twin_fact = await _retain_fact(
         memory, request_context, observations_enabled, bank_id, "Carla ran the Rome marathon.", "marathon"
@@ -347,15 +348,18 @@ async def test_store_owned_fold_merges_bounds_like_the_sql_path():
     store = types.SimpleNamespace(get_memories=AsyncMock(return_value=[stored]), upsert_observation=AsyncMock())
 
     with patch.object(consolidator.embedding_utils, "generate_embeddings_batch", AsyncMock(return_value=[[0.1, 0.2]])):
-        await consolidator._reconcile_merge_via_store(
+        # The store-owned fold is the base-class default; call it on the stub store.
+        await MemoriesExtension.fold_sources_into_observation(
             store,
             conn=object(),
-            memory_engine=types.SimpleNamespace(embeddings=object()),
+            fq_table=None,
             bank_id="bank-1",
             observation_id=str(uuid.uuid4()),
+            expected_text="twin",
             merged_text="merged",
-            add_source_ids=[uuid.uuid4()],
-            add_bounds=_TemporalBounds(event_date=EARLY, occurred_end=LATE, mentioned_at=LATE),
+            source_memory_ids=[uuid.uuid4()],
+            bounds=_TemporalBounds(event_date=EARLY, occurred_end=LATE, mentioned_at=LATE),
+            embeddings=object(),
         )
 
     record = store.upsert_observation.await_args.kwargs["record"]

@@ -34,18 +34,26 @@ PDF_ID = short_attachment_id(compute_attachment_hash(PDF))
 class _Validator:
     """Records what validate_retain saw; refuses when asked to."""
 
-    def __init__(self, allow: bool = True) -> None:
+    def __init__(self, allow: bool = True, write_scope: list[str] | None = None) -> None:
         self._allow = allow
+        self._write_scope = write_scope
         self.seen: list = []
+        self.document_id: str | None = None
 
     async def validate_retain(self, ctx) -> ValidationResult:
         self.seen = list(ctx.attachments)
+        self.document_id = ctx.document_id
         if self._allow:
             return ValidationResult(allowed=True)
         return ValidationResult(allowed=False, reason="policy: no attachments", status_code=403)
 
     def __getattr__(self, name):
         async def permissive(*a, **k):
+            # The tag-scope hooks answer with a scope, not a verdict: None means unrestricted.
+            if name == "resolve_write_tag_scope":
+                return self._write_scope
+            if name.startswith("resolve_"):
+                return None
             return ValidationResult(allowed=True)
 
         return permissive
@@ -73,20 +81,27 @@ def _item() -> dict:
     }
 
 
-async def _retain(client, bank_id: str):
-    return await client.post(f"/v1/default/banks/{bank_id}/memories", json={"items": [_item()], "async": False})
+async def _retain(client, bank_id: str, is_async: bool = False):
+    return await client.post(f"/v1/default/banks/{bank_id}/memories", json={"items": [_item()], "async": is_async})
+
+
+# Both paths build their own RetainContext; #4373 was the async one leaving
+# fields (document_id, attachments) empty that the sync one filled.
+both_paths = pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
 
 
 @pytest.mark.asyncio
-async def test_the_hook_sees_each_attachment_described(api_client, memory):
+@both_paths
+async def test_the_hook_sees_each_attachment_described(api_client, memory, is_async):
     """Enough to write a size quota or a media-type rule against."""
     validator = _Validator(allow=True)
     memory._operation_validator = validator
     try:
-        response = await _retain(api_client, f"val-{uuid.uuid4().hex[:8]}")
+        response = await _retain(api_client, f"val-{uuid.uuid4().hex[:8]}", is_async)
     finally:
         memory._operation_validator = None
     assert response.status_code == 200, response.text
+    assert validator.document_id == "d1", "the hook must name the document under retain"
 
     by_id = {a.short_id: a for a in validator.seen}
     assert set(by_id) == {PNG_ID, PDF_ID}, "the hook did not see every attachment"
@@ -120,7 +135,8 @@ async def test_a_text_only_retain_reports_no_attachments(api_client, memory):
 
 
 @pytest.mark.asyncio
-async def test_refusing_the_retain_discards_the_bytes(api_client, memory):
+@both_paths
+async def test_refusing_the_retain_discards_the_bytes(api_client, memory, is_async):
     """The point of a content policy: refused bytes must not remain fetchable.
 
     They are written before the hook runs, and nothing else would ever remove
@@ -130,7 +146,7 @@ async def test_refusing_the_retain_discards_the_bytes(api_client, memory):
     bank_id = f"val-{uuid.uuid4().hex[:8]}"
     memory._operation_validator = _Validator(allow=False)
     try:
-        response = await _retain(api_client, bank_id)
+        response = await _retain(api_client, bank_id, is_async)
     finally:
         memory._operation_validator = None
     assert response.status_code == 403, response.text
@@ -141,3 +157,57 @@ async def test_refusing_the_retain_discards_the_bytes(api_client, memory):
             f"attachment {attachment_id} survived a refused retain — a content policy "
             f"that rejects a retain cannot keep its bytes out of the bank"
         )
+
+
+@pytest.mark.asyncio
+@both_paths
+async def test_a_write_scope_refusal_discards_the_bytes(api_client, memory, is_async):
+    """The write-scope check refuses after the hook allowed it; the bytes must go all the same (#5416)."""
+    bank_id = f"val-{uuid.uuid4().hex[:8]}"
+    memory._operation_validator = _Validator(allow=True, write_scope=["team:a"])
+    try:
+        response = await api_client.post(
+            f"/v1/default/banks/{bank_id}/memories",
+            json={"items": [{**_item(), "tags": ["team:b"]}], "async": is_async},
+        )
+    finally:
+        memory._operation_validator = None
+    assert response.status_code == 403, response.text
+
+    for attachment_id in (PNG_ID, PDF_ID):
+        fetched = await api_client.get(f"/v1/default/banks/{bank_id}/attachments/{attachment_id}")
+        assert fetched.status_code == 404, f"attachment {attachment_id} survived a write-scope refusal"
+
+
+@pytest.mark.asyncio
+@both_paths
+async def test_a_refused_group_keeps_the_attachments_of_a_group_that_landed(api_client, memory, is_async):
+    """One request, two strategy groups: the first lands, the second is refused.
+
+    The ingress stores every group's attachments up front, so the refusal must
+    take back only its own documents' bytes, not those the first group now uses.
+    """
+    bank_id = f"val-{uuid.uuid4().hex[:8]}"
+    image, document = _item()["content"][1], _item()["content"][2]
+    items = [
+        {"content": [{"type": "text", "text": "Allowed:"}, image], "document_id": "d1", "tags": ["team:a"]},
+        {
+            "content": [{"type": "text", "text": "Refused:"}, document],
+            "document_id": "d2",
+            "tags": ["team:b"],
+            "strategy": "other",
+        },
+    ]
+    memory._operation_validator = _Validator(allow=True, write_scope=["team:a"])
+    try:
+        response = await api_client.post(
+            f"/v1/default/banks/{bank_id}/memories", json={"items": items, "async": is_async}
+        )
+    finally:
+        memory._operation_validator = None
+    assert response.status_code == 403, response.text
+
+    kept = await api_client.get(f"/v1/default/banks/{bank_id}/attachments/{PNG_ID}")
+    assert kept.status_code == 200, "the refusal took the attachment of the group that landed"
+    refused = await api_client.get(f"/v1/default/banks/{bank_id}/attachments/{PDF_ID}")
+    assert refused.status_code == 404, "the refused group's attachment survived"

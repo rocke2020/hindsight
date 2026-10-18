@@ -159,6 +159,19 @@ def test_record_llm_call_success_with_context_and_tokens():
     assert r.llm_info["finish_reason"] == "stop"
 
 
+def test_record_llm_call_keeps_the_prompt_as_sent():
+    """The reflect loop appends its tool call and the tool result to the same list
+    after the call returns, and the row is serialized later. The recorded prompt
+    must be what was sent, not what the list holds by the time it is written."""
+    rec = _CapturingRecorder()
+    messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "q"}]
+    rec.record_llm_call(provider="mock", model="mock", scope="reflect_tool_call", messages=messages)
+    messages.append({"role": "assistant", "tool_calls": [{"id": "1"}]})
+    messages.append({"role": "tool", "content": "{}"})
+
+    assert [m["role"] for m in rec.records[0].input] == ["system", "user"]
+
+
 def test_record_llm_call_error_record():
     rec = _CapturingRecorder()
     rec.record_llm_call(
@@ -330,6 +343,93 @@ def _openai_response_with_usage(content: str):
 
 
 @pytest.mark.asyncio
+async def test_openai_reasoning_tokens_reach_success_and_error_traces(registered_recorder):
+    """Both outcomes must retain the billable reasoning count separately from visible output."""
+    llm = LLMProvider(provider="openai", api_key="test-key", base_url="https://example.test/v1", model="qwen")
+    response = _openai_response_with_usage('{"fact": "the sky is blue"}')
+    response.usage.prompt_tokens = 100
+    response.usage.completion_tokens = 80
+    response.usage.total_tokens = 180
+    response.usage.completion_tokens_details = SimpleNamespace(reasoning_tokens=60)
+    llm._provider_impl._client.chat.completions.create = AsyncMock(return_value=response)
+
+    await llm.call(
+        messages=[{"role": "user", "content": "extract facts"}],
+        response_format=_Extracted,
+        scope="retain_extract_facts",
+        max_retries=0,
+    )
+    success = registered_recorder.records[-1]
+    assert success.output_tokens == 20
+    assert success.total_tokens == 120
+    assert success.thoughts_tokens == 60
+
+    response.choices[0].message.content = "not valid json"
+    with pytest.raises(json.JSONDecodeError):
+        await llm.call(
+            messages=[{"role": "user", "content": "extract facts"}],
+            response_format=_Extracted,
+            scope="retain_extract_facts",
+            max_retries=0,
+        )
+    failure = registered_recorder.records[-1]
+    assert failure.status == "error"
+    assert failure.output_tokens == 20
+    assert failure.total_tokens == 120
+    assert failure.thoughts_tokens == 60
+
+
+@pytest.mark.asyncio
+async def test_openai_tool_trace_keeps_cached_and_reasoning_usage(registered_recorder):
+    """A successful tool-capable reply must expose both reported usage details in its trace."""
+    llm = LLMProvider(provider="openai", api_key="test-key", base_url="https://example.test/v1", model="qwen")
+    response = _openai_response_with_usage("done")
+    response.usage.prompt_tokens = 100
+    response.usage.completion_tokens = 80
+    response.usage.total_tokens = 180
+    response.usage.prompt_tokens_details.cached_tokens = 30
+    response.usage.completion_tokens_details = SimpleNamespace(reasoning_tokens=60)
+    llm._provider_impl._client.chat.completions.create = AsyncMock(return_value=response)
+
+    await llm.call_with_tools(messages=[{"role": "user", "content": "answer"}], tools=[], scope="tools", max_retries=0)
+
+    assert len(registered_recorder.records) == 1
+    trace = registered_recorder.records[0]
+    assert trace.status == "success"
+    assert trace.input_tokens == 100
+    assert trace.output_tokens == 20
+    assert trace.cached_tokens == 30
+    assert trace.thoughts_tokens == 60
+
+
+@pytest.mark.asyncio
+async def test_openai_tool_parse_error_keeps_billed_reasoning_usage(registered_recorder):
+    """Usage is already billed when an unusable tool reply fails local parsing."""
+    llm = LLMProvider(provider="openai", api_key="test-key", base_url="https://example.test/v1", model="qwen")
+    response = _openai_response_with_usage("done")
+    response.usage.prompt_tokens = 100
+    response.usage.completion_tokens = 80
+    response.usage.total_tokens = 180
+    response.usage.prompt_tokens_details.cached_tokens = 30
+    response.usage.completion_tokens_details = SimpleNamespace(reasoning_tokens=60)
+    response.choices = []
+    llm._provider_impl._client.chat.completions.create = AsyncMock(return_value=response)
+
+    with pytest.raises(IndexError):
+        await llm.call_with_tools(
+            messages=[{"role": "user", "content": "answer"}], tools=[], scope="tools", max_retries=0
+        )
+
+    assert len(registered_recorder.records) == 1
+    trace = registered_recorder.records[0]
+    assert trace.status == "error"
+    assert trace.input_tokens == 100
+    assert trace.output_tokens == 20
+    assert trace.cached_tokens == 30
+    assert trace.thoughts_tokens == 60
+
+
+@pytest.mark.asyncio
 async def test_retain_extract_json_parse_failure_keeps_usage(registered_recorder):
     """The provider call succeeds (and reports usage) but returns non-JSON for a
     structured request; the retain-extraction error trace keeps the tokens."""
@@ -479,9 +579,9 @@ async def test_engine_teardown_unregisters_recorder_even_when_close_skipped():
     out to ALL registered recorders. The engine fixtures must remove their recorder
     on teardown even when ``close()`` is skipped (pool already closing/absent) or
     raises before the unregister step — otherwise a leaked, still-enabled recorder
-    from an earlier test records a later test's LLM calls into the shared DB, which
-    is what made ``test_disabled_writes_no_rows`` flaky. The teardown helper must
-    leave the registry exactly as it found it.
+    from an earlier test goes on recording every later test's LLM calls into the
+    shared DB under their bank ids. The teardown helper must leave the registry
+    exactly as it found it.
     """
     from hindsight_api import tracing
     from tests.conftest import _teardown_memory_engine
@@ -525,6 +625,42 @@ async def trace_api_client(memory):
 @pytest.fixture
 def bank_id():
     return f"llm_trace_test_{datetime.now().timestamp()}"
+
+
+@pytest.mark.asyncio
+async def test_reasoning_tokens_persist_in_bank_trace_and_stats(trace_api_client, memory, bank_id):
+    await trace_api_client.put(f"/v1/default/banks/{bank_id}", json={"name": "Trace Bank"})
+    trace_id = f"reasoning-{bank_id}"
+    token = set_trace_context(LLMTraceContext(bank_id=bank_id, operation="retain", trace_id=trace_id))
+    try:
+        memory._llm_recorder.record_llm_call(
+            provider="openai",
+            model="qwen",
+            scope="retain_extract_facts",
+            messages=[{"role": "user", "content": "extract facts"}],
+            response_content="fact",
+            input_tokens=100,
+            output_tokens=20,
+            thoughts_tokens=60,
+            duration=0.1,
+        )
+        await memory._llm_recorder._writes.drain(trace_id)
+    finally:
+        llm_trace.reset_trace_context(token)
+
+    response = await trace_api_client.get(f"/v1/default/banks/{bank_id}/llm-requests")
+    assert response.status_code == 200
+    entry = next(item for item in response.json()["items"] if item["trace_id"] == trace_id)
+    assert entry["output_tokens"] == 20
+    assert entry["thoughts_tokens"] == 60
+    assert entry["total_tokens"] == 120
+
+    response = await trace_api_client.get(f"/v1/default/banks/{bank_id}/llm-requests/stats", params={"period": "1d"})
+    assert response.status_code == 200
+    totals = response.json()["buckets"][0]["tokens"]
+    assert totals["output"] == 20
+    assert totals["thoughts"] == 60
+    assert totals["total"] == 120
 
 
 @pytest.mark.asyncio
@@ -751,43 +887,45 @@ async def test_stats_endpoint_includes_tokens(trace_api_client, bank_id):
     bucket = data["buckets"][0]
     assert "statuses" in bucket
     assert "tokens" in bucket
-    assert set(bucket["tokens"].keys()) == {"input", "output", "cached", "total"}
+    assert set(bucket["tokens"].keys()) == {"input", "output", "cached", "thoughts", "total"}
     assert bucket["total"] >= 1
 
 
 @pytest.mark.asyncio
-async def test_disabled_writes_no_rows(memory):
-    # Recorders live in a process-global registry, and this test can only prove
-    # anything about the one it disables. A recorder leaked by an earlier test is
-    # still enabled and still writing to the shared table, so it records this
-    # bank's retain and the count below comes back non-zero — with nothing in the
-    # failure naming the real cause (#2229). Assert the registry is clean first,
-    # so a leak reports itself instead of arriving as `assert 4 == 0`.
-    from hindsight_api.engine.llm_trace import LLMTraceRecorder
-    from hindsight_api.tracing import get_span_recorder
+async def test_disabled_schedules_no_write(memory, monkeypatch):
+    """A disabled recorder schedules no write for a retain that drives real LLM calls.
 
-    registered = [r for r in get_span_recorder()._recorders if isinstance(r, LLMTraceRecorder)]
-    assert registered == [memory._llm_recorder], (
-        f"{len(registered)} LLM trace recorder(s) registered, expected only this engine's — "
-        "an earlier test leaked one into the global registry (#2229)"
-    )
+    Asserted on the recorder, not by counting rows. This used to retain and then
+    assert the read API reported 0 rows for the bank, which flaked for three rounds
+    of registry hardening (#2229): ``llm_requests`` is one table every test in the
+    xdist worker writes to (tracing is on by default), reached through a
+    process-global recorder registry that providers fan every LLM call out to. So
+    the count was a claim about the whole process, not about the one recorder the
+    test disabled, and any recorder outliving its own test turned it into a bare
+    ``assert 3 == 0`` naming nothing. Spying on the recorder's schedule point is
+    process-local: nothing else can pollute it, and
+    ``_record_fire_and_forget`` is the only path that creates a row
+    (``attach_memory_ids`` only patches ones already written).
 
-    memory._llm_recorder._enabled = False
+    The read API's empty case is covered by ``test_list_empty``.
+    """
+    scheduled: list[LLMRequestRecord] = []
+    monkeypatch.setattr(memory._llm_recorder, "_record_fire_and_forget", scheduled.append)
+    monkeypatch.setattr(memory._llm_recorder, "_enabled", False)
 
     app = create_app(memory, initialize_memory=False)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         bid = f"llm_trace_disabled_{datetime.now().timestamp()}"
         await client.put(f"/v1/default/banks/{bid}", json={"name": "No Trace"})
-        await client.post(
+        response = await client.post(
             f"/v1/default/banks/{bid}/memories",
             json={"items": [{"content": "nope", "context": "x"}]},
         )
-        await asyncio.sleep(0.5)
+        assert response.status_code == 200  # the retain really ran, so LLM calls really fanned out
 
-        response = await client.get(f"/v1/default/banks/{bid}/llm-requests")
-        assert response.status_code == 200
-        assert response.json()["total"] == 0
+    assert scheduled == []
+    assert memory._llm_recorder.is_enabled("retain_extract_facts") is False
 
 
 # ── real-LLM acceptance (provider matrix) ─────────────────────────────────────

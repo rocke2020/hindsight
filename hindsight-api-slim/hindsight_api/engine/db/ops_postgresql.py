@@ -16,7 +16,7 @@ from .ops import (
     TagListingParts,
     UpdatedWindow,
     bank_serialization_sql,
-    document_serialization_sql,
+    key_serialization_sql,
     memory_unit_columns,
 )
 from .result import ResultRow
@@ -82,6 +82,38 @@ class PostgreSQLOps(DataAccessOps):
     @property
     def uses_observation_sources_table(self) -> bool:
         return False  # PG uses native array ops on source_memory_ids
+
+    async def fetch_reconcilable_batch_parents(self, conn: DatabaseConnection, table: str) -> list[ResultRow]:
+        # Matches children with `->>` equality rather than the `@>` containment the
+        # locked recheck (and the result_metadata GIN index) uses: `@>` against a
+        # per-parent expression forces a nested loop of index probes, one per
+        # pending parent, which is the cost this discovery pass exists to remove
+        # (51k parents took 7m46s before #5178). `->>` lets the planner hash the
+        # child set once and anti-join it.
+        #
+        # The two predicates are not identical, and the asymmetry is deliberately
+        # the safe way round: every child `->>` matches, `@>` matches too, so a
+        # parent this query skips is one the recheck would also have left alone.
+        # The reverse can happen (`@>` also matches a child whose result_metadata
+        # is a JSON array wrapping the object), which only makes discovery
+        # over-inclusive — the locked recheck below is authoritative and leaves
+        # such a parent pending.
+        return await conn.fetch(
+            f"""
+            SELECT parent.operation_id, parent.bank_id
+            FROM {table} parent
+            WHERE parent.operation_type = 'batch_retain'
+              AND parent.status = 'pending'
+              AND parent.task_payload IS NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM {table} child
+                  WHERE child.bank_id = parent.bank_id
+                    AND child.result_metadata->>'parent_operation_id' = parent.operation_id::text
+                    AND child.status NOT IN ('completed', 'failed')
+              )
+            """
+        )
 
     async def bulk_upsert_chunks(
         self,
@@ -234,6 +266,48 @@ class PostgreSQLOps(DataAccessOps):
         )
         return [str(row["id"]) for row in results]
 
+    async def delete_unit_links(
+        self,
+        conn: DatabaseConnection,
+        table: str,
+        bank_id: str,
+        unit_ids: list,
+        keep_link_types: list[str] | None = None,
+    ) -> None:
+        if not unit_ids:
+            return
+        # Two single-column arms rather than one `from = ANY OR to = ANY`, which no
+        # endpoint index can drive (#3387). The ORDER BY ... FOR UPDATE matches
+        # delete_chunks_by_ids so every writer locks shared links the same way.
+        keep = "WHERE NOT (ml.link_type = ANY($3::text[]))" if keep_link_types else ""
+        await conn.execute(
+            f"""
+            WITH matched_links AS MATERIALIZED (
+                SELECT ctid AS link_ctid FROM {table} WHERE from_unit_id = ANY($1::uuid[]) AND bank_id = $2
+                UNION
+                SELECT ctid AS link_ctid FROM {table} WHERE to_unit_id = ANY($1::uuid[]) AND bank_id = $2
+            ),
+            ordered_links AS MATERIALIZED (
+                SELECT ml.ctid
+                FROM {table} ml
+                JOIN matched_links ON ml.ctid = matched_links.link_ctid
+                {keep}
+                ORDER BY
+                    LEAST(ml.from_unit_id, ml.to_unit_id),
+                    GREATEST(ml.from_unit_id, ml.to_unit_id),
+                    ml.link_type,
+                    COALESCE(ml.entity_id, '00000000-0000-0000-0000-000000000000'::uuid)
+                FOR UPDATE OF ml
+            )
+            DELETE FROM {table} ml
+            USING ordered_links ol
+            WHERE ml.ctid = ol.ctid
+            """,
+            unit_ids,
+            bank_id,
+            *([keep_link_types] if keep_link_types else []),
+        )
+
     async def bulk_insert_links(
         self,
         conn: DatabaseConnection,
@@ -258,9 +332,9 @@ class PostgreSQLOps(DataAccessOps):
         # into the one INSERT keeps this to a single round-trip — no extra query
         # and no surrounding transaction needed. (Oracle's immediate FK has no
         # such window and uses exists_clause via its own bulk_insert_links.)
-        from ..schema import fq_table
+        from ..schema import fq_store_table
 
-        mu_table = fq_table("memory_units")
+        mu_table = fq_store_table("memory_units")
         from_ids = [lnk[0] for lnk in sorted_links]
         to_ids = [lnk[1] for lnk in sorted_links]
         types = [lnk[2] for lnk in sorted_links]
@@ -757,21 +831,22 @@ class PostgreSQLOps(DataAccessOps):
         # made each per-row check cheaper; it kept the per-row structure, so the
         # product blew up again at scale.
         #
-        # `live` groups unit_entities by unit (self-join on unit_id) to emit every
-        # co-occurring (e1<e2) pair in one materialised pass: its cost is driven
-        # by unit degree (entities per unit — small), never by entity degree, so a
-        # hub contributes only its per-unit membership rather than a rescan per
-        # edge. The victims anti-join then hashes against it. MATERIALIZED keeps
-        # the planner from inlining `live` back into a per-row correlated plan.
+        # `live` is built in one materialised pass from unit_entities (self-join
+        # on unit_id), so cost is driven by unit membership, never by a rescan
+        # per edge. The victims anti-join then hashes against it. MATERIALIZED
+        # keeps the planner from inlining `live` back into a per-row correlated
+        # plan.
         #
-        # `live` is seeded from the *candidates'* units rather than the whole
-        # bank's (#3222 composed with #3367): graph maintenance is queue-driven,
-        # so this only has to decide about pairs in `incident`, and every such
-        # pair has a candidate as at least one endpoint. Any unit still
-        # witnessing such a pair therefore references a candidate, and so is in
-        # the seeded set — the scoped build cannot miss a live pair. That keeps
-        # the whole statement proportional to the batch instead of re-deriving
-        # every pair in the bank on every run.
+        # `live` holds only the pairs a *candidate* forms inside its own units
+        # (#3222 composed with #3367), normalised to (LEAST, GREATEST) to match
+        # entity_cooccurrences' entity_id_1 < entity_id_2 order. That is all the
+        # anti-join needs: every pair in `incident` has a candidate endpoint,
+        # and such a pair is live exactly when one of that candidate's units
+        # also holds the other endpoint. Emitting every pair of every candidate
+        # unit instead (the previous shape) gives the same victims, but around
+        # a hub it also expands all the non-candidate pairs of the hub's units,
+        # several times more rows for nothing. Duplicate pairs (both endpoints
+        # candidates, or several shared units) are harmless to the anti-join.
         result = await conn.execute(
             f"""
             WITH incident AS MATERIALIZED (
@@ -784,12 +859,12 @@ class PostgreSQLOps(DataAccessOps):
                 WHERE c.entity_id_2 = ANY($1::uuid[])
             ),
             live AS MATERIALIZED (
-                SELECT u1.entity_id AS e1, u2.entity_id AS e2
-                FROM {ue_table} seed
-                JOIN {ue_table} u1 ON u1.unit_id = seed.unit_id
-                JOIN {ue_table} u2 ON u2.unit_id = u1.unit_id
-                                  AND u2.entity_id > u1.entity_id
-                WHERE seed.entity_id = ANY($1::uuid[])
+                SELECT LEAST(s.entity_id, u.entity_id) AS e1,
+                       GREATEST(s.entity_id, u.entity_id) AS e2
+                FROM {ue_table} s
+                JOIN {ue_table} u ON u.unit_id = s.unit_id
+                                 AND u.entity_id <> s.entity_id
+                WHERE s.entity_id = ANY($1::uuid[])
             ),
             victims AS (
                 SELECT c.entity_id_1, c.entity_id_2
@@ -1005,7 +1080,7 @@ class PostgreSQLOps(DataAccessOps):
         per_entity_limit: int,
         window: UpdatedWindow,
     ) -> LinkExpansionRows:
-        # v0.5.6 array ops: unnest, &&, COUNT(DISTINCT) on source_memory_ids.
+        # Array ops on source_memory_ids: unnest, a per-source @> GIN probe, COUNT(DISTINCT).
         #
         # The window bounds the observations that come *back*, not the source facts
         # traversed to reach them: an observation is in the window when it was itself
@@ -1041,7 +1116,22 @@ class PostgreSQLOps(DataAccessOps):
         # O(sum of degree) rather than O(entities x per_entity_limit). Measured at
         # parity up to ~12k-degree hubs and +50% traversal cost at 38k. If banks
         # grow hubs far past that, re-measure before assuming this is still the
-        # right shape.
+        # right shape. Re-measured for #4715 at 138k-degree hubs with the
+        # `observation-hubs` perf suite: the whole call is ~0.2-0.4s, so the
+        # window still holds once the candidate probe below is per-source.
+        #
+        # `candidate_ids` probes the source_memory_ids GIN index once per connected
+        # source with a one-element `@>`, not once with `&& <all connected sources>`
+        # (issue #4715). On hub-heavy banks connected_sources reaches ~17k ids, and
+        # rechecking `&&` against a 17k-element array costs every matched row
+        # O(len x 17k): 5-21s per call, so 8 parallel consolidation recalls passed
+        # the 60s timeout. `x && ARRAY[a, b, ...]` holds exactly when some
+        # `x @> ARRAY[a]` does, so the candidate set is unchanged. Two traps, both
+        # measured on the reporter's bank: keep `fact_type` out of the probe and
+        # keep the OFFSET 0 fence. With the filter inside (or flattened in from
+        # `candidates`), the planner ANDs every probe with a full scan of
+        # idx_memory_units_observations and the query took 84-185s. A per-source
+        # `&&` instead of `@>` took 137s.
         #
         # Entity/source traversal and semantic/causal expansion run as ONE query
         # (#3857): the observation entity arm is fused into the semantic/causal CTE
@@ -1080,18 +1170,24 @@ class PostgreSQLOps(DataAccessOps):
                       SELECT 1 FROM seed_sources ss WHERE ss.source_id = t.unit_id
                   )
             ),
-            connected_array AS (
-                SELECT array_agg(source_id) AS source_ids FROM connected_sources
+            candidate_ids AS (
+                SELECT DISTINCT o.id
+                FROM connected_sources cs
+                CROSS JOIN LATERAL (
+                    SELECT m.id
+                    FROM {mu_table} m
+                    WHERE m.source_memory_ids @> ARRAY[cs.source_id]
+                    OFFSET 0
+                ) o
             ),
             candidates AS (
                 SELECT
                     {memory_unit_columns("mu", indent=20)},
                     mu.source_memory_ids
-                FROM {mu_table} mu, connected_array ca
+                FROM {mu_table} mu
+                JOIN candidate_ids ci ON ci.id = mu.id
                 WHERE mu.fact_type = 'observation'
                   AND mu.id != ALL($1::uuid[])
-                  AND ca.source_ids IS NOT NULL
-                  AND mu.source_memory_ids && ca.source_ids
                   {window.clause("mu")}
             ),
             scored AS (
@@ -1676,7 +1772,7 @@ class PostgreSQLOps(DataAccessOps):
               AND o.operation_type = $1
               AND (o.next_retry_at IS NULL OR o.next_retry_at <= NOW())
               AND {bank_serialization_sql(table, "o")}
-              AND {document_serialization_sql(table, "o")}
+              AND {key_serialization_sql(table, "o")}
             ORDER BY o.created_at
             LIMIT $2
             FOR UPDATE SKIP LOCKED
@@ -1730,7 +1826,7 @@ class PostgreSQLOps(DataAccessOps):
         cursor off the result. Within the rotated bank the row is index-ordered
         rather than that bank's oldest — sorting by ``created_at`` there would
         need an index on ``(bank_id, created_at)`` and cost 12 s without one, and
-        per-document order is held by ``document_serialization_sql`` regardless.
+        per-key order is held by ``key_serialization_sql`` regardless.
         """
         params: list = [bank_cursor]
         exclusion = ""
@@ -1747,7 +1843,7 @@ class PostgreSQLOps(DataAccessOps):
               AND o.operation_type != 'consolidation'
               AND (o.next_retry_at IS NULL OR o.next_retry_at <= NOW())
               AND {bank_serialization_sql(table, "o")}
-              AND {document_serialization_sql(table, "o")}{exclusion}"""
+              AND {key_serialization_sql(table, "o")}{exclusion}"""
 
         return await conn.fetch(
             f"""

@@ -12,6 +12,7 @@ Sections:
 """
 
 import json
+import uuid
 
 import pytest
 
@@ -263,6 +264,139 @@ def regex_defense() -> MemoryDefenseRegexExtension:
     return MemoryDefenseRegexExtension({})
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        "score: 0.1234567890123456",
+        "timestamp_ms: 1700000000000",
+        "task_id: aaaaaaaa-bbbb-cccc-1234-123456789012",
+        "ports: 8000 8080 8888 9999",
+        "count: 123456",
+        "score: 0.123456",
+        # A checksum alone cannot distinguish a card-shaped decimal or UUID tail.
+        "score: 0.4111111111111111",
+        "task_id: aaaaaaaa-bbbb-cccc-4111-111111111111",
+        "task_id: 41111111-1111-1111-1111-111111111111",
+        "value: 4111111111111111.25",
+        "card typo: 4111 1111 1111 1112",
+        "placeholder: 0000 0000 0000 0000",
+    ],
+)
+def test_credit_card_rejects_technical_values(content: str) -> None:
+    result = apply_redaction(content)
+    assert result.content == content
+    assert result.matched_types == []
+    assert result.hits == []
+
+
+@pytest.mark.parametrize(
+    "card",
+    [
+        "4111111111111111",
+        "4111 1111 1111 1111",
+        "4111-1111-1111-1111",
+        "4222222222222",
+        "378282246310005",
+        "5555555555554444",
+    ],
+)
+@pytest.mark.parametrize("template", ["{}", "卡号{}请删除", "Card: {}.", "card-{}", "-{}", "{}.Next", "{}-expires"])
+def test_credit_card_keeps_valid_test_numbers(card: str, template: str) -> None:
+    result = apply_redaction(template.format(card))
+    assert result.content == template.format("[REDACTED:credit_card]")
+    assert result.matched_types == ["credit_card"]
+    assert result.hits == [{"detector": "credit_card", "preview": _fingerprint_value(card)}]
+
+
+@pytest.mark.parametrize("action", ["redact", "block"])
+@pytest.mark.parametrize("prefix", ["card: ", "2026 ", "2026 2026 "])
+@pytest.mark.parametrize(
+    "card",
+    ["4111 1111 1111 1111", "４１１１１１１１１１１１１１１１", "٤١١١١١١١١١١١١١١١", "４١11 １１١1 1111 1111"],
+)
+async def test_credit_card_policy_preserves_overlapping_and_unicode_matches(
+    regex_defense: MemoryDefenseRegexExtension, action: str, prefix: str, card: str
+) -> None:
+    policy = parse_policy({"enabled": True, "rules": [{"on": "sensitive_data", "action": action}]})
+    decision = await regex_defense.screen(
+        policy=policy, bank_id="test", document_id=None, content=prefix + card, tags=[]
+    )
+    assert decision.action == DefenseAction(action)
+    assert decision.matched_types == ["credit_card"]
+    assert decision.hits == [{"detector": "credit_card", "preview": _fingerprint_value(card)}]
+    assert decision.redacted_content == (prefix + "[REDACTED:credit_card]" if action == "redact" else None)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "０.4111111111111111",
+        "4111111111111111.٢",
+        "0.４１１１１１１１１１１１１１１１",
+        "٤١١١١١١١١١١١١١١١.25",
+        "４1111111111111111",
+        "4111111111111111٤",
+        "００٠٠ 0000 ００٠٠ 0000",
+        "٤١١١ ١١١١ ١١١١ ١١١٢",
+    ],
+)
+@pytest.mark.parametrize("action", ["redact", "block"])
+async def test_credit_card_policy_rejects_unicode_non_cards(
+    regex_defense: MemoryDefenseRegexExtension, action: str, content: str
+) -> None:
+    policy = parse_policy({"enabled": True, "rules": [{"on": "sensitive_data", "action": action}]})
+    decision = await regex_defense.screen(policy=policy, bank_id="test", document_id=None, content=content, tags=[])
+    assert decision.action is DefenseAction.ALLOW
+    assert decision.matched_types == []
+    assert decision.hits == []
+    assert decision.redacted_content is None
+
+
+def test_credit_card_overlapping_search_preserves_multiple_hits() -> None:
+    # Both year-prefixed candidates fail Luhn, unlike "2026 5555 5555 5555".
+    content = "2026 4111 1111 1111 1111; 2025 5555 5555 5555 4444; 2026"
+    result = apply_redaction(content)
+    assert result.content == "2026 [REDACTED:credit_card]; 2025 [REDACTED:credit_card]; 2026"
+    assert result.matched_types == ["credit_card"]
+    assert result.hits == [
+        {"detector": "credit_card", "preview": "4111...1111"},
+        {"detector": "credit_card", "preview": "5555...4444"},
+    ]
+
+
+def test_credit_card_filters_each_match_without_losing_other_detectors() -> None:
+    content = "1700000000000; 4111 1111 1111 1111; 8000 8080 8888 9999; 5555555555554444; 123-45-6789"
+    result = apply_redaction(content)
+    assert result.content == (
+        "1700000000000; [REDACTED:credit_card]; 8000 8080 8888 9999; [REDACTED:credit_card]; [REDACTED:ssn_us]"
+    )
+    assert result.matched_types == ["credit_card", "ssn_us"]
+    assert result.hits == [
+        {"detector": "credit_card", "preview": "4111...1111"},
+        {"detector": "credit_card", "preview": "5555...4444"},
+        {"detector": "ssn_us", "preview": "12...89"},
+    ]
+
+
+@pytest.mark.parametrize("action", ["redact", "block"])
+@pytest.mark.parametrize("content", ["score: 0.4111111111111111", "4111 1111 1111 1111"])
+async def test_credit_card_policy_uses_validated_matches(
+    regex_defense: MemoryDefenseRegexExtension, action: str, content: str
+) -> None:
+    policy = parse_policy({"enabled": True, "rules": [{"on": "sensitive_data", "action": action}]})
+    decision = await regex_defense.screen(policy=policy, bank_id="test", document_id=None, content=content, tags=[])
+    if content.startswith("score:"):
+        assert decision.action is DefenseAction.ALLOW
+        assert decision.matched_types == []
+        assert decision.hits == []
+        assert decision.redacted_content is None
+    else:
+        assert decision.action == DefenseAction(action)
+        assert decision.matched_types == ["credit_card"]
+        assert decision.hits == [{"detector": "credit_card", "preview": "4111...1111"}]
+        assert decision.redacted_content == ("[REDACTED:credit_card]" if action == "redact" else None)
+
+
 @pytest.fixture
 def redact_policy() -> dict:
     return {"enabled": True, "rules": [{"on": "sensitive_data", "action": "redact"}]}
@@ -478,13 +612,8 @@ def test_engine_memory_defense_shares_ext_ctx() -> None:
     engine = _make_minimal_engine()
     assert engine._memory_defense._context is engine._ext_ctx
     assert engine._ext_ctx.webhook_manager is None
-
-
-def test_engine_ext_ctx_current_schema_propagation() -> None:
-    """Writing _ext_ctx.current_schema is visible through _memory_defense.context."""
-    engine = _make_minimal_engine()
-    engine._ext_ctx.current_schema = "tenant_x"
-    assert engine._memory_defense.context.current_schema == "tenant_x"
+    # One context shared by every request: per-request tenant state on it is last-writer-wins (#4372).
+    assert not hasattr(engine._ext_ctx, "current_schema")
 
 
 # ---------------------------------------------------------------------------
@@ -609,6 +738,62 @@ async def test_retain_blocks_secret_item(api_client) -> None:
         json={"items": [{"content": "the roadmap meeting is on friday"}]},
     )
     assert r2.status_code == 200, r2.text
+
+
+@pytest.mark.asyncio
+async def test_mixed_retain_preserves_input_positions_in_results_and_hook(
+    pg0_db_url, query_analyzer, request_context
+) -> None:
+    from hindsight_api.engine.memory_engine import MemoryEngine
+    from hindsight_api.engine.task_backend import SyncTaskBackend
+    from tests.test_extensions import TrackingValidator
+    from tests.test_llm_reasoning_effort_env import DummyCrossEncoder
+    from tests.test_retain_same_document_concurrency import _StubEmbeddings
+
+    validator = TrackingValidator({})
+    memory = MemoryEngine(
+        db_url=pg0_db_url,
+        memory_llm_provider="mock",
+        memory_llm_api_key="",
+        memory_llm_model="mock",
+        embeddings=_StubEmbeddings(),
+        cross_encoder=DummyCrossEncoder(),
+        query_analyzer=query_analyzer,
+        run_migrations=False,
+        task_backend=SyncTaskBackend(),
+        operation_validator=validator,
+    )
+    await memory.initialize()
+    memory._config_resolver._global_config.enable_auto_consolidation = False
+    bank = f"md-retain-mixed-order-{uuid.uuid4().hex[:8]}"
+    await memory.update_bank_config(
+        bank,
+        {"memory_defense": {"enabled": True, "rules": [{"on": "sensitive_data", "action": "block"}]}},
+        request_context=request_context,
+    )
+    # Each document is processed as its own group, with a blocked item before
+    # the item that creates memories.
+    contents = [
+        {"content": "key=" + "ghp_" + "A" * 36, "document_id": "doc-a"},
+        {"content": "Alice lives in Paris.", "document_id": "doc-a"},
+        {"content": "key=" + "sk-ant-" + "B" * 40, "document_id": "doc-b"},
+        {"content": "Bob enjoys hiking.", "document_id": "doc-b"},
+    ]
+
+    try:
+        memory_ids = await memory.retain_batch_async(bank, contents, request_context=request_context)
+
+        assert len(memory_ids) == len(contents)
+        assert memory_ids[0] == []
+        assert memory_ids[1]
+        assert memory_ids[2] == []
+        assert memory_ids[3]
+        assert len(validator.post_retain_calls) == 1
+        hook_result = validator.post_retain_calls[0]
+        assert hook_result.contents == contents
+        assert hook_result.unit_ids == memory_ids
+    finally:
+        await memory.close()
 
 
 async def _memory_defense_webhook_events(memory, bank: str) -> list[dict]:
@@ -903,6 +1088,28 @@ def _defense_config(memory_defense: dict | None) -> HindsightConfig:
     from hindsight_api.config import _get_raw_config
 
     return dataclasses.replace(_get_raw_config(), memory_defense=memory_defense)
+
+
+@pytest.mark.parametrize("card", ["4111 1111 1111 1111", "４１１１１１１１１１１１１１１１", "٤١١١١١١١١١١١١١١١"])
+def test_redact_document_body_preserves_overlapping_and_unicode_matches(card: str) -> None:
+    from hindsight_api.engine.retain.orchestrator import redact_document_body
+
+    out = redact_document_body(
+        "2026 " + card,
+        _defense_config({"enabled": True, "rules": [{"on": "sensitive_data", "action": "redact"}]}),
+    )
+    assert out == "2026 [REDACTED:credit_card]"
+
+
+def test_redact_document_body_preserves_technical_values_and_scrubs_cards() -> None:
+    from hindsight_api.engine.retain.orchestrator import redact_document_body
+
+    technical = "score: 0.4111111111111111; task_id: aaaaaaaa-bbbb-cccc-4111-111111111111; "
+    out = redact_document_body(
+        technical + "card: 4111 1111 1111 1111",
+        _defense_config({"enabled": True, "rules": [{"on": "sensitive_data", "action": "redact"}]}),
+    )
+    assert out == technical + "card: [REDACTED:credit_card]"
 
 
 def test_redact_document_body_scrubs_when_the_policy_redacts():

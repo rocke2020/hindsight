@@ -142,7 +142,11 @@ def create_worker_app(poller: WorkerPoller, memory):
     )
     async def metrics_endpoint():
         """Return Prometheus metrics."""
-        metrics_data = generate_latest()
+        # Render off the event loop, same as the API's /metrics: generate_latest() is synchronous
+        # and its cost scales with registry size. Inline, a large scrape freezes this loop -- and
+        # this app also serves /health/live, so a stalled probe gets the worker restarted and its
+        # claimed operations requeued. See the longer note in api/http.py's metrics_endpoint.
+        metrics_data = await asyncio.to_thread(generate_latest)
         return Response(content=metrics_data, media_type=CONTENT_TYPE_LATEST)
 
     @app.get(
@@ -186,12 +190,6 @@ def main():
         default=config.worker_poll_interval_ms,
         help=f"Poll interval in milliseconds (default: {config.worker_poll_interval_ms}, env: HINDSIGHT_API_WORKER_POLL_INTERVAL_MS)",
     )
-    parser.add_argument(
-        "--max-retries",
-        type=int,
-        default=config.worker_max_retries,
-        help=f"Max retries before marking failed (default: {config.worker_max_retries}, env: HINDSIGHT_API_WORKER_MAX_RETRIES)",
-    )
 
     # HTTP server options
     parser.add_argument(
@@ -206,15 +204,19 @@ def main():
         help="HTTP host to bind (default: 0.0.0.0)",
     )
 
-    # Logging options
-    parser.add_argument(
-        "--log-level",
-        default=config.log_level,
-        choices=["critical", "error", "warning", "info", "debug", "trace"],
-        help=f"Log level (default: {config.log_level}, env: HINDSIGHT_API_LOG_LEVEL)",
-    )
+    # Retired: these only ever changed the startup banner, never the poller, the engine
+    # or logging. Still accepted so existing launch commands keep starting.
+    for retired_flag in ("--max-retries", "--log-level"):
+        parser.add_argument(retired_flag, default=None, help=argparse.SUPPRESS)
 
     args = parser.parse_args()
+
+    for flag, env_var, value in (
+        ("--max-retries", "HINDSIGHT_API_WORKER_MAX_RETRIES", args.max_retries),
+        ("--log-level", "HINDSIGHT_API_LOG_LEVEL", args.log_level),
+    ):
+        if value is not None:
+            print(f"{flag} {value} is ignored: set {env_var} instead.", file=sys.stderr)
 
     # Configure logging
     config.configure_logging()
@@ -239,7 +241,7 @@ def main():
 
     print(f"Starting Hindsight Worker: {worker_id}")
     print(f"  Poll interval: {args.poll_interval}ms")
-    print(f"  Max retries: {args.max_retries}")
+    print(f"  Max retries: {config.worker_max_retries}")
     print(f"  Max slots: {config.worker_max_slots}")
     reservations = config.worker_slot_reservations
     reservations_str = ", ".join(f"{k}={v}" for k, v in reservations.items()) if reservations else "none"
@@ -309,7 +311,9 @@ def main():
 
         schema = None if config.database_schema == DEFAULT_DATABASE_SCHEMA else config.database_schema
         poller = WorkerPoller(
-            backend=memory._backend,
+            # Not `_backend` directly: it is Optional only because `close()` clears it, and
+            # this runs while the engine is live.
+            backend=memory._require_backend(),
             worker_id=worker_id,
             executor=memory.execute_task,
             poll_interval_ms=args.poll_interval,

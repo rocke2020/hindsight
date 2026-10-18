@@ -150,7 +150,13 @@ describe("buildKnowledgeTools", () => {
   it("hindsight_search_knowledge_pages calls the server hybrid search and returns ranked hits", async () => {
     const client = stubClient({
       searchKnowledgePages: vi.fn(async () => [
-        { id: "p1", name: "Uploader guide", snippet: "Uploads retry with backoff…", score: 0.031 },
+        {
+          id: "p1",
+          name: "Uploader guide",
+          source_query: "How do uploads recover from failures?",
+          snippet: "Uploads retry with backoff…",
+          score: 0.031,
+        },
         { id: "p2", name: "Auth notes", snippet: "Tokens rotate daily.", score: 0.012 },
       ]),
     });
@@ -158,16 +164,38 @@ describe("buildKnowledgeTools", () => {
     const tool = findTool(tools, "hindsight_search_knowledge_pages");
     const result = await tool.handler({ query: "upload retries" });
     expect(result.isError).toBeFalsy();
-    expect(client.searchKnowledgePages).toHaveBeenCalledWith("upload retries", 3);
-    expect(JSON.parse(result.content[0].text)).toEqual([
+    // The tool passes no limit — the client's pageSearchLimit is the single source for it.
+    expect(client.searchKnowledgePages).toHaveBeenCalledWith("upload retries");
+    // No `score`: the server's RRF number tops out near 0.03, so a model reading it treats its best
+    // hit as 3% relevant. Rank order carries the ranking.
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.pages).toEqual([
       {
         page: "Uploader guide",
         page_id: "p1",
+        description: "How do uploads recover from failures?",
         snippet: "Uploads retry with backoff…",
-        score: 0.031,
       },
-      { page: "Auth notes", page_id: "p2", snippet: "Tokens rotate daily.", score: 0.012 },
+      { page: "Auth notes", page_id: "p2", snippet: "Tokens rotate daily." },
     ]);
+    // The credit reminder rides with the hits: the session guide has scrolled away by the time a
+    // search lands mid-session, and a paraphrased snippet otherwise gets absorbed uncredited.
+    expect(payload.crediting).toContain("From Hindsight memory");
+    expect(payload.crediting).toContain("paraphrased");
+  });
+
+  it("hindsight_search_knowledge_pages adds toolGuideExtra after the crediting note (#4791)", async () => {
+    const extra = "Memory is a past record: verify it against the code first.";
+    const client = stubClient({ searchKnowledgePages: vi.fn(async () => []) });
+    const tool = findTool(
+      buildKnowledgeTools(client, "repo-a", { toolGuideExtra: extra }),
+      "hindsight_search_knowledge_pages"
+    );
+    const { crediting } = JSON.parse((await tool.handler({ query: "q" })).content[0].text);
+    // Added, not replacing: the crediting rule is still there, and the team's text follows it.
+    expect(crediting).toContain("From Hindsight memory");
+    expect(crediting.endsWith(extra)).toBe(true);
+    expect(tool.description.endsWith(extra)).toBe(true);
   });
 
   it("hindsight_search_knowledge_pages returns isError:true when the server search throws", async () => {
@@ -376,20 +404,40 @@ describe("buildKnowledgeTools", () => {
     );
   });
 
-  it("hindsight_ingest_document falls back to 'doc' when the title has no safe characters", async () => {
-    const client = stubClient();
-    const tools = buildKnowledgeTools(client, "repo-a");
-    const tool = findTool(tools, "hindsight_ingest_document");
-    await tool.handler({ title: "!!!///???", content: "x" });
-    expect(client.retain).toHaveBeenCalledWith(
-      "x",
-      "ingested document",
-      "doc",
-      ["source:upload"],
-      "document",
-      {} // no harness in these tests: nothing to stamp
-    );
-  });
+  it.each([
+    ["测试问题17记忆文档一", "测试问题17记忆文档二"],
+    ["记忆文档一", "记忆文档二"],
+    ["Résumé", "Rèsumé"],
+    ["!!!///???", "???///!!!"],
+  ])(
+    "hindsight_ingest_document keeps distinct lossy titles: %s / %s",
+    async (title, otherTitle) => {
+      const documents = new Map<string, string>();
+      const client = stubClient({
+        retain: vi.fn(async (content: string, _context: string, documentId: string) => {
+          documents.set(documentId, content);
+        }),
+      });
+      const tool = findTool(buildKnowledgeTools(client, "repo-a"), "hindsight_ingest_document");
+      const first = JSON.parse(
+        (await tool.handler({ title, content: "first document" })).content[0].text
+      );
+      const second = JSON.parse(
+        (await tool.handler({ title: otherTitle, content: "second document" })).content[0].text
+      );
+      expect(first.ok).toBe(true);
+      expect(second.ok).toBe(true);
+      expect(first.doc_id).not.toBe(second.doc_id);
+      expect(documents.get(first.doc_id)).toBe("first document");
+      expect(documents.get(second.doc_id)).toBe("second document");
+
+      const updated = await tool.handler({ title, content: "updated first document" });
+      expect(JSON.parse(updated.content[0].text)).toEqual(first);
+      expect(documents.size).toBe(2);
+      expect(documents.get(first.doc_id)).toBe("updated first document");
+      expect(documents.get(second.doc_id)).toBe("second document");
+    }
+  );
 
   for (const name of [
     "hindsight_list_knowledge_pages",

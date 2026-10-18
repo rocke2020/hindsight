@@ -21,61 +21,16 @@ import json
 from datetime import datetime
 from typing import Any
 
-from ...search.tags import build_tags_where_clause
-
-
-def _entity_rows_for_units_sql(*, ops, fq_table, unit_ids_placeholder: int) -> str:
-    """SQL SELECT producing ``(unit_id, entity_id, canonical_name)`` rows for
-    the given unit IDs.
-
-    Direct rows come from ``unit_entities``. Observations rarely carry
-    direct rows there; their entity association lives transitively through
-    their source memories (``source_memory_ids`` on PG, the
-    ``observation_sources`` junction on Oracle). When an observation has
-    no direct entity rows the SELECT inherits its source memories'
-    entities, so the result is the same set callers would get from
-    ``get_memory_unit``.
-
-    ``unit_ids_placeholder`` is the 1-based parameter index that holds the
-    ``uuid[]`` of unit IDs. The placeholder is referenced twice — both
-    sides of the UNION need it — so callers should not reuse the slot.
-    """
-    ue = fq_table("unit_entities")
-    ents = fq_table("entities")
-    mu = fq_table("memory_units")
-    p = unit_ids_placeholder
-
-    direct = (
-        f"SELECT ue.unit_id, e.id AS entity_id, e.canonical_name "
-        f"FROM {ue} ue "
-        f"JOIN {ents} e ON e.id = ue.entity_id "
-        f"WHERE ue.unit_id = ANY(${p}::uuid[])"
-    )
-
-    if ops.uses_observation_sources_table:
-        os_t = fq_table("observation_sources")
-        inherited = (
-            f"SELECT os.observation_id AS unit_id, e.id AS entity_id, e.canonical_name "
-            f"FROM {os_t} os "
-            f"JOIN {ue} src_ue ON src_ue.unit_id = os.source_id "
-            f"JOIN {ents} e ON e.id = src_ue.entity_id "
-            f"WHERE os.observation_id = ANY(${p}::uuid[]) "
-            f"AND NOT EXISTS (SELECT 1 FROM {ue} d WHERE d.unit_id = os.observation_id)"
-        )
-    else:
-        inherited = (
-            f"SELECT obs.id AS unit_id, e.id AS entity_id, e.canonical_name "
-            f"FROM {mu} obs "
-            f"CROSS JOIN LATERAL unnest(obs.source_memory_ids) AS src_id "
-            f"JOIN {ue} src_ue ON src_ue.unit_id = src_id "
-            f"JOIN {ents} e ON e.id = src_ue.entity_id "
-            f"WHERE obs.id = ANY(${p}::uuid[]) "
-            f"AND obs.fact_type = 'observation' "
-            f"AND obs.source_memory_ids IS NOT NULL "
-            f"AND NOT EXISTS (SELECT 1 FROM {ue} d WHERE d.unit_id = obs.id)"
-        )
-
-    return f"({direct}) UNION ({inherited})"
+from ...search.tags import (
+    TagGroup,
+    TagsMatch,
+    build_tag_filter_clause,
+    build_tag_groups_where_clause,
+    build_tags_where_clause,
+    tag_filter_active,
+)
+from ...time_filter import MEMORY_TIME_FIELDS, build_time_clause
+from .graph import _entity_rows_for_units_sql, _ops_for
 
 
 async def list_memory_units(
@@ -91,8 +46,12 @@ async def list_memory_units(
     document_id: str | None = None,
     entity_id: str | None = None,
     tags: list[str] | None = None,
-    tags_match: str = "any",
+    tags_match: TagsMatch = "any",
+    tag_groups: list[TagGroup] | None = None,
     created_before: datetime | None = None,
+    time_field: str | None = None,
+    start_date: datetime | None = None,
+    end_date: datetime | None = None,
     limit: int = 100,
     offset: int = 0,
 ) -> dict[str, Any]:
@@ -123,6 +82,12 @@ async def list_memory_units(
             'pending' (not yet consolidated, no failure), or
             'done' (successfully consolidated). Only applies to source memory
             types (world/experience).
+        time_field: Time axis to filter and order by — one of
+            ``MEMORY_TIME_FIELDS``. Supplying it (or either bound) also replaces
+            the default ordering and DROPS units with no value on that axis; see
+            ``engine.time_filter``.
+        start_date: Inclusive lower bound on ``time_field``.
+        end_date: Exclusive upper bound on ``time_field``.
         limit: Maximum number of results to return
         offset: Offset for pagination
 
@@ -214,11 +179,31 @@ async def list_memory_units(
         # Exact match with no tags is the "global" scope: rows that carry no
         # tags at all. (Other match modes treat empty tags as "no filter".)
         query_conditions.append("(tags IS NULL OR tags = '{}')")
+    if tag_groups:
+        built = build_tag_groups_where_clause(tag_groups, param_count + 1)
+        query_conditions.append(built.sql.removeprefix("AND "))
+        query_params.extend(built.params)
+        param_count = built.next_param_offset - 1
 
     if created_before is not None:
         param_count += 1
         query_conditions.append(f"created_at < ${param_count}")
         query_params.append(created_before)
+
+    # Validation rides along with the clause here, unlike `list_documents`, which has to
+    # validate before its store-owned branch returns. Memories have no such branch — every
+    # store reaches this builder — so a second guard upstream would only be a second copy.
+    window = build_time_clause(
+        time_field=time_field,
+        start_date=start_date,
+        end_date=end_date,
+        allowed=MEMORY_TIME_FIELDS,
+        default_field="created_at",
+        param_offset=param_count + 1,
+    )
+    query_conditions.extend(window.conditions)
+    query_params.extend(window.params)
+    param_count = window.next_param_offset - 1
 
     where_clause = "WHERE " + " AND ".join(query_conditions) if query_conditions else ""
 
@@ -254,7 +239,7 @@ async def list_memory_units(
                updated_at, source_memory_ids, {curation_cols}
         FROM {source_table}
         {where_clause}
-        ORDER BY mentioned_at DESC NULLS LAST, created_at DESC
+        ORDER BY {window.order_by or "mentioned_at DESC NULLS LAST, created_at DESC"}
         LIMIT {limit_param} OFFSET {offset_param}
     """,
         *query_params,
@@ -440,6 +425,9 @@ async def list_entities(
     fq_table,
     bank_id: str,
     search: str | None = None,
+    tags: list[str] | None = None,
+    tags_match: TagsMatch = "any",
+    tag_groups: list | None = None,
     limit: int = 100,
     offset: int = 0,
 ) -> dict[str, Any]:
@@ -451,12 +439,30 @@ async def list_entities(
         fq_table: Table-name resolver.
         bank_id: bank IDentifier
         search: Optional case-insensitive substring match on canonical_name.
+        tags: Optional tag filter on the memories that mention each entity. An
+            entity is listed only when at least one of its memories matches, and
+            its counts and dates cover the matching memories only.
+        tags_match: How ``tags`` match, same modes as everywhere else.
+        tag_groups: Compound tag filter (already fuzzy-resolved), AND-ed with ``tags``.
         limit: Maximum number of entities to return
         offset: Offset for pagination
 
     Returns:
         Dict with items, total, limit, offset
     """
+    if tag_filter_active(tags, tags_match, tag_groups):
+        return await _list_entities_tag_filtered(
+            conn=conn,
+            fq_table=fq_table,
+            bank_id=bank_id,
+            search=search,
+            tags=tags,
+            tags_match=tags_match,
+            tag_groups=tag_groups,
+            limit=limit,
+            offset=offset,
+        )
+
     conditions = ["bank_id = $1"]
     params: list[Any] = [bank_id]
     if search:
@@ -491,37 +497,163 @@ async def list_entities(
         offset,
     )
 
-    entities = []
-    for row in rows:
-        # Handle metadata - may be dict, JSON string, or None
-        metadata = row["metadata"]
-        if metadata is None:
-            metadata = {}
-        elif isinstance(metadata, str):
-            try:
-                metadata = json.loads(metadata)
-            except json.JSONDecodeError:
-                metadata = {}
-
-        entities.append(
-            {
-                "id": str(row["id"]),
-                "canonical_name": row["canonical_name"],
-                # How the entity was classified (label vs free-form, etc.); same row,
-                # so listing it costs nothing extra.
-                "entity_kind": row["entity_kind"],
-                "mention_count": row["mention_count"],
-                "first_seen": row["first_seen"].isoformat() if row["first_seen"] else None,
-                "last_seen": row["last_seen"].isoformat() if row["last_seen"] else None,
-                "metadata": metadata,
-            }
-        )
     return {
-        "items": entities,
+        "items": [_entity_list_item(row) for row in rows],
         "total": total,
         "limit": limit,
         "offset": offset,
     }
 
 
-__all__ = ["get_memory_unit", "list_entities", "list_memory_units"]
+def _entity_list_item(row: Any) -> dict[str, Any]:
+    """Render one entity-list row; the plain and the tag-filtered query select the same columns."""
+    # Handle metadata - may be dict, JSON string, or None
+    metadata = row["metadata"]
+    if metadata is None:
+        metadata = {}
+    elif isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except json.JSONDecodeError:
+            metadata = {}
+    return {
+        "id": str(row["id"]),
+        "canonical_name": row["canonical_name"],
+        # How the entity was classified (label vs free-form, etc.); same row,
+        # so listing it costs nothing extra.
+        "entity_kind": row["entity_kind"],
+        "mention_count": row["mention_count"],
+        "first_seen": row["first_seen"].isoformat() if row["first_seen"] else None,
+        "last_seen": row["last_seen"].isoformat() if row["last_seen"] else None,
+        "metadata": metadata,
+    }
+
+
+def visible_entity_mentions_sql(fq_table, ops, tag_clause_sql: str) -> str:
+    """``SELECT unit_id, entity_id, seen_at`` — one row per entity a tag-matching memory mentions.
+
+    The one rowset every tag-filtered entity read aggregates (list, detail, graph), so they
+    agree on what "mentioned by a visible memory" means. Direct mentions come from
+    ``unit_entities``; an observation with no direct rows inherits its source memories'
+    entities (``source_memory_ids`` on PG, the ``observation_sources`` junction on
+    Oracle), the same rule :func:`_entity_rows_for_units_sql` applies when a memory is
+    rendered. Without it, an entity only observations mention would vanish under a filter.
+
+    ``seen_at`` is the per-memory date retain stamps on the entity — ``occurred_start``,
+    falling back to ``mentioned_at`` (``event_date`` as a last resort, it is never null).
+
+    ``$1`` must be the bank id. ``tag_clause_sql`` is a :func:`build_tag_filter_clause`
+    clause built WITHOUT a table alias: the Oracle rewriter turns ``tags && :n`` into
+    a ``JSON_TABLE`` probe by matching a bare column name, so ``mu.tags`` would come
+    out as ``mu.EXISTS(...)``. That is why the filter runs on an unaliased subquery.
+    """
+    ue = fq_table("unit_entities")
+    sources = "" if ops.uses_observation_sources_table else ", source_memory_ids"
+    visible = f"""(
+            SELECT id, fact_type, COALESCE(occurred_start, mentioned_at, event_date) AS seen_at{sources}
+            FROM {fq_table("memory_units")}
+            WHERE bank_id = $1 {tag_clause_sql}
+        )"""
+    if ops.uses_observation_sources_table:
+        inherited_from = (
+            f"JOIN {fq_table('observation_sources')} os ON os.observation_id = vu.id "
+            f"JOIN {ue} src_ue ON src_ue.unit_id = os.source_id"
+        )
+    else:
+        inherited_from = (
+            f"CROSS JOIN LATERAL unnest(vu.source_memory_ids) AS src_id JOIN {ue} src_ue ON src_ue.unit_id = src_id"
+        )
+    return f"""
+        SELECT ue.unit_id, ue.entity_id, vu.seen_at
+        FROM {ue} ue
+        JOIN {visible} vu ON vu.id = ue.unit_id
+        UNION
+        SELECT vu.id AS unit_id, src_ue.entity_id, vu.seen_at
+        FROM {visible} vu
+        {inherited_from}
+        WHERE vu.fact_type = 'observation'
+          AND NOT EXISTS (SELECT 1 FROM {ue} d WHERE d.unit_id = vu.id)
+    """
+
+
+def visible_entity_stats_sql(fq_table, ops, tag_clause_sql: str) -> str:
+    """``SELECT entity_id, mention_count, first_seen, last_seen`` over the memories a tag filter lets through.
+
+    The stored ``entities.mention_count`` / ``first_seen`` / ``last_seen`` count every
+    memory in the bank, so a tag-filtered read that returned them would tell the
+    reader how much out-of-scope memories mention an entity (#5031). These are
+    recomputed from :func:`visible_entity_mentions_sql` instead. An entity with no
+    visible mention has no row, which is what hides it.
+    """
+    return f"""
+        SELECT vm.entity_id,
+               COUNT(*) AS mention_count,
+               MIN(vm.seen_at) AS first_seen,
+               MAX(vm.seen_at) AS last_seen
+        FROM ({visible_entity_mentions_sql(fq_table, ops, tag_clause_sql)}) vm
+        GROUP BY vm.entity_id
+    """
+
+
+async def _list_entities_tag_filtered(
+    *,
+    conn,
+    fq_table,
+    bank_id: str,
+    search: str | None,
+    tags: list[str] | None,
+    tags_match: TagsMatch,
+    tag_groups: list | None,
+    limit: int,
+    offset: int,
+) -> dict[str, Any]:
+    """:func:`list_entities` restricted to entities a tag-matching memory mentions.
+
+    Counts, dates and the ordering all come from the matching memories, never from
+    the stored totals. This is a GROUP BY over the bank's postings rather than a
+    read of the materialised counters, so it costs more — the unfiltered list keeps
+    the fast path.
+    """
+    built = build_tag_filter_clause(tags, tags_match, tag_groups, param_offset=2)
+    params: list[Any] = [bank_id, *built.params]
+    search_clause = ""
+    if search:
+        params.append(f"%{search}%")
+        search_clause = f"AND canonical_name ILIKE ${len(params)}"
+    # The stats are aggregated first and joined after, rather than grouping the
+    # entities row directly: Oracle cannot GROUP BY the `metadata` JSON column.
+    from_sql = f"""
+        FROM {fq_table("entities")} e
+        JOIN ({visible_entity_stats_sql(fq_table, _ops_for(conn), built.sql)}) s ON s.entity_id = e.id
+        WHERE e.bank_id = $1 {search_clause}
+    """
+
+    total_row = await conn.fetchrow(f"SELECT COUNT(*) AS total {from_sql}", *params)
+    total = total_row["total"] if total_row else 0
+
+    rows = await conn.fetch(
+        f"""
+        SELECT e.id, e.canonical_name, e.entity_kind, s.mention_count, s.first_seen, s.last_seen, e.metadata
+        {from_sql}
+        ORDER BY s.mention_count DESC, s.last_seen DESC, e.id ASC
+        LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}
+        """,
+        *params,
+        limit,
+        offset,
+    )
+    return {
+        "items": [_entity_list_item(row) for row in rows],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+__all__ = [
+    "get_memory_unit",
+    "list_entities",
+    "list_memory_units",
+    "visible_entity_mentions_sql",
+    "visible_entity_stats_sql",
+]

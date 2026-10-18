@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { useTranslations } from "next-intl";
+import { resolveDateRangePreset } from "@/lib/date-range-preset";
 import { useBank } from "@/lib/bank-context";
 import { client, LLMRequestEntry, LLMRequestStatsBucket } from "@/lib/api";
 import { Button } from "@/components/ui/button";
@@ -25,17 +26,7 @@ import {
 } from "@/components/ui/select";
 import { RefreshCw, ChevronLeft, ChevronRight } from "lucide-react";
 import { Spinner } from "@/components/ui/spinner";
-import {
-  LineChart,
-  Line,
-  AreaChart,
-  Area,
-  XAxis,
-  YAxis,
-  Tooltip,
-  Legend,
-  ResponsiveContainer,
-} from "recharts";
+import { LineChart, Line, XAxis, YAxis, Tooltip, Legend, ResponsiveContainer } from "recharts";
 
 type TranslateFn = (key: string) => string;
 
@@ -77,6 +68,15 @@ function formatTokens(n: number): string {
   if (n < 1000) return `${n}`;
   if (n < 1_000_000) return `${(n / 1000).toFixed(1).replace(/\.0$/, "")}k`;
   return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, "")}M`;
+}
+
+// The API keeps total_tokens as input + visible output for compatibility.
+// Add reported reasoning tokens when displaying a complete token total.
+export function totalTokens(entry: LLMRequestEntry): number | null {
+  if (entry.total_tokens == null) {
+    return entry.thoughts_tokens && entry.thoughts_tokens > 0 ? entry.thoughts_tokens : null;
+  }
+  return entry.total_tokens + (entry.thoughts_tokens ?? 0);
 }
 
 // Pull a list of memory_unit ids out of trace metadata (memory_ids /
@@ -179,7 +179,7 @@ interface GroupAgg {
 // Aggregate a run: summed tokens, error-if-any, earliest start, and wall-clock
 // duration (first call start → last call end) — the operation span.
 function aggregateGroup(rows: LLMRequestEntry[]): GroupAgg {
-  const tokens = rows.reduce((sum, r) => sum + (r.total_tokens ?? 0), 0);
+  const tokens = rows.reduce((sum, r) => sum + (totalTokens(r) ?? 0), 0);
   const starts = rows
     .map((r) => (r.started_at ? new Date(r.started_at).getTime() : NaN))
     .filter((n) => !isNaN(n));
@@ -218,6 +218,7 @@ function SpanRow({
   const left = Math.min(98, Math.max(0, ((start - traceStart) / traceSpan) * 100));
   const width = Math.max(2, Math.min(100 - left, ((end - start) / traceSpan) * 100));
   const isError = span.status === "error";
+  const spanTokens = totalTokens(span);
   return (
     <button
       type="button"
@@ -237,7 +238,7 @@ function SpanRow({
         </span>
         <span className="text-[10px] text-muted-foreground font-mono shrink-0">
           {formatDurationMs(span.duration_ms)}
-          {span.total_tokens != null ? ` · ${formatTokens(span.total_tokens)}` : ""}
+          {spanTokens != null ? ` · ${formatTokens(spanTokens)}` : ""}
         </span>
       </div>
       <div className="relative h-1.5 mt-1 rounded bg-muted/40">
@@ -283,7 +284,8 @@ function SpanDetails({ entry, t }: { entry: LLMRequestEntry; t: TranslateFn }) {
 
       {(entry.total_tokens !== null ||
         entry.input_tokens !== null ||
-        entry.output_tokens !== null) && (
+        entry.output_tokens !== null ||
+        entry.thoughts_tokens != null) && (
         <div className="flex flex-wrap gap-x-6 gap-y-1 text-sm border-t border-border pt-3">
           <div>
             <span className="text-muted-foreground">{t("tokensInput")}:</span>{" "}
@@ -294,12 +296,16 @@ function SpanDetails({ entry, t }: { entry: LLMRequestEntry; t: TranslateFn }) {
             <span className="font-mono">{entry.output_tokens ?? "—"}</span>
           </div>
           <div>
+            <span className="text-muted-foreground">{t("tokensThoughts")}:</span>{" "}
+            <span className="font-mono">{entry.thoughts_tokens ?? "—"}</span>
+          </div>
+          <div>
             <span className="text-muted-foreground">{t("tokensCached")}:</span>{" "}
             <span className="font-mono">{entry.cached_tokens ?? "—"}</span>
           </div>
           <div>
             <span className="text-muted-foreground">{t("tokensTotal")}:</span>{" "}
-            <span className="font-mono font-medium">{entry.total_tokens ?? "—"}</span>
+            <span className="font-mono font-medium">{totalTokens(entry) ?? "—"}</span>
           </div>
         </div>
       )}
@@ -416,6 +422,7 @@ export function TraceDialog({
   const traceSpan = Math.max(1, traceEnd - traceStart);
   const inputTokens = spans.reduce((sum, r) => sum + (r.input_tokens ?? 0), 0);
   const outputTokens = spans.reduce((sum, r) => sum + (r.output_tokens ?? 0), 0);
+  const thoughtsTokens = spans.reduce((sum, r) => sum + (r.thoughts_tokens ?? 0), 0);
   const anyError = spans.some((s) => s.status === "error");
   const op = entry?.operation ?? spans[0]?.operation ?? "—";
   // memory_ids / source_memory_ids are attached identically to every row of a
@@ -445,6 +452,13 @@ export function TraceDialog({
               {" · "}
               {t("tokensOutput")}{" "}
               <span className="font-mono text-foreground">{formatTokens(outputTokens)}</span>
+              {spans.some((s) => s.thoughts_tokens != null) && (
+                <>
+                  {" · "}
+                  {t("tokensThoughts")}{" "}
+                  <span className="font-mono text-foreground">{formatTokens(thoughtsTokens)}</span>
+                </>
+              )}
             </span>
             <span>
               {t("detailDuration")}{" "}
@@ -537,19 +551,21 @@ function LLMRequestChart({ bankId }: { bankId: string }) {
   }, [bankId]);
 
   // Build per-bucket points, applying a running sum when cumulative is on.
-  const running = { calls: 0, input: 0, output: 0, cached: 0, total: 0 };
+  const running = { calls: 0, input: 0, output: 0, thoughts: 0, cached: 0, total: 0 };
   const chartData = buckets.map((b) => {
     const point = {
       calls: b.total,
       input: b.tokens?.input ?? 0,
       output: b.tokens?.output ?? 0,
+      thoughts: b.tokens?.thoughts ?? 0,
       cached: b.tokens?.cached ?? 0,
-      total: b.tokens?.total ?? 0,
+      total: (b.tokens?.total ?? 0) + (b.tokens?.thoughts ?? 0),
     };
     if (cumulative) {
       running.calls += point.calls;
       running.input += point.input;
       running.output += point.output;
+      running.thoughts += point.thoughts;
       running.cached += point.cached;
       running.total += point.total;
     }
@@ -567,8 +583,12 @@ function LLMRequestChart({ bankId }: { bankId: string }) {
 
   const renderChart = () => {
     if (metric === "tokens" && tokenMode === "breakdown") {
+      // Unstacked lines, not the stacked areas this used to draw: cached is a
+      // subset of input, so the stack height was never a meaningful total, and
+      // adding reasoning to it would have compounded the double-count. The
+      // single-series "total" chart below is where a real total belongs.
       return (
-        <AreaChart data={chartData} margin={{ top: 5, right: 5, bottom: 0, left: 5 }}>
+        <LineChart data={chartData} margin={{ top: 5, right: 5, bottom: 0, left: 5 }}>
           <XAxis dataKey="time" tick={{ fontSize: 10 }} axisLine={false} tickLine={false} />
           <YAxis
             tick={{ fontSize: 10 }}
@@ -580,34 +600,39 @@ function LLMRequestChart({ bankId }: { bankId: string }) {
           />
           <Tooltip contentStyle={tooltipStyle} />
           <Legend wrapperStyle={{ fontSize: "10px" }} />
-          <Area
+          <Line
             type="monotone"
             dataKey="input"
             name={t("tokensInput")}
-            stackId="t"
             stroke="var(--chart-1, #3b82f6)"
-            fill="var(--chart-1, #3b82f6)"
-            fillOpacity={0.5}
+            strokeWidth={2}
+            dot={false}
           />
-          <Area
+          <Line
             type="monotone"
             dataKey="output"
             name={t("tokensOutput")}
-            stackId="t"
             stroke="var(--chart-2, #22c55e)"
-            fill="var(--chart-2, #22c55e)"
-            fillOpacity={0.5}
+            strokeWidth={2}
+            dot={false}
           />
-          <Area
+          <Line
+            type="monotone"
+            dataKey="thoughts"
+            name={t("tokensThoughts")}
+            stroke="var(--chart-4, #a855f7)"
+            strokeWidth={2}
+            dot={false}
+          />
+          <Line
             type="monotone"
             dataKey="cached"
             name={t("tokensCached")}
-            stackId="t"
             stroke="var(--chart-3, #f59e0b)"
-            fill="var(--chart-3, #f59e0b)"
-            fillOpacity={0.5}
+            strokeWidth={2}
+            dot={false}
           />
-        </AreaChart>
+        </LineChart>
       );
     }
     const dataKey = metric === "calls" ? "calls" : "total";
@@ -774,17 +799,6 @@ export function LLMRequestsView() {
   const [selected, setSelected] = useState<LLMRequestEntry | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
 
-  const getDateRange = useCallback((range: string): { start_date?: string; end_date?: string } => {
-    if (range === "all") return {};
-    const now = new Date();
-    const start = new Date();
-    if (range === "1h") start.setHours(now.getHours() - 1);
-    else if (range === "1d") start.setDate(now.getDate() - 1);
-    else if (range === "7d") start.setDate(now.getDate() - 7);
-    else if (range === "30d") start.setDate(now.getDate() - 30);
-    return { start_date: start.toISOString() };
-  }, []);
-
   const loadRequests = useCallback(
     async (
       newStatusFilter: string | null = statusFilter,
@@ -797,7 +811,7 @@ export function LLMRequestsView() {
 
       setLoading(true);
       try {
-        const dates = getDateRange(newDateRange);
+        const dates = resolveDateRangePreset(newDateRange);
         const data = await client.listLLMRequests(currentBank, {
           status: newStatusFilter || undefined,
           operation: newOperationFilter || undefined,
@@ -815,7 +829,7 @@ export function LLMRequestsView() {
         setLoading(false);
       }
     },
-    [currentBank, statusFilter, operationFilter, dateRange, offset, grouped, limit, getDateRange]
+    [currentBank, statusFilter, operationFilter, dateRange, offset, grouped, limit]
   );
 
   const handleGroupToggle = () => {
@@ -870,7 +884,7 @@ export function LLMRequestsView() {
         <StatusBadge status={entry.status} />
       </TableCell>
       <TableCell className="text-sm text-muted-foreground font-mono text-right">
-        {entry.total_tokens != null ? entry.total_tokens.toLocaleString() : "—"}
+        {totalTokens(entry)?.toLocaleString() ?? "—"}
       </TableCell>
       <TableCell className="text-sm text-muted-foreground font-mono">
         {formatDurationMs(entry.duration_ms)}

@@ -113,7 +113,7 @@ async def test_failures_rescued_by_bisection_are_still_counted(memory: MemoryEng
     """The reported symptom: N calls fail schema validation, bisection rescues every
     fact, ``failed_consolidation`` reads 0 — and the run now says so anyway."""
     bank_id = f"test-4151-{uuid.uuid4().hex[:8]}"
-    await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+    await memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
     collector = _RecordingCollector()
     original_llm = memory._consolidation_llm_config
     try:
@@ -174,7 +174,7 @@ async def test_failures_rescued_by_bisection_are_still_counted(memory: MemoryEng
 async def test_a_clean_run_reports_no_batch_failures(memory: MemoryEngine, request_context):
     """The counter must stay 0 on a healthy run, or it is noise rather than signal."""
     bank_id = f"test-4151-clean-{uuid.uuid4().hex[:8]}"
-    await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+    await memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
     collector = _RecordingCollector()
     original_llm = memory._consolidation_llm_config
     try:
@@ -218,7 +218,7 @@ async def test_retried_attempts_each_count(memory: MemoryEngine, request_context
     than batch calls — a call retried three times cost three generations.
     """
     bank_id = f"test-4151-retry-{uuid.uuid4().hex[:8]}"
-    await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+    await memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
     collector = _RecordingCollector()
     original_llm = memory._consolidation_llm_config
     try:
@@ -261,7 +261,7 @@ async def test_facts_bisection_cannot_rescue_are_counted_in_both_places(memory: 
     gauge and the new counter report it — they measure different things, not the
     same thing twice."""
     bank_id = f"test-4151-stuck-{uuid.uuid4().hex[:8]}"
-    await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+    await memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
     collector = _RecordingCollector()
     original_llm = memory._consolidation_llm_config
     try:
@@ -292,6 +292,46 @@ async def test_facts_bisection_cannot_rescue_are_counted_in_both_places(memory: 
         # One call for the pair plus one per bisected half.
         assert result["llm_batch_failures"] == 3
         assert len(collector.batch_failures) == 3
+    finally:
+        memory._consolidation_llm_config = original_llm
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
+async def test_action_citing_no_batch_fact_is_counted_not_silent(memory: MemoryEngine, request_context):
+    """#5273: a create whose source_fact_ids are all miscopied (truncated UUID, an
+    observation id) cannot be applied, but it must be reported, not folded into
+    ``no_durable_knowledge`` like a fact the model chose to skip."""
+    bank_id = f"test-5273-{uuid.uuid4().hex[:8]}"
+    await memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
+    original_llm = memory._consolidation_llm_config
+    try:
+        async with memory._pool.acquire() as conn:
+            for text in ("Erin likes tea", "Erin bikes daily"):
+                await _insert_memory(conn, bank_id, text, ["user:erin"])
+
+        def callback(messages, scope):
+            if scope != "consolidation":
+                return _ConsolidationBatchResponse()
+            prompt = "\n".join(m.get("content", "") for m in messages if m.get("role") == "user")
+            fact_ids = re.findall(r"\[([0-9a-f-]{36})\]", prompt)
+            return _ConsolidationBatchResponse(
+                creates=[
+                    _CreateAction(text="Erin likes tea", source_fact_ids=[fact_ids[0]]),
+                    _CreateAction(text="Erin bikes", source_fact_ids=[fact_ids[1][:8] + "-…", str(uuid.uuid4())]),
+                ]
+            )
+
+        _install_llm(memory, callback)
+        with (
+            _override_config(memory, consolidation_llm_batch_size=2, consolidation_llm_parallelism=1),
+            patch.object(memory, "submit_async_consolidation"),
+        ):
+            result = await run_consolidation_job(memory_engine=memory, bank_id=bank_id, request_context=request_context)
+
+        assert result["observations_created"] == 1
+        assert result["unresolved_actions"] == 1
     finally:
         memory._consolidation_llm_config = original_llm
         await memory.delete_bank(bank_id, request_context=request_context)

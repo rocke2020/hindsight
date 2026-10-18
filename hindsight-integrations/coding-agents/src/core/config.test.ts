@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { loadConfig, applyBankConfig, readEnvConfig, resolveConfig } from "./config";
+import { log } from "./log";
 
 let root: string;
 let globalCfg: string;
@@ -70,8 +71,8 @@ describe("loadConfig layering", () => {
     expect(loadConfig(globalCfg).bankId).toBe("legacy");
   });
 
-  it("pageRefreshEveryTurns defaults to 10", () => {
-    expect(loadConfig({ harness: "claude-code" }).pageRefreshEveryTurns).toBe(10);
+  it("pageRefreshEveryTurns defaults to 1 — the guide is re-stated every turn", () => {
+    expect(loadConfig({ harness: "claude-code" }).pageRefreshEveryTurns).toBe(1);
   });
 
   it("pageRefreshEveryTurns override wins over the default", () => {
@@ -109,6 +110,42 @@ describe("maxParallelRetains", () => {
   });
 });
 
+describe("injectTimeoutMs (#4843)", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("defaults to 7s independently of the reflect timeouts", () => {
+    expect(resolveConfig({}).injectTimeoutMs).toBe(7000);
+    expect(
+      resolveConfig({ reflectTimeoutMs: 15000, reflectToolTimeoutMs: 90000 }).injectTimeoutMs
+    ).toBe(7000);
+  });
+
+  it.each([2000, 15000])("honours an explicit %ims budget", (ms) => {
+    expect(resolveConfig({ injectTimeoutMs: ms }).injectTimeoutMs).toBe(ms);
+  });
+
+  it.each([2000, 15000])("reads the numeric %ims environment fallback", (ms) => {
+    vi.stubEnv("HINDSIGHT_INJECT_TIMEOUT_MS", String(ms));
+    expect(readEnvConfig().injectTimeoutMs).toBe(ms);
+    expect(loadConfig({ path: join(root, "missing.json") }).injectTimeoutMs).toBe(ms);
+  });
+
+  it("applies file, harness and bank overrides over the environment fallback", () => {
+    vi.stubEnv("HINDSIGHT_INJECT_TIMEOUT_MS", "15000");
+    writeJson(globalCfg, {
+      injectTimeoutMs: 5000,
+      harnesses: { dsh: { injectTimeoutMs: 2000 } },
+      banks: { slow: { injectTimeoutMs: 12000 } },
+    });
+    expect(loadConfig({ path: globalCfg }).injectTimeoutMs).toBe(5000);
+    const cfg = loadConfig({ path: globalCfg, harness: "dsh" });
+    expect(cfg.injectTimeoutMs).toBe(2000);
+    expect(applyBankConfig(cfg, "slow").cfg.injectTimeoutMs).toBe(12000);
+  });
+});
+
 /**
  * #3590: the hindsight_reflect tool aborted at a hardcoded 120s. The tool's window is now its own
  * knob, defaulting ABOVE the server's 300s reflect wall timeout — and it inherits an explicitly
@@ -118,7 +155,7 @@ describe("reflectToolTimeoutMs / reflectBudget", () => {
   it("defaults above the server's reflect wall timeout, leaving the hook window untouched", () => {
     const cfg = resolveConfig({});
     expect(cfg.reflectToolTimeoutMs).toBe(330000);
-    expect(cfg.reflectTimeoutMs).toBe(120000);
+    expect(cfg.reflectTimeoutMs).toBe(20000);
     expect(cfg.reflectBudget).toBe("high");
   });
 
@@ -183,6 +220,76 @@ describe("manageBankConfig (#3927)", () => {
     });
     expect(applyBankConfig(cfg, "my-global-bank").cfg.manageBankConfig).toBe(false);
     expect(applyBankConfig(cfg, "coding-agent::repo").cfg.manageBankConfig).toBe(true);
+  });
+});
+
+describe("retainExtractionMode (#4560)", () => {
+  it("defaults to concise and rejects an unknown mode", () => {
+    expect(resolveConfig({}).retainExtractionMode).toBe("concise");
+    expect(resolveConfig({ retainExtractionMode: "custom" as never }).retainExtractionMode).toBe(
+      "concise"
+    );
+    expect(resolveConfig({ retainExtractionMode: "verbose" }).retainExtractionMode).toBe("verbose");
+  });
+
+  it("is settable per bank and from the environment", () => {
+    const cfg = resolveConfig({
+      banks: { "coding-agent::big": { retainExtractionMode: "chunks" } },
+    });
+    expect(applyBankConfig(cfg, "coding-agent::big").cfg.retainExtractionMode).toBe("chunks");
+    expect(
+      readEnvConfig({ HINDSIGHT_RETAIN_EXTRACTION_MODE: "verbose" }).retainExtractionMode
+    ).toBe("verbose");
+  });
+});
+
+describe("defaultBankConfig (#4725)", () => {
+  it("is empty by default and passed through as the bank-config API's own field names", () => {
+    expect(resolveConfig({}).defaultBankConfig).toEqual({});
+    const cheap = {
+      enable_observations: false,
+      enable_auto_consolidation: false,
+      mental_model_min_refresh_interval_seconds: 21600,
+    };
+    expect(resolveConfig({ defaultBankConfig: cheap }).defaultBankConfig).toEqual(cheap);
+  });
+
+  it("rejects anything but a plain object", () => {
+    // An array would spread into numeric keys and reach the import as garbage.
+    expect(resolveConfig({ defaultBankConfig: ["x"] as never }).defaultBankConfig).toEqual({});
+    expect(resolveConfig({ defaultBankConfig: "x" as never }).defaultBankConfig).toEqual({});
+    expect(resolveConfig({ defaultBankConfig: null as never }).defaultBankConfig).toEqual({});
+  });
+
+  it("drops the fields the plugin governs itself, with a warning", () => {
+    const warn = vi.spyOn(log, "warn").mockImplementation(() => {});
+    const cfg = resolveConfig({
+      defaultBankConfig: {
+        retain_strategies: { mine: {} },
+        entity_labels: [],
+        retain_extraction_mode: "verbose",
+        enable_auto_consolidation: false,
+      },
+    });
+    expect(cfg.defaultBankConfig).toEqual({ enable_auto_consolidation: false });
+    const warnings = warn.mock.calls.map(([, msg]) => msg);
+    expect(warnings).toHaveLength(3);
+    expect(warnings.some((w) => w.includes("defaultBankConfig.retain_strategies"))).toBe(true);
+    expect(warnings.some((w) => w.includes("set retainExtractionMode instead"))).toBe(true);
+    warn.mockRestore();
+  });
+
+  it("is settable per bank, replacing the global map rather than merging into it", () => {
+    const cfg = resolveConfig({
+      defaultBankConfig: { enable_auto_consolidation: false },
+      banks: { "coding-agent::hot": { defaultBankConfig: { enable_observations: true } } },
+    });
+    expect(applyBankConfig(cfg, "coding-agent::hot").cfg.defaultBankConfig).toEqual({
+      enable_observations: true,
+    });
+    expect(applyBankConfig(cfg, "coding-agent::other").cfg.defaultBankConfig).toEqual({
+      enable_auto_consolidation: false,
+    });
   });
 });
 
@@ -278,6 +385,124 @@ describe("environment fallback", () => {
     expect(cfg.apiToken).toBe("tok-from-file");
   });
 
+  it("autoInject: explicit mode wins, legacy autoReflect=false maps to none, junk falls back", () => {
+    expect(resolveConfig({}).autoInject).toBe("reflect");
+    expect(resolveConfig({ autoInject: "pages" }).autoInject).toBe("pages");
+    expect(resolveConfig({ autoInject: "recall", autoReflect: false }).autoInject).toBe("recall");
+    expect(resolveConfig({ autoReflect: false }).autoInject).toBe("none");
+    expect(resolveConfig({ autoInject: "bogus" as never }).autoInject).toBe("reflect");
+    const base = resolveConfig({ autoInject: "pages", banks: { b: { autoReflect: false } } });
+    expect(applyBankConfig(base, "b").cfg.autoInject).toBe("none");
+    expect(applyBankConfig(base, "other").cfg.autoInject).toBe("pages");
+  });
+
+  it("recallOptions: empty by default, passed through verbatim, non-objects rejected", () => {
+    // Empty at this layer — the DEFAULTS live on the client, so config states only overrides.
+    expect(resolveConfig({}).recallOptions).toEqual({});
+    expect(resolveConfig({ recallOptions: { types: null, max_tokens: 9 } }).recallOptions).toEqual({
+      types: null,
+      max_tokens: 9,
+    });
+    // An array would spread into numeric keys and reach the API as garbage.
+    expect(resolveConfig({ recallOptions: ["types"] as never }).recallOptions).toEqual({});
+    expect(resolveConfig({ recallOptions: "types" as never }).recallOptions).toEqual({});
+    // File-only, like retainMetadata: an object does not flatten into an env var.
+    expect(resolveConfig({ recallOptions: { a: 1 } }).recallOptions).not.toBe(
+      resolveConfig({ recallOptions: { a: 1 } }).recallOptions
+    );
+  });
+
+  it("pages: valid entries kept, unknown names and unusable values dropped with a warning", () => {
+    const warn = vi.spyOn(log, "warn").mockImplementation(() => {});
+    expect(resolveConfig({}).pages).toEqual({});
+    expect(
+      resolveConfig({
+        pages: { "Component map": false, "Key decisions and rationale": { source_query: "why?" } },
+      }).pages
+    ).toEqual({
+      "Component map": false,
+      "Key decisions and rationale": { source_query: "why?" },
+    });
+    expect(warn).not.toHaveBeenCalled();
+
+    // A name matching no seeded page reads as having disabled or reworded something and would
+    // otherwise do nothing at all — the reason this is validated rather than passed through.
+    expect(resolveConfig({ pages: { "Componnet map": false } }).pages).toEqual({});
+    // Values that would travel and become a page whose description is `5`, or blank.
+    expect(
+      resolveConfig({ pages: { "Core concepts": { source_query: 5 } } as never }).pages
+    ).toEqual({});
+    expect(resolveConfig({ pages: { "Core concepts": { source_query: "  " } } }).pages).toEqual({});
+    expect(resolveConfig({ pages: ["Core concepts"] as never }).pages).toEqual({});
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it("customPages: source_query required, tags optional, seeded-page names refused", () => {
+    const warn = vi.spyOn(log, "warn").mockImplementation(() => {});
+    expect(resolveConfig({}).customPages).toEqual({});
+    expect(
+      resolveConfig({
+        customPages: {
+          "Security posture": { source_query: "what did we decide about auth?", tags: ["x"] },
+          Roadmap: { source_query: "where is this going?" },
+        },
+      }).customPages
+    ).toEqual({
+      "Security posture": { source_query: "what did we decide about auth?", tags: ["x"] },
+      Roadmap: { source_query: "where is this going?" },
+    });
+    expect(warn).not.toHaveBeenCalled();
+
+    // `pages` rewords a page the plugin owns, `customPages` creates one — choosing for the user
+    // would be a guess, so a seeded name here is refused rather than merged.
+    expect(
+      resolveConfig({ customPages: { "Core concepts": { source_query: "x" } } }).customPages
+    ).toEqual({});
+    expect(resolveConfig({ customPages: { Roadmap: { source_query: "  " } } }).customPages).toEqual(
+      {}
+    );
+    expect(resolveConfig({ customPages: { Roadmap: {} } as never }).customPages).toEqual({});
+    // A stray non-string tag would reach the API as a tag and fail page creation.
+    expect(
+      resolveConfig({ customPages: { Roadmap: { source_query: "q", tags: ["ok", 5] } } as never })
+        .customPages
+    ).toEqual({ Roadmap: { source_query: "q", tags: ["ok"] } });
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it("pages: a banks.<id> section replaces the global map rather than merging into it", () => {
+    const base = resolveConfig({
+      pages: { "Component map": false },
+      banks: { b: { pages: { "Core concepts": false } } },
+    });
+    expect(applyBankConfig(base, "b").cfg.pages).toEqual({ "Core concepts": false });
+    expect(applyBankConfig(base, "other").cfg.pages).toEqual({ "Component map": false });
+  });
+
+  it("pageSearchLimit: default, override and env fallback", () => {
+    expect(resolveConfig({}).pageSearchLimit).toBe(10);
+    expect(resolveConfig({ pageSearchLimit: 8 }).pageSearchLimit).toBe(8);
+    writeJson(globalCfg, {});
+    process.env.HINDSIGHT_PAGE_SEARCH_LIMIT = "6";
+    expect(loadConfig({ path: globalCfg }).pageSearchLimit).toBe(6);
+  });
+
+  it("autoReflect is deprecated: still honoured, but warns only when set", () => {
+    // log.warn writes to the plugin log file, not the console — spy on it directly.
+    const warn = vi.spyOn(log, "warn").mockImplementation(() => {});
+    expect(resolveConfig({ autoInject: "pages" }).autoInject).toBe("pages");
+    expect(warn).not.toHaveBeenCalled();
+    expect(resolveConfig({ autoReflect: true }).autoInject).toBe("reflect");
+    expect(resolveConfig({ autoReflect: false }).autoInject).toBe("none");
+    expect(warn).toHaveBeenLastCalledWith(
+      "config",
+      'autoReflect is deprecated — use autoInject: "none" instead'
+    );
+    warn.mockRestore();
+  });
+
   it("parses booleans and numbers rather than passing strings through", () => {
     writeJson(globalCfg, {});
     process.env.HINDSIGHT_AUTO_REFLECT = "false";
@@ -285,7 +510,7 @@ describe("environment fallback", () => {
     process.env.HINDSIGHT_DISABLED = "1";
     process.env.HINDSIGHT_SEED_LIMIT = "5";
     const cfg = loadConfig({ path: globalCfg });
-    expect(cfg.autoReflect).toBe(false);
+    expect(cfg.autoInject).toBe("none");
     expect(cfg.manageBankConfig).toBe(false);
     expect(cfg.disabled).toBe(true);
     expect(cfg.seedLimit).toBe(5);
@@ -296,7 +521,7 @@ describe("environment fallback", () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
     process.env.HINDSIGHT_REFLECT_TIMEOUT_MS = "soon";
     // NaN here would silently break the reflect timeout in a way that is very hard to trace.
-    expect(loadConfig({ path: globalCfg }).reflectTimeoutMs).toBe(120000);
+    expect(loadConfig({ path: globalCfg }).reflectTimeoutMs).toBe(20000);
   });
 
   it("an empty env var does not mask the file or the default", () => {

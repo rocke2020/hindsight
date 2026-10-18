@@ -14,15 +14,24 @@ import logging
 import re
 import time
 from contextlib import AbstractAsyncContextManager, nullcontext
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
-from hindsight_api.engine.llm_interface import LLM_TOOL_CHOICE_AUTO, LLMInterface, LLMToolChoice
+from hindsight_api.engine.cache_affinity import apply_opencode_session
+from hindsight_api.engine.llm_interface import (
+    LLM_TOOL_CHOICE_AUTO,
+    LLMInterface,
+    LLMToolChoice,
+    LLMToolChoiceMode,
+    ProviderContentPolicyError,
+)
 from hindsight_api.engine.llm_trace import LLMResponseUsage, stash_response_usage
-from hindsight_api.engine.llm_transport import build_sdk_timeout, describe_transport_error
+from hindsight_api.engine.llm_transport import build_sdk_timeout, describe_llm_error
 from hindsight_api.engine.providers.llm_debug import dump_request_on_4xx
+from hindsight_api.engine.remote_retry import jittered_backoff
 from hindsight_api.engine.response_models import LLMToolCall, LLMToolCallResult, TokenUsage
 from hindsight_api.engine.structured_output import provider_json_schema
 from hindsight_api.metrics import get_metrics_collector
+from hindsight_api.provider_auth import requires_api_key
 from hindsight_api.worker.stage import set_stage
 
 from ..response_models import LLMCallResult
@@ -30,19 +39,51 @@ from ..response_models import LLMCallResult
 logger = logging.getLogger(__name__)
 
 
+_REFUSAL_STOP_REASONS = ("refusal", "content_filter")
+
+
+def _raise_on_refusal(response: Any) -> None:
+    """Fail fast when Anthropic refused the request (HTTP 200, empty body).
+
+    Without this the empty body is parsed as invalid JSON and retried, paying
+    for the same refusal again and again (#5201).
+    """
+    stop_reason = getattr(response, "stop_reason", None)
+    if stop_reason in _REFUSAL_STOP_REASONS:
+        raise ProviderContentPolicyError(f"Anthropic refused the request (stop_reason={stop_reason}); not retrying")
+
+
 def _usage_from_anthropic_response(response: Any) -> LLMResponseUsage:
-    """Extract input/output/cached token counts from an Anthropic usage block."""
+    """Extract input/output/cached token counts from an Anthropic usage block.
+
+    Anthropic counts cache reads and writes apart from ``input_tokens``; the
+    ``TokenUsage`` contract counts them in it, with reads also in ``cached_tokens``.
+    """
     usage = getattr(response, "usage", None)
     if not usage:
         return LLMResponseUsage()
+    cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
+    cache_write = getattr(usage, "cache_creation_input_tokens", 0) or 0
     return LLMResponseUsage(
-        input_tokens=usage.input_tokens or 0,
+        input_tokens=(usage.input_tokens or 0) + cache_read + cache_write,
         output_tokens=usage.output_tokens or 0,
-        cached_tokens=getattr(usage, "cache_read_input_tokens", 0) or 0,
+        cached_tokens=cache_read,
     )
 
 
 _EPHEMERAL_CACHE = {"type": "ephemeral"}
+
+# The Messages API *requires* ``max_tokens``, so there is no "uncapped" transport
+# option here the way there is on OpenAI/Gemini: when a caller passes no cap we
+# still have to send a number. 4096 (the old value) silently truncated long
+# completions whose caller deliberately left the cap open -- reflect's tool-call
+# loop cut off mid-``done`` payload and lost the answer field (#4437), the same
+# class of bug as #2668 on the consolidation path.
+# ponytail: one flat number instead of a per-model table. Every current Claude
+# model caps at 64K output or more; a model with a lower ceiling gets an explicit
+# 400 from the API (not a silent truncation) and the operator can set the
+# scope's max_completion_tokens config.
+_DEFAULT_MAX_TOKENS = 64000
 
 
 def _cached_system_blocks(system_prompt: str) -> list[dict[str, Any]]:
@@ -187,7 +228,7 @@ class AnthropicLLM(LLMInterface):
         super().__init__(provider, api_key, base_url, model, reasoning_effort, timeout=timeout, **kwargs)
         self._warn_reasoning_effort_unsupported()
 
-        if not self.api_key:
+        if not self.api_key and requires_api_key(provider):
             raise ValueError("API key is required for Anthropic provider")
 
         # User-configured extra body params (merged into every Messages API call)
@@ -195,16 +236,22 @@ class AnthropicLLM(LLMInterface):
 
         # Import and initialize Anthropic client
         try:
-            from anthropic import AsyncAnthropic
+            from anthropic import AsyncAnthropic, Timeout
 
             # SDK retries disabled — wrapper-level retry loop in ``call`` handles
             # backoff (mirrors ``OpenAICompatibleLLM`` so the two providers behave
             # consistently).
-            client_kwargs: dict[str, Any] = {"api_key": self.api_key, "max_retries": 0}
+            client_kwargs: dict[str, Any] = {"max_retries": 0}
+            # No key: the SDK resolves credentials itself (Workload Identity Federation).
+            # An explicit api_key would outrank that, so only pass one when set.
+            if self.api_key:
+                client_kwargs["api_key"] = self.api_key
             if self.base_url:
                 client_kwargs["base_url"] = self.base_url
-            # Per-phase so the connect leg is capped independently (issue #3881).
-            client_kwargs["timeout"] = build_sdk_timeout(self.timeout or _DEFAULT_ANTHROPIC_TIMEOUT)
+            # Per-phase so the connect leg is capped independently (issue #3881). Built
+            # with the SDK's own Timeout: anthropic 1.x runs on httpx2 and rejects an
+            # httpx.Timeout, or on 1.0.x fails every request with it (issue #4683).
+            client_kwargs["timeout"] = build_sdk_timeout(self.timeout or _DEFAULT_ANTHROPIC_TIMEOUT, Timeout)
             if default_headers:
                 client_kwargs["default_headers"] = default_headers
 
@@ -221,7 +268,7 @@ class AnthropicLLM(LLMInterface):
             RuntimeError: If the connection test fails.
         """
         try:
-            test_messages = [{"role": "user", "content": "test"}]
+            test_messages = [{"role": "user", "content": "Say 'ok'"}]
             await self.call(
                 messages=test_messages,
                 max_completion_tokens=10,
@@ -272,7 +319,7 @@ class AnthropicLLM(LLMInterface):
         """
         from anthropic import APIConnectionError, APIStatusError, RateLimitError
 
-        start_time = time.time()
+        start_time = time.perf_counter()
 
         # Convert OpenAI-style messages to Anthropic format
         system_prompt = None
@@ -310,7 +357,7 @@ class AnthropicLLM(LLMInterface):
         call_params: dict[str, Any] = {
             "model": self.model,
             "messages": anthropic_messages,
-            "max_tokens": max_completion_tokens if max_completion_tokens is not None else 4096,
+            "max_tokens": max_completion_tokens if max_completion_tokens is not None else _DEFAULT_MAX_TOKENS,
         }
 
         if system_prompt:
@@ -329,16 +376,27 @@ class AnthropicLLM(LLMInterface):
         if self._extra_body:
             call_params["extra_body"] = self._extra_body
 
+        # opencode-go's /v1/messages requires x-opencode-session (#4071), reached
+        # via provider=anthropic + an opencode.ai base URL; the host check decides.
+        apply_opencode_session(call_params, base_url=self.base_url)
+
         last_exception = None
 
         for attempt in range(max_retries + 1):
             try:
                 async with attempt_context() if attempt_context is not None else nullcontext():
                     set_stage(f"llm.{self.provider}.{scope}.attempt={attempt + 1}/{max_retries + 1}")
-                    response = await self._client.messages.create(**call_params)
+                    # Wall-clock cap: the SDK's timeout is per phase and its read timeout restarts
+                    # on every byte, so an upstream trickling keep-alive whitespace never trips it
+                    # and the call pins its worker slot forever (#4763).
+                    response = await asyncio.wait_for(
+                        self._request_client().messages.create(**call_params),
+                        timeout=self.timeout or _DEFAULT_ANTHROPIC_TIMEOUT,
+                    )
                 # Stash usage before parse/validate, which may raise locally
                 # even though the provider charged for these tokens (#2387).
                 stash_response_usage(_usage_from_anthropic_response(response))
+                _raise_on_refusal(response)
 
                 if use_forced_tool:
                     # Forced tool_use → the validated args are already a dict; no parsing,
@@ -385,7 +443,7 @@ class AnthropicLLM(LLMInterface):
                         result = content
 
                 # Record metrics and log slow calls
-                duration = time.time() - start_time
+                duration = time.perf_counter() - start_time
                 response_usage = _usage_from_anthropic_response(response)
                 input_tokens = response_usage.input_tokens
                 output_tokens = response_usage.output_tokens
@@ -402,6 +460,7 @@ class AnthropicLLM(LLMInterface):
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     success=True,
+                    cached_input_tokens=cached_tokens,
                 )
 
                 # Record trace span
@@ -450,7 +509,7 @@ class AnthropicLLM(LLMInterface):
                     logger.error(f"Anthropic returned invalid JSON after {max_retries + 1} attempts")
                     raise
 
-            except (APIConnectionError, RateLimitError, APIStatusError) as e:
+            except (APIConnectionError, RateLimitError, APIStatusError, TimeoutError) as e:
                 # Fast fail on 401/403
                 if isinstance(e, APIStatusError) and e.status_code in (401, 403):
                     logger.error(f"Anthropic auth error (HTTP {e.status_code}), not retrying: {str(e)}")
@@ -462,18 +521,19 @@ class AnthropicLLM(LLMInterface):
                 last_exception = e
                 if attempt < max_retries:
                     # Check if it's a rate limit or server error
-                    should_retry = isinstance(e, (APIConnectionError, RateLimitError)) or (
+                    should_retry = isinstance(e, (APIConnectionError, RateLimitError, TimeoutError)) or (
                         isinstance(e, APIStatusError) and e.status_code >= 500
                     )
 
                     if should_retry:
-                        backoff = min(initial_backoff * (2**attempt), max_backoff)
-                        jitter = backoff * 0.2 * (2 * (time.time() % 1) - 1)
-                        await asyncio.sleep(backoff + jitter)
+                        await asyncio.sleep(jittered_backoff(attempt, initial_backoff, max_backoff))
                         continue
 
-                detail = f" [{describe_transport_error(e)}]" if isinstance(e, APIConnectionError) else ""
-                logger.error(f"Anthropic API error after {max_retries + 1} attempts: {str(e)}{detail}")
+                logger.error(f"Anthropic API error after {max_retries + 1} attempts: {describe_llm_error(e)}")
+                raise
+
+            except ProviderContentPolicyError:
+                # An expected, permanent outcome — not an "unexpected error" worth an error log.
                 raise
 
             except Exception as e:
@@ -516,7 +576,7 @@ class AnthropicLLM(LLMInterface):
         """
         from anthropic import APIConnectionError, APIStatusError
 
-        start_time = time.time()
+        start_time = time.perf_counter()
 
         # Convert OpenAI tool format to Anthropic format
         anthropic_tools = []
@@ -587,21 +647,46 @@ class AnthropicLLM(LLMInterface):
             "model": self.model,
             "messages": anthropic_messages,
             "tools": anthropic_tools,
-            "max_tokens": max_completion_tokens or 4096,
+            "max_tokens": max_completion_tokens or _DEFAULT_MAX_TOKENS,
         }
+        # Map the canonical modes onto Anthropic's own tool_choice. A named choice
+        # rides the wire natively, so the complete tool list stays on the request
+        # instead of being narrowed to the forced tool.
+        if tool_choice.mode is LLMToolChoiceMode.NAMED:
+            forced_name = tool_choice.selected_function_name
+            matching = [tool for tool in anthropic_tools if tool.get("name") == forced_name]
+            if len(matching) != 1:
+                raise ValueError(
+                    f"Named tool_choice must reference exactly one declared tool; "
+                    f"found {len(matching)} definitions for {forced_name!r}"
+                )
+            call_params["tool_choice"] = {"type": "tool", "name": forced_name}
+        elif tool_choice.mode is LLMToolChoiceMode.REQUIRED:
+            call_params["tool_choice"] = {"type": "any"}
+        elif tool_choice.mode is LLMToolChoiceMode.NONE:
+            call_params["tool_choice"] = {"type": "none"}
         if system_prompt:
             call_params["system"] = _cached_system_blocks(system_prompt)
 
         if self._extra_body:
             call_params["extra_body"] = self._extra_body
 
+        apply_opencode_session(call_params, base_url=self.base_url)
+
         last_exception = None
         for attempt in range(max_retries + 1):
             try:
                 async with attempt_context() if attempt_context is not None else nullcontext():
                     set_stage(f"llm.{self.provider}.{scope}.attempt={attempt + 1}/{max_retries + 1}")
-                    response = await self._client.messages.create(**call_params)
+                    # Wall-clock cap: the SDK's timeout is per phase and its read timeout restarts
+                    # on every byte, so an upstream trickling keep-alive whitespace never trips it
+                    # and the call pins its worker slot forever (#4763).
+                    response = await asyncio.wait_for(
+                        self._request_client().messages.create(**call_params),
+                        timeout=self.timeout or _DEFAULT_ANTHROPIC_TIMEOUT,
+                    )
                 stash_response_usage(_usage_from_anthropic_response(response))
+                _raise_on_refusal(response)
 
                 # Extract content and tool calls
                 content_parts = []
@@ -617,12 +702,14 @@ class AnthropicLLM(LLMInterface):
                 finish_reason = "tool_calls" if tool_calls else "stop"
 
                 # Extract token usage
-                input_tokens = response.usage.input_tokens or 0
-                output_tokens = response.usage.output_tokens or 0
+                response_usage = _usage_from_anthropic_response(response)
+                input_tokens = response_usage.input_tokens
+                output_tokens = response_usage.output_tokens
+                cached_tokens = response_usage.cached_tokens
 
                 # Record metrics
                 metrics = get_metrics_collector()
-                duration = time.time() - start_time
+                duration = time.perf_counter() - start_time
                 metrics.record_llm_call(
                     provider=self.provider,
                     model=self.model,
@@ -631,6 +718,7 @@ class AnthropicLLM(LLMInterface):
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     success=True,
+                    cached_input_tokens=cached_tokens,
                 )
 
                 # Record OpenTelemetry span
@@ -655,6 +743,7 @@ class AnthropicLLM(LLMInterface):
                     finish_reason=finish_reason,
                     error=None,
                     tool_calls=tool_calls_dict,
+                    cached_tokens=cached_tokens,
                 )
 
                 return LLMToolCallResult(
@@ -663,18 +752,19 @@ class AnthropicLLM(LLMInterface):
                     finish_reason=finish_reason,
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
+                    cached_tokens=cached_tokens,
                 )
 
-            except (APIConnectionError, APIStatusError) as e:
+            except (APIConnectionError, APIStatusError, TimeoutError) as e:
                 if isinstance(e, APIStatusError) and e.status_code in (401, 403):
                     raise
                 # Diagnostic dump (opt-in) of the exact request behind any 4xx.
                 dump_request_on_4xx(scope=scope, provider=self.provider, model=self.model, err=e, request=call_params)
                 last_exception = e
-                if isinstance(e, APIConnectionError):
+                if isinstance(e, (APIConnectionError, TimeoutError)):
                     logger.warning(
-                        f"APIConnectionError in tool call ({self.provider}/{self.model}, scope={scope}, "
-                        f"attempt {attempt + 1}/{max_retries + 1}): {str(e)[:200]} [{describe_transport_error(e)}]"
+                        f"Connection error in tool call ({self.provider}/{self.model}, scope={scope}, "
+                        f"attempt {attempt + 1}/{max_retries + 1}): {describe_llm_error(e)}"
                     )
                 if attempt < max_retries:
                     await asyncio.sleep(min(initial_backoff * (2**attempt), max_backoff))
@@ -714,7 +804,7 @@ class AnthropicLLM(LLMInterface):
 
         Mirrors the conversion rules of ``call()``: system messages fold into
         the ``system`` param; ``max_completion_tokens`` becomes ``max_tokens``
-        (default 4096); ``temperature`` is dropped (the sync path never sends
+        (default ``_DEFAULT_MAX_TOKENS``); ``temperature`` is dropped (the sync path never sends
         it either — current Claude models reject non-default sampling params);
         an OpenAI ``response_format`` json_schema becomes a single forced
         tool_use tool when strict (native constrained decoding, issue #1002),
@@ -739,7 +829,7 @@ class AnthropicLLM(LLMInterface):
         params: dict[str, Any] = {
             "model": body.get("model") or self.model,
             "messages": messages,
-            "max_tokens": body.get("max_completion_tokens") or 4096,
+            "max_tokens": body.get("max_completion_tokens") or _DEFAULT_MAX_TOKENS,
         }
 
         json_schema = (body.get("response_format") or {}).get("json_schema") or {}
@@ -789,9 +879,10 @@ class AnthropicLLM(LLMInterface):
         if tool_input is not None:
             content = json.dumps(tool_input, ensure_ascii=False)
 
-        usage = getattr(message, "usage", None)
-        input_tokens = (usage.input_tokens or 0) if usage else 0
-        output_tokens = (usage.output_tokens or 0) if usage else 0
+        usage = _usage_from_anthropic_response(message)
+        input_tokens = usage.input_tokens
+        output_tokens = usage.output_tokens
+        cached_tokens = usage.cached_tokens
 
         return {
             "choices": [
@@ -804,6 +895,7 @@ class AnthropicLLM(LLMInterface):
                 "prompt_tokens": input_tokens,
                 "completion_tokens": output_tokens,
                 "total_tokens": input_tokens + output_tokens,
+                "prompt_tokens_details": {"cached_tokens": cached_tokens},
             },
         }
 
@@ -828,7 +920,9 @@ class AnthropicLLM(LLMInterface):
         ]
 
         logger.info(f"Submitting Anthropic message batch with {len(batch_requests)} requests")
-        batch = await self._client.messages.batches.create(requests=batch_requests)
+        # The SDK types each request as a TypedDict; these are built as plain dicts with the
+        # same keys just above.
+        batch = await self._client.messages.batches.create(requests=cast("list", batch_requests))
         logger.info(f"Anthropic batch submitted: {batch.id}, status={batch.processing_status}")
 
         return {
@@ -904,6 +998,16 @@ class AnthropicLLM(LLMInterface):
         """Clean up resources (close Anthropic client connections)."""
         if hasattr(self, "_client") and self._client:
             await self._client.close()
+
+    def supports_request_overrides(self) -> bool:
+        return True
+
+    def _request_client(self) -> Any:
+        """The SDK client for one call, with the credentials an LLM request extension chose."""
+        # Lazy: importing the extensions package here would be circular.
+        from hindsight_api.extensions.llm_request import request_client
+
+        return request_client(self._client)
 
     def supports_attempt_scoped_concurrency(self) -> bool:
         return True

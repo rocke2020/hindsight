@@ -3,7 +3,7 @@ SentenceTransformer / CrossEncoder models.
 
 Two concerns live here, both about keeping a local API instance's memory flat:
 
-**1. Device selection — MPS is opt-in.**
+**1. Device selection — MPS is never used.**
 On Apple Silicon the PyTorch **MPS** (Metal) backend caches a distinct compiled
 kernel graph *and* allocator pool per unique input tensor shape, and never
 releases them. Under the variable-length, high-volume recall/rerank/embed traffic
@@ -13,10 +13,18 @@ of Metal graphics memory plus ~8 GB of native heap, essentially all of it stale
 per-shape MPS cache. CPU inference has no per-shape cache: the same workload holds
 flat at a few hundred MB, with negligible latency cost for the small default
 models (and MPS actually *slows down* over time as it recompiles graphs for new
-shapes). So MPS is excluded from auto-detection and must be opted into explicitly;
-CUDA and Intel XPU still auto-select.
+shapes). MPS is also not thread-safe for concurrent encodes: overlapping
+``CrossEncoder.predict()`` calls hit the same Metal command buffer and Metal
+validation aborts the whole process (issue #4412,
+``A command encoder is already encoding to this command buffer``).
 
-This is a confirmed, still-open PyTorch bug in the MPSGraph compilation cache
+So MPS is never selected. It used to be reachable through
+``*_LOCAL_ALLOW_MPS`` opt-in flags; those were removed because every
+known outcome of enabling them was worse than CPU. The supported Metal path on
+Apple Silicon is the MLX reranker (``jina_mlx_reranker.py``). CUDA and Intel XPU
+still auto-select.
+
+The leak is a confirmed, still-open PyTorch bug in the MPSGraph compilation cache
 (keyed on tensor shape, no eviction path). We are tracking it upstream:
   - https://github.com/pytorch/pytorch/issues/181213
     ([MPS] unbounded RSS growth with varying-shape inference — our exact case)
@@ -27,7 +35,8 @@ This is a confirmed, still-open PyTorch bug in the MPSGraph compilation cache
     env var that would let us keep MPS)
 No released mitigation exists today: empty_cache(), synchronize(),
 PYTORCH_MPS_HIGH_WATERMARK_RATIO, and autorelease pools were all confirmed
-ineffective upstream. Revisit MPS-as-default once one of those knobs lands.
+ineffective upstream. Revisit MPS once one of those knobs lands *and* the
+concurrency abort has an answer.
 
 **3. Weight alignment — safetensors tensors can land unaligned.**
 ``transformers`` loads safetensors zero-copy: each parameter is a view onto the
@@ -66,24 +75,82 @@ import ctypes
 import ctypes.util
 import gc
 import logging
+import os
 import sys
+import threading
 
 logger = logging.getLogger(__name__)
 
+#: Held while building and smoke-testing any local torch model. Building a
+#: transformers model flips process-global state for the whole load:
+#: ``PreTrainedModel.tie_weights`` is swapped for a no-op (huggingface/transformers
+#: PR #44940 would make that per-thread; still open as of 5.19) and torch's default
+#: dtype is changed. When the startup loads overlap in threads, a model with tied
+#: weights (Qwen3-Reranker) is left with ``lm_head.weight`` on the meta device
+#: ("Cannot copy out of meta tensor"), or the other model's smoke test mixes
+#: float/bfloat16 — about half of cold starts with two Qwen3 models (issue #4420).
+#: Downloads do not touch that state, so ``prefetch_local_model`` runs them outside.
+LOCAL_MODEL_BUILD_LOCK = threading.Lock()
 
-def select_local_device(force_cpu: bool, allow_mps: bool) -> str | None:
+# Weight formats the loaders do not read when the repo also ships safetensors (``*.bin``
+# is the legacy duplicate many repos keep). Anything skipped that a loader does need —
+# a bin-only checkpoint — is fetched by the loader itself, inside the lock: slower,
+# still correct.
+_PREFETCH_IGNORE = ["onnx/*", "openvino/*", "*.onnx", "*.bin", "*.h5", "*.msgpack", "*.ot", "*.gguf", "*.tflite"]
+
+
+def prefetch_local_model(model_name: str, cache_dir: str | None = None) -> None:
+    """Download a HuggingFace model into the cache so that only the build, not the
+    download, runs under ``LOCAL_MODEL_BUILD_LOCK``.
+
+    ``cache_dir`` must be the folder the loader reads from (``None`` is the HF hub
+    cache), or the loader downloads the model a second time.
+    """
+    if os.path.isdir(model_name):
+        return
+    # Sync on purpose: huggingface_hub has no async download, and this runs where the
+    # loader would download anyway — inside a blocking initialize() on a startup thread.
+    try:
+        from huggingface_hub import snapshot_download
+
+        snapshot_download(model_name, cache_dir=cache_dir, ignore_patterns=_PREFETCH_IGNORE)
+    except Exception as e:
+        # Offline, gated, unknown id, …: the loader raises the real error itself.
+        logger.debug("Prefetch of %s skipped: %s", model_name, e)
+
+
+#: Removed opt-in flags. Still read only to tell anyone who set them that they no
+#: longer do anything, so the switch back to CPU is not silent.
+_REMOVED_ALLOW_MPS_ENV = (
+    "HINDSIGHT_API_EMBEDDINGS_LOCAL_ALLOW_MPS",
+    "HINDSIGHT_API_RERANKER_LOCAL_ALLOW_MPS",
+)
+
+
+def _warn_if_allow_mps_set() -> None:
+    set_vars = [name for name in _REMOVED_ALLOW_MPS_ENV if os.getenv(name)]
+    if set_vars:
+        logger.warning(
+            "%s is set but no longer has any effect: MPS was removed because it leaks "
+            "memory under variable-length workloads and aborts the process under "
+            "concurrent inference. Running on CPU. For GPU on Apple Silicon use the MLX "
+            "reranker (HINDSIGHT_API_RERANKER_PROVIDER=jina-mlx).",
+            ", ".join(set_vars),
+        )
+
+
+def select_local_device(force_cpu: bool) -> str | None:
     """Choose the device for a local SentenceTransformer / CrossEncoder.
 
     Returns a value suitable to pass as the model's ``device`` argument:
 
-    - ``"cpu"``  — forced CPU, or the only accelerator is MPS and it is not allowed.
+    - ``"cpu"``  — forced CPU, or the only accelerator is MPS.
     - ``None``   — let sentence-transformers auto-detect (picks CUDA / XPU,
                    handling multi-GPU correctly).
-    - ``"mps"``  — Apple Silicon GPU, only when ``allow_mps`` is set.
 
-    MPS is never auto-selected because its per-shape cache leaks unbounded memory
-    under the engine's variable-length workload (see the module docstring). Set the
-    matching ``*_ALLOW_MPS`` config flag to opt back in.
+    MPS is never selected: its per-shape cache leaks unbounded memory under the
+    engine's variable-length workload, and concurrent encodes abort the process
+    (see the module docstring).
     """
     if force_cpu:
         return "cpu"
@@ -96,16 +163,13 @@ def select_local_device(force_cpu: bool, allow_mps: bool) -> str | None:
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             return None  # auto-detect Intel XPU
 
-        mps_available = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
-        if mps_available:
-            if allow_mps:
-                return "mps"
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             logger.info(
-                "Local model: MPS (Apple Silicon GPU) is available but disabled by "
-                "default because its per-shape cache leaks memory under variable-length "
-                "workloads; running on CPU. Set the *_ALLOW_MPS flag to opt in."
+                "Local model: MPS (Apple Silicon GPU) is available but unsupported "
+                "(leaks memory under variable-length workloads, aborts under concurrent "
+                "inference); running on CPU."
             )
-            return "cpu"
+            _warn_if_allow_mps_set()
         return "cpu"
     except Exception as e:  # pragma: no cover - defensive
         logger.warning("Local device detection failed, falling back to CPU: %s", e)
@@ -172,6 +236,19 @@ def _empty_gpu_cache(device_type: str | None) -> None:
     """Empty the allocator pool of the GPU backend the model ran on, if any."""
     if not device_type or device_type == "cpu":
         return
+    if device_type == "mlx":
+        # MLX keeps freed Metal buffers in its own cache and only returns them to
+        # the OS once the cache limit is exceeded. That limit defaults to the device
+        # memory limit — 121.60 GB measured on a 128 GB M-series host — so without
+        # this the cache is effectively unbounded. torch has no "mlx" attribute, so
+        # the lookup below would silently free nothing.
+        try:
+            import mlx.core as mx  # ty: ignore[unresolved-import]
+
+            mx.clear_cache()
+        except Exception:  # pragma: no cover - defensive
+            pass
+        return
     try:
         import torch
 
@@ -189,10 +266,14 @@ def release_local_inference_memory(device_type: str | None = None) -> None:
     the model ran on a GPU. Python's normal reference counting already releases
     the short-lived CPU inference buffers; a full cyclic-GC scan on every batch is
     needlessly expensive on that hot path, so CPU callers leave cyclic GC to its
-    normal threshold-based schedule. GPU callers retain the existing full cleanup
+    normal threshold-based schedule. MLX callers skip it for the same reason: MLX
+    arrays are refcounted too. Torch GPU callers retain the existing full cleanup
     because allocator release is part of the opt-in accelerator memory policy.
     """
-    if device_type != "cpu":
+    # "mlx" is exempt for the same reason "cpu" is: MLX arrays are refcounted C++
+    # objects behind Python wrappers, so reference counting already releases them and
+    # a process-wide cycle scan on every batch does not release anything extra.
+    if device_type not in ("cpu", "mlx"):
         gc.collect()
     _heap_trim()
     _empty_gpu_cache(device_type)

@@ -6,6 +6,12 @@ partial indexes are built in the bank-create transaction and dropped when the
 bank is deleted — the behaviour that predates the threshold, and still the right
 one for a deployment whose bank count is not the problem.
 
+One bank is outside all of it at every threshold: one whose memories a custom
+store owns has no ``memory_units`` rows, so it is owed no index here and
+:func:`plan_bank_vector_indexes` returns it an empty plan (#4615). Empty in both
+directions — this module will not build such a bank an index, and will not take
+away one it already has.
+
 A deployment holding thousands of banks sets a positive threshold, because these
 indexes live on the shared ``memory_units`` table: PostgreSQL locks and plans
 against every index on a relation, and opens every one for each DML statement, so
@@ -43,7 +49,7 @@ from .._vector_index import (
     per_bank_indexes_are_eager,
 )
 from .db_utils import retry_with_backoff
-from .retain.bank_utils import _BANK_INDEX_FACT_TYPES, _bank_index_name
+from .retain.bank_utils import _BANK_INDEX_FACT_TYPES, _bank_index_name, bank_indexes_are_store_owned
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +115,10 @@ class BankIndexPlan:
     to_build: list[str] = field(default_factory=list)
     # Index names present in the catalog that this bank should no longer carry.
     to_drop: list[str] = field(default_factory=list)
-    # Indexes already present and healthy — reported, never touched.
+    # Indexes already present and healthy — reported, never touched. NOT filled for a
+    # bank whose memories a custom store owns: that plan is returned before the catalog
+    # is read at all, so such a bank reports 0 whether or not it still carries indexes
+    # (pg_indexes is where an operator reads that — see the admin-CLI docs).
     already_present: int = 0
 
     @property
@@ -136,15 +145,18 @@ def _quote_identifier(value: str) -> str:
     return '"' + value.replace('"', '""') + '"'
 
 
-async def _index_health(conn: Any, schema: str, index_names: list[str]) -> dict[str, bool]:
+async def _index_health(conn: Any, schema: str, index_names: list[str], bank_id: str) -> dict[str, bool]:
     """Return valid-and-usable state for each requested index in one query.
 
     Health requires the index to be valid AND ready, defined over the expected
     ``memory_units`` table, to use a supported access method, and to carry our
-    partial predicate. A name-only match is *not* enough: an INVALID leftover
-    (from an interrupted concurrent build) or an index whose access method
-    drifted after a backend switch must count as unhealthy so it is rebuilt —
-    ``pg_indexes``/``IF NOT EXISTS`` alone would silently treat those as present.
+    partial predicate for *this* bank. A name-only match is *not* enough: an
+    INVALID leftover (from an interrupted concurrent build) or an index whose
+    access method drifted after a backend switch must count as unhealthy so it is
+    rebuilt — ``pg_indexes``/``IF NOT EXISTS`` alone would silently treat those as
+    present. So must a renamed bank's index: it is named after the unchanged
+    internal_id, but its predicate still names the old bank_id, so it covers no
+    row of the bank and recall on it silently loses the index.
     """
     if not index_names:
         return {}
@@ -155,6 +167,7 @@ async def _index_health(conn: Any, schema: str, index_names: list[str]) -> dict[
                 AND t.relname = 'memory_units'
                 AND am.amname = ANY($3::text[])
                 AND pg_get_indexdef(i.indexrelid) LIKE $4
+                AND strpos(pg_get_indexdef(i.indexrelid), '(bank_id = ' || quote_literal($5::text) || '::text)') > 0
                ) AS healthy
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -167,6 +180,7 @@ async def _index_health(conn: Any, schema: str, index_names: list[str]) -> dict[
         index_names,
         list(_SUPPORTED_INDEX_AM),
         "%" + _BANK_INDEX_PARTIAL_SUFFIX + "%",
+        bank_id,
     )
     return {row["index_name"]: bool(row["healthy"]) for row in rows}
 
@@ -194,27 +208,18 @@ async def _capped_row_counts(
     The cap is a query parameter rather than an outer-column reference on
     purpose: PostgreSQL rejects a LIMIT/OFFSET expression containing a variable
     from an outer query level, and the bounds are global anyway, not per-fact-type.
+
+    The count itself belongs to the memories store, which owns `memory_units`
+    (#4969); the Postgres store runs the capped scan described here — and it is asked directly,
+    because the only caller has already established the bank is SQL-backed
+    (``bank_indexes_are_store_owned`` returned False above), and the count is of Postgres's own
+    rows — so it is a Postgres-only method, not part of the store interface.
     """
-    if not fact_types:
-        return {}
-    qschema = _quote_identifier(schema)
-    rows = await conn.fetch(
-        f"""
-        SELECT t.fact_type,
-               (
-                   SELECT count(*) FROM (
-                       SELECT 1 FROM {qschema}.memory_units
-                       WHERE bank_id = $1 AND fact_type = t.fact_type
-                       LIMIT $2
-                   ) capped
-               ) AS row_count
-        FROM unnest($3::text[]) AS t(fact_type)
-        """,  # noqa: S608 — schema is a quoted identifier
-        bank_id,
-        cap,
-        fact_types,
+    from .memories import sql_memories
+
+    return await sql_memories().capped_memory_counts(
+        conn=conn, schema=schema, bank_id=bank_id, fact_types=fact_types, cap=cap
     )
-    return {row["fact_type"]: int(row["row_count"]) for row in rows}
 
 
 async def plan_bank_vector_indexes(
@@ -233,20 +238,40 @@ async def plan_bank_vector_indexes(
     without counting.
 
     With the threshold off, entitlement does not depend on rows at all: every
-    partition is owed an index from the moment the bank exists, so this reports
-    whatever bank creation did not manage to leave healthy and never drops
-    anything. The write path does not reach here in that mode (it short-circuits
-    before querying), but ``repair-bank`` does, and it is the path that repairs a
-    bank whose creation lost its DDL to a deadlock, or that was restored around
-    it.
+    partition of a SQL-owned bank is owed an index from the moment the bank
+    exists, so this reports whatever bank creation did not manage to leave
+    healthy and never drops anything. The write path does not reach here in that
+    mode (it short-circuits before querying), but ``repair-bank`` does, and it is
+    the path that repairs a bank whose creation lost its DDL to a deadlock, or
+    that was restored around it.
+
+    A store-owned bank is excluded from that entitlement, and the check comes
+    before both branches because it does not depend on the threshold. Its plan is
+    empty in BOTH directions. Nothing built: creation no longer builds it anything
+    (#4615), so without this it would read here exactly like a bank whose DDL was
+    lost, and one ``repair-bank --all`` would rebuild every index the fix stopped
+    creating. Nothing dropped: adopting a memories store makes every existing bank
+    store-owned at once, and shedding tens of thousands of indexes stays an
+    operator's decision with its own timing.
 
     A bank whose row is gone yields an empty plan: its indexes are dropped by
     ``delete_bank`` while the internal_id they are named after is still known,
     and a bank-scoped reconcile has no way to name them afterwards.
     """
     plan = BankIndexPlan(bank_id=bank_id)
-    qschema = _quote_identifier(schema)
 
+    # Empty plan for a store-owned bank — see this function's docstring for both
+    # halves. First, before either round trip: with a threshold set this runs on every
+    # write, and neither the bank lookup nor the catalog read can change the answer.
+    # Not wrapped, deliberately: bank_indexes_are_store_owned raises rather than guess,
+    # and its docstring says why the two callers need opposite fallbacks.
+    # ponytail: the probe takes bank_id with no schema, so a router with per-schema
+    # backends would get one answer for the same id in two tenant schemas. Pass the
+    # schema through MemoriesExtension.store_owned_for if such a router appears.
+    if bank_indexes_are_store_owned(bank_id):
+        return plan
+
+    qschema = _quote_identifier(schema)
     internal_id = await conn.fetchval(
         f"SELECT internal_id FROM {qschema}.banks WHERE bank_id = $1",  # noqa: S608 — schema is a quoted identifier
         bank_id,
@@ -255,7 +280,7 @@ async def plan_bank_vector_indexes(
         return plan
 
     names = {ft: _bank_index_name(ft, str(internal_id)) for ft in _BANK_INDEX_FACT_TYPES}
-    health = await _index_health(conn, schema, list(names.values()))
+    health = await _index_health(conn, schema, list(names.values()), bank_id)
 
     if per_bank_indexes_are_eager():
         for fact_type, index_name in names.items():

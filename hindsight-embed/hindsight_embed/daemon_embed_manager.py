@@ -10,11 +10,13 @@ import math
 import os
 import platform
 import re
+import signal
 import subprocess
 import sys
 import sysconfig
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from importlib.util import find_spec
 from pathlib import Path
 from typing import IO, Optional
@@ -68,6 +70,7 @@ def _parse_non_negative_int(value: str | None, default: int, name: str) -> int:
 # unpacks and runs initdb on first boot, which takes noticeably longer on cold
 # runners than POSIX.
 DAEMON_STARTUP_TIMEOUT = int(os.getenv("HINDSIGHT_EMBED_DAEMON_STARTUP_TIMEOUT", "180"))
+DAEMON_STARTUP_TERMINATE_TIMEOUT = 10
 DEFAULT_DAEMON_IDLE_TIMEOUT = 0  # 0 = disabled (no auto-exit)
 ENV_DAEMON_LOG_MAX_BYTES = "HINDSIGHT_EMBED_DAEMON_LOG_MAX_BYTES"
 ENV_DAEMON_LOG_BACKUP_COUNT = "HINDSIGHT_EMBED_DAEMON_LOG_BACKUP_COUNT"
@@ -142,14 +145,59 @@ def _probe(url: str, read: float) -> ProbeResponse | None:
     return probe_get(url, read_timeout=read, connect_timeout=min(read, PROBE_CONNECT_TIMEOUT))
 
 
+# Interpreter-selection variables of the *parent* process. They are meaningful
+# only for the interpreter that set them; forwarding them to a child that runs a
+# different interpreter makes that child import the parent's packages.
+_PARENT_INTERPRETER_ENV = ("PYTHONPATH", "PYTHONHOME", "PYTHONSAFEPATH", "VIRTUAL_ENV")
+
+
+def _runs_a_foreign_interpreter(cmd: list[str]) -> bool:
+    """Whether *cmd* launches hindsight-api on an interpreter that is not ours.
+
+    True for every uv-launched form — the ``uvx hindsight-api@<version>`` fallback and the
+    monorepo ``uv run --project <api-slim> ... hindsight-api`` dev command — because uv resolves
+    an environment of its own, usually on a different Python than the caller. False for the
+    installed-binary paths, which are a single executable from an environment we already share.
+
+    Matched on the basename, not the literal string: the sibling candidate paths in
+    ``_find_api_command`` are returned resolved (``[str(candidate)]``), so a future change that
+    resolves the launcher the same way must not silently stop scrubbing the env.
+    """
+    return Path(cmd[0]).stem in {"uv", "uvx"}
+
+
+def _strip_parent_interpreter_env(env: dict[str, str]) -> dict[str, str]:
+    """Drop the parent interpreter's PYTHONPATH/PYTHONHOME/VIRTUAL_ENV from *env*.
+
+    Only for the uv-launched commands, which run in an environment uv
+    builds for them, usually on a different Python than the caller. Hosts that
+    locate their own site-packages through PYTHONPATH (Hermes' package-manager
+    install exports its Python 3.14 generation that way) otherwise hand that
+    directory to uvx's 3.12 interpreter, which then imports the host's pydantic
+    and dies on the missing compiled extension::
+
+        ModuleNotFoundError: No module named 'pydantic_core._pydantic_core'
+
+    The installed-binary paths keep the env untouched: a ``pip install --target``
+    layout (issue #1240) relies on PYTHONPATH to find hindsight_api at all, and a
+    binary from the caller's own venv runs the same interpreter, so nothing there
+    is foreign.
+    """
+    return {key: value for key, value in env.items() if key not in _PARENT_INTERPRETER_ENV}
+
+
 def _detach_popen_kwargs(log_handle: IO[bytes]) -> dict:
     """Cross-platform kwargs to spawn a subprocess detached from the caller.
 
     On POSIX, `start_new_session=True` calls setsid(2) so the child
-    survives the parent's terminal. On Windows there is no setsid: we use
-    `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`, which also means the
-    child has no console, so stdin/stdout/stderr MUST be redirected or any
-    write from the child crashes with "handle is invalid".
+    survives the parent's terminal; `stdin` is pinned to /dev/null so the
+    child never inherits a caller fd 0 that may be CLOEXEC (closed at exec,
+    leaving ``sys.stdin = None``). On Windows there is no setsid: we use
+    `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP` so console launchers such
+    as uvx and their descendants share a windowless console. Previously,
+    `DETACHED_PROCESS` left the launcher without a console, so its children
+    could allocate a visible one (#4562). Do not combine the two flags:
+    Windows ignores `CREATE_NO_WINDOW` when `DETACHED_PROCESS` is also set.
 
     `log_handle` receives the child's stdout/stderr on both platforms so
     output never leaks into the parent's terminal (which would corrupt a
@@ -159,10 +207,10 @@ def _detach_popen_kwargs(log_handle: IO[bytes]) -> dict:
         # Windows-only constants; use getattr so type checkers (e.g. ty) running
         # on Linux don't flag the attribute access. They're guaranteed present
         # at runtime because of the platform.system() guard above.
-        detached_process = getattr(subprocess, "DETACHED_PROCESS", 0)
+        create_no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         create_new_process_group = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         return {
-            "creationflags": detached_process | create_new_process_group,
+            "creationflags": create_no_window | create_new_process_group,
             "stdin": subprocess.DEVNULL,
             "stdout": log_handle,
             "stderr": subprocess.STDOUT,
@@ -170,9 +218,56 @@ def _detach_popen_kwargs(log_handle: IO[bytes]) -> dict:
         }
     return {
         "start_new_session": True,
+        "stdin": subprocess.DEVNULL,
         "stdout": log_handle,
         "stderr": log_handle,
     }
+
+
+def _signal_startup_process(process: subprocess.Popen, *, force: bool) -> None:
+    """Signal the daemon child's whole process group on POSIX.
+
+    The child may be the ``uvx`` launcher rather than hindsight-api itself;
+    signalling only its pid can leave the real API running as an orphan.
+    ``_detach_popen_kwargs`` starts it with ``start_new_session``, so its pid is
+    also its process group id. On Windows there is no group to signal, and
+    ``terminate()`` is already an alias for ``kill()``.
+    """
+    if platform.system() == "Windows":
+        process.kill()
+    else:
+        os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
+
+
+def _terminate_startup_process(process: subprocess.Popen) -> None:
+    """Stop the daemon child owned by a failed startup attempt, escalating to kill."""
+    if process.poll() is not None:
+        return
+    try:
+        _signal_startup_process(process, force=False)
+        try:
+            process.wait(timeout=DAEMON_STARTUP_TERMINATE_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            _signal_startup_process(process, force=True)
+            process.wait(timeout=DAEMON_STARTUP_TERMINATE_TIMEOUT)
+    except ProcessLookupError:
+        return
+
+
+# Runs hindsight_api.main on a base interpreter after adding a venv's site-packages (argv[1])
+# the way the venv itself would, .pth files included. Arguments after it reach the module.
+_VENV_SITE_BOOTSTRAP = (
+    "import runpy, site, sys; site.addsitedir(sys.argv.pop(1)); "
+    "runpy.run_module('hindsight_api.main', run_name='__main__', alter_sys=True)"
+)
+
+
+@dataclass(frozen=True)
+class UvTrampoline:
+    """A uv venv's Scripts/pythonw.exe, resolved to what it actually launches."""
+
+    base_pythonw: str
+    venv_root: Path
 
 
 class DaemonEmbedManager(EmbedManager):
@@ -263,8 +358,44 @@ class DaemonEmbedManager(EmbedManager):
         return None
 
     @staticmethod
-    def _windows_gui_interpreter(preferred_dir: Path | None = None) -> str | None:
-        """Path to the GUI-subsystem Python (pythonw.exe), or None.
+    def _uv_trampoline_target(pythonw: Path) -> UvTrampoline | None:
+        """For a uv venv trampoline, resolve the base pythonw.exe it launches.
+
+        uv does not put a real interpreter in a venv's Scripts dir: the small
+        ``pythonw.exe`` there is a trampoline that CreateProcess's the base
+        interpreter recorded in ``pyvenv.cfg``. That relaunch lands on the CUI
+        ``python.exe``, which allocates a visible console because the
+        ``CREATE_NO_WINDOW`` flag applied to the trampoline, not to the process
+        the trampoline went on to spawn (issue #4466). Launching the base
+        pythonw.exe ourselves keeps the whole tree GUI-subsystem.
+
+        Returns None unless pyvenv.cfg carries uv's own ``uv =`` marker: a
+        stdlib venv's pythonw.exe is the GUI venvwlauncher, which already
+        redirects to the base *pythonw*, so bypassing it here would drop it out
+        of its venv for no gain.
+        """
+        for venv_root in (pythonw.parent.parent, pythonw.parent):
+            cfg = venv_root / "pyvenv.cfg"
+            try:
+                if not cfg.is_file():
+                    continue
+                text = cfg.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            entries = {
+                key.strip().lower(): value.strip()
+                for key, _, value in (line.partition("=") for line in text.splitlines())
+            }
+            if "uv" not in entries or "home" not in entries:
+                continue
+            base_pythonw = Path(entries["home"]) / "pythonw.exe"
+            if base_pythonw.is_file():
+                return UvTrampoline(base_pythonw=str(base_pythonw), venv_root=venv_root)
+        return None
+
+    @staticmethod
+    def _windows_gui_api_command(preferred_dir: Path | None = None) -> list[str] | None:
+        """Command that runs ``hindsight_api.main`` on the GUI-subsystem Python (pythonw.exe), or None.
 
         Returns None on non-Windows, or when pythonw.exe can't be located next
         to the preferred scripts directory or running interpreter.
@@ -277,15 +408,34 @@ class DaemonEmbedManager(EmbedManager):
         never allocates a console, so no window appears. Prefer the scripts dir
         that contains hindsight-api.exe because wrapper entry points can make
         sys.executable point at a different launcher directory (issue #2389).
+
+        When the pythonw we find is a uv trampoline, run the base interpreter
+        instead (#4466) and add the venv's site-packages with
+        ``site.addsitedir`` before running the module. This used to put
+        site-packages on PYTHONPATH, which makes it importable but never
+        processes its ``.pth`` files: ``pywin32.pth`` (DLL search path for
+        ``pywintypes``) and the files that wire up fastmcp were skipped, and the
+        daemon died on import (#4974, #5025). ``addsitedir`` handles both.
         """
         if platform.system() != "Windows":
             return None
+        candidates: list[Path] = []
         if preferred_dir is not None:
-            pythonw = preferred_dir / "pythonw.exe"
-            if pythonw.exists():
-                return str(pythonw)
-        pythonw = Path(sys.executable).with_name("pythonw.exe")
-        return str(pythonw) if pythonw.exists() else None
+            candidates.append(preferred_dir / "pythonw.exe")
+        candidates.append(Path(sys.executable).with_name("pythonw.exe"))
+        for pythonw in candidates:
+            if not pythonw.exists():
+                continue
+            target = DaemonEmbedManager._uv_trampoline_target(pythonw)
+            # Only bypass the trampoline when we can hand the base interpreter
+            # the venv's packages: without them it can't import hindsight_api,
+            # and a daemon that won't start is worse than a console flash.
+            if target is not None:
+                site_packages = target.venv_root / "Lib" / "site-packages"
+                if site_packages.is_dir():
+                    return [target.base_pythonw, "-c", _VENV_SITE_BOOTSTRAP, str(site_packages)]
+            return [str(pythonw), "-m", "hindsight_api.main"]
+        return None
 
     def _component_version(self, profile: str, env_key: str) -> str:
         """Resolve a component version: profile .env override > env var > embed version.
@@ -345,10 +495,7 @@ class DaemonEmbedManager(EmbedManager):
             # The console exe lives in sys.executable's scripts dir, so
             # hindsight_api is importable by the GUI interpreter; prefer it on
             # Windows to avoid ConPTY popping a terminal tab (issue #1885).
-            gui_python = self._windows_gui_interpreter(scripts_dir)
-            if gui_python is not None:
-                return [gui_python, "-m", "hindsight_api.main"]
-            return [str(candidate)]
+            return self._windows_gui_api_command(scripts_dir) or [str(candidate)]
 
         # --target installs place binaries alongside site-packages contents.
         # The running interpreter usually can't import hindsight_api here (it's
@@ -393,12 +540,28 @@ class DaemonEmbedManager(EmbedManager):
 
     @staticmethod
     def _run_probe(cmd: list[str], timeout: float = _PROBE_TIMEOUT_S) -> str | None:
-        """Run a short read-only probe command, returning stdout or None."""
+        """Run a short read-only probe command, returning stdout or None.
+
+        The decode is pinned rather than left to the locale. These probes run
+        Windows-native CLIs (`netstat`, `powershell`, `wmic`) that emit localized
+        text in the console code page, while `text=True` alone decodes with
+        `locale.getpreferredencoding(False)` - which is `utf-8` in a UTF-8-mode
+        process. The mismatch raises inside `subprocess`'s own reader thread, where
+        nothing here can catch it: the thread dies, `run()` returns normally with
+        `stdout=None` and returncode 0, and the caller reads "no listeners" from a
+        host that has plenty.
+
+        `errors="replace"` is the half that makes it deterministic; `encoding` alone
+        still raises. Only the localized header carries non-ASCII, so every line the
+        parsers read survives intact and neither needed changing.
+        """
         try:
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=timeout,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
@@ -771,8 +934,12 @@ class DaemonEmbedManager(EmbedManager):
         env["HINDSIGHT_API_DAEMON_LOG"] = str(daemon_log)
 
         # Build command
+        # No --daemon: _HINDSIGHT_DAEMON_CHILD above already puts hindsight-api
+        # in daemon mode, and this Popen already detaches it. Passing --daemon
+        # too was redundant, and API versions older than the Popen-based
+        # daemonize() (#1519) fork on it, which can deadlock native libraries
+        # on macOS.
         cmd = self._find_api_command(self._component_version(profile, "HINDSIGHT_EMBED_API_VERSION"), env=env) + [
-            "--daemon",
             "--idle-timeout",
             str(idle_timeout),
             "--port",
@@ -780,6 +947,8 @@ class DaemonEmbedManager(EmbedManager):
         ]
         if extra_args:
             cmd.extend(extra_args)
+        if _runs_a_foreign_interpreter(cmd):
+            env = _strip_parent_interpreter_env(env)
 
         try:
             # Start daemon. Redirect stdout/stderr to the daemon log so that
@@ -790,7 +959,7 @@ class DaemonEmbedManager(EmbedManager):
             # Popen dups the fd into the child during spawn, so the parent
             # can close its handle as soon as Popen returns.
             with open(daemon_log, "ab") as daemon_log_handle:
-                subprocess.Popen(cmd, env=env, **_detach_popen_kwargs(daemon_log_handle))
+                daemon_process = subprocess.Popen(cmd, env=env, **_detach_popen_kwargs(daemon_log_handle))
 
             # Wait for daemon to be ready with rich UI
             start_time = time.time()
@@ -807,6 +976,22 @@ class DaemonEmbedManager(EmbedManager):
                 live.refresh()
 
                 while time.time() - start_time < DAEMON_STARTUP_TIMEOUT:
+                    # Polling keeps going through a missed health probe (below),
+                    # so a child that actually died is detected here instead of
+                    # waiting out the whole startup deadline.
+                    exit_code = daemon_process.poll()
+                    if exit_code is not None:
+                        log_lines.append("")
+                        log_lines.append(f"✗ Daemon exited during initialization (exit code {exit_code})")
+                        log_lines.append(f"See full log: {daemon_log}")
+                        content = Text("\n".join(log_lines), style="dim")
+                        fail_title = f"[bold red]✗ Daemon Failed[/bold red] [dim]({profile} @ :{port})[/dim]"
+                        panel = Panel(content, title=fail_title, border_style="red", padding=(1, 2))
+                        live.update(panel)
+                        live.refresh()
+                        console.print()
+                        return False
+
                     # Tail daemon logs
                     if daemon_log.exists():
                         try:
@@ -855,14 +1040,16 @@ class DaemonEmbedManager(EmbedManager):
                             return True
                         else:
                             log_lines.append("")
-                            log_lines.append("✗ Daemon crashed during initialization")
+                            log_lines.append("Health probe failed after readiness; continuing to wait...")
                             content = Text("\n".join(log_lines), style="dim")
-                            fail_title = f"[bold red]✗ Daemon Failed[/bold red] [dim]({profile} @ :{port})[/dim]"
-                            panel = Panel(content, title=fail_title, border_style="red", padding=(1, 2))
+                            panel = Panel(content, title=title, border_style="cyan", padding=(1, 2))
                             live.update(panel)
                             live.refresh()
-                            console.print()
-                            break
+                            # /health shares the daemon event loop with startup
+                            # backlog processing. A single missed stability probe
+                            # is not evidence that the process exited; keep polling
+                            # within the existing startup deadline.
+                            continue
 
                     # Periodic progress
                     if time.time() - last_check_time > 3:
@@ -890,6 +1077,11 @@ class DaemonEmbedManager(EmbedManager):
             panel = Panel(content, title=timeout_title, border_style="red", padding=(1, 2))
             console.print(panel)
             console.print()
+            # Before this cleanup, the manager returned at the deadline but left
+            # the detached child initializing. A supervisor retry could then
+            # accumulate overlapping daemons that had not bound the port yet, so
+            # port-based cleanup could not see them.
+            _terminate_startup_process(daemon_process)
             return False
 
         except FileNotFoundError:

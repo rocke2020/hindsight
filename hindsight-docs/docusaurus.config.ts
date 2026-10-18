@@ -7,7 +7,12 @@ const umamiWebsiteId = process.env.UMAMI_WEBSITE_ID;
 
 // Announcement bar - supports HTML for links
 // Set to empty string '' to hide the bar
-const ANNOUNCEMENT_BAR = 'Hindsight is State-of-the-Art on Memory for AI Agents <a href="https://arxiv.org/abs/2512.12818" target="_blank">Read the paper →</a>';
+//
+// This is the highest-traffic strip on the site (~45k impressions/month), so it
+// points at the thing we want people to do, not off-site. The paper used to live
+// here and now sits in the homepage hero, which is where a visitor who wants
+// evidence is already looking.
+const ANNOUNCEMENT_BAR = 'New: <strong>Introducing Hindsight Memlake</strong>, serving 100M memories at &lt;100ms p99 on object storage. <a href="/blog/2026/10/13/memlake">Read the post →</a>';
 
 const config: Config = {
   title: 'Hindsight',
@@ -193,6 +198,9 @@ const config: Config = {
   ],
 
   plugins: [
+    // Fetches the repo's star count at build time for the navbar and the
+    // homepage hero.
+    './plugins/github-stars',
     // Indexes src/pages/changelog/integrations/*.md at build time so the
     // Integrations Hub knows which integrations have a changelog page.
     './plugins/integration-changelogs',
@@ -247,14 +255,18 @@ const config: Config = {
   themeConfig: {
     ...(ANNOUNCEMENT_BAR && {
       announcementBar: {
-        id: 'announcement',
+        id: 'memlake-launch',
         content: ANNOUNCEMENT_BAR,
         backgroundColor: '#0074d9',
         textColor: '#ffffff',
         isCloseable: false,
       },
     }),
-    image: 'img/logo.png',
+    image: 'img/social-card.png',
+    // Fallback for pages with no description of their own; a page's own one wins.
+    metadata: [
+      {name: 'description', content: 'State of the art long-term memory for your agents. Hindsight gives AI agents memory that learns across sessions.'},
+    ],
     colorMode: {
       defaultMode: 'dark',
       respectPrefersColorScheme: true,
@@ -365,9 +377,10 @@ const config: Config = {
         // Rendered last on the right (after the color-mode toggle) by
         // src/theme/Navbar/Content — the only call to action up there.
         {
-          href: 'https://ui.hindsight.vectorize.io/signup',
+          href: 'https://ui.hindsight.vectorize.io',
           position: 'right',
-          label: 'Sign up',
+          // "Sign up" names a cost; "Start free" names what you get. Same link.
+          label: 'Start free',
           className: 'navbar-item-signup',
         },
       ],
@@ -421,7 +434,7 @@ const config: Config = {
             },
             {
               label: 'Hindsight Cloud',
-              href: 'https://ui.hindsight.vectorize.io/signup',
+              href: 'https://ui.hindsight.vectorize.io',
             },
           ],
         },

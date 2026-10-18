@@ -3,7 +3,12 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { useTranslations, useLocale } from "next-intl";
 import { toast } from "sonner";
-import { client, LLMRequestEntry } from "@/lib/api";
+import { client, DocumentTimeField, LLMRequestEntry } from "@/lib/api";
+import {
+  DateRangePreset,
+  resolveCustomRange,
+  resolveDateRangePreset,
+} from "@/lib/date-range-preset";
 import { useBank } from "@/lib/bank-context";
 import { useFeatures } from "@/lib/features-context";
 import { DataView } from "./data-view";
@@ -81,37 +86,21 @@ import { TagFilterInput } from "./tag-filter-input";
 import { FacetLegend, MetadataChip, TagChip } from "@/components/ui/facet-chip";
 import { Spinner } from "@/components/ui/spinner";
 import { HarnessLogo } from "@/components/ui/harness-logo";
-import { InlineAttachmentText } from "@/components/ui/inline-attachment-text";
+import { InlineAttachmentText, countMatches } from "@/components/ui/inline-attachment-text";
 import { documentHarness, resolveHarnessLogo } from "@/lib/harness-logo";
+import { pendingUploadsFromOperations, type PendingUpload } from "@/lib/pending-uploads";
+import { editedRetainItem } from "@/lib/edited-retain-item";
 
 const ITEMS_PER_PAGE = 50;
 
-// Show in-flight/failed uploads that don't have a real document row yet. The
-// source of truth is the server's file_convert_retain operations, not any
-// client-side store — so the status survives reloads, tabs and devices.
-const PENDING_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const PENDING_POLL_INTERVAL_MS = 4000;
 // Idle cadence for auto-refreshing the whole table (new/updated docs, counts,
 // "Updating" badges) so it stays live without a manual reload. Gentler than the
 // active poll above — a quiet table shouldn't hammer the API.
 const DOCUMENTS_AUTO_REFRESH_MS = 8000;
-// A file_convert_retain operation flips to "completed" a couple of seconds
-// before the document becomes visible in listDocuments. Keep showing the
-// pending row for recently-completed operations so it stays on screen until
-// the real document row takes over (dedup by document_id) — no flicker.
-const PENDING_BRIDGE_MS = 30000;
 const DOCUMENTS_REFRESH_EVENT = "hindsight:documents-refresh";
 // Debounce between a filter edit (search text, tags) and the list request.
 const FILTER_DEBOUNCE_MS = 250;
-
-type PendingUpload = {
-  operationId: string;
-  id: string;
-  filename: string | null;
-  status: "processing" | "failed";
-  error?: string | null;
-  createdAt: string;
-};
 
 function formatRelativeTime(dateStr: string): string {
   const now = Date.now();
@@ -746,7 +735,17 @@ export function DocumentsView() {
   // The UI exposes the two useful modes; both map to their *_strict variant so
   // that filtering by a tag never surfaces untagged documents.
   const [tagsMatch, setTagsMatch] = useState<"any" | "all">("any");
+  // The time window. `timeField` picks the axis the server filters AND orders
+  // on, so it only means anything once a range is chosen — see the note on the
+  // axis Select below.
+  const [dateRange, setDateRange] = useState<DateRangePreset>("all");
+  const [timeField, setTimeField] = useState<DocumentTimeField>("updated_at");
+  // Explicit bounds for dateRange === "custom", as `datetime-local` strings.
+  const [customFrom, setCustomFrom] = useState("");
+  const [customTo, setCustomTo] = useState("");
   const [total, setTotal] = useState(0);
+  // A capped search: `total` is a lower bound, shown as "N+".
+  const [totalIsEstimate, setTotalIsEstimate] = useState(false);
 
   // Document transfer (export/import) state
   const [exporting, setExporting] = useState(false);
@@ -768,6 +767,7 @@ export function DocumentsView() {
   const [loadingDocument, setLoadingDocument] = useState(false);
   const [deletingDocumentId, setDeletingDocumentId] = useState<string | null>(null);
   const [deletingUploadOperationId, setDeletingUploadOperationId] = useState<string | null>(null);
+  const [retryingUploadOperationId, setRetryingUploadOperationId] = useState<string | null>(null);
 
   // Tag editing state
   const [editingTags, setEditingTags] = useState(false);
@@ -778,6 +778,8 @@ export function DocumentsView() {
   const [editingContent, setEditingContent] = useState(false);
   const [contentInput, setContentInput] = useState("");
   const [savingContent, setSavingContent] = useState(false);
+  // Find-in-text for the open document: local only, highlights matches in the content card.
+  const [contentSearch, setContentSearch] = useState("");
 
   // Chunks state
   const [chunks, setChunks] = useState<any[]>([]);
@@ -808,16 +810,29 @@ export function DocumentsView() {
       setLoading(true);
       try {
         const pageOffset = (page - 1) * ITEMS_PER_PAGE;
+        // Not named `window`: this file reaches for the global elsewhere
+        // (setInterval, addEventListener), and shadowing it here is a trap.
+        const timeWindow =
+          dateRange === "custom"
+            ? resolveCustomRange(customFrom, customTo).bounds
+            : resolveDateRangePreset(dateRange);
+        const hasWindow = Boolean(timeWindow.start_date || timeWindow.end_date);
         const data: any = await client.listDocuments({
           bank_id: currentBank,
           q: searchQuery,
           tags: selectedTags,
           tags_match: tagsMatch === "all" ? "all_strict" : "any_strict",
+          // Send the axis only with a window: on its own it would re-sort the
+          // list for no visible reason.
+          time_field: hasWindow ? timeField : undefined,
+          start_date: timeWindow.start_date,
+          end_date: timeWindow.end_date,
           limit: ITEMS_PER_PAGE,
           offset: pageOffset,
         });
         setDocuments(data.items || []);
         setTotal(data.total || 0);
+        setTotalIsEstimate(Boolean(data.total_is_estimate));
       } catch (error) {
         // Error toast is shown automatically by the API client interceptor
       } finally {
@@ -826,50 +841,29 @@ export function DocumentsView() {
         setLastRefreshedAt(Date.now());
       }
     },
-    [currentBank, searchQuery, selectedTags, tagsMatch]
+    [currentBank, searchQuery, selectedTags, tagsMatch, dateRange, timeField, customFrom, customTo]
   );
 
-  // Pull in-flight/failed file uploads straight from the server's
-  // file_convert_retain operations. Completed operations drop off here and
-  // reappear as real document rows once listDocuments returns them.
+  // Pull in-flight/failed file uploads straight from the server's operations.
+  // Completed ones drop off here and reappear as real document rows once
+  // listDocuments returns them.
   const loadPendingUploads = useCallback(async () => {
     if (!currentBank) {
       setPendingUploads([]);
       return;
     }
     try {
-      const data = await client.listOperations(currentBank, {
-        type: "file_convert_retain",
-        limit: 100,
-      });
-      const now = Date.now();
-      const cutoff = now - PENDING_MAX_AGE_MS;
-      const uploads: PendingUpload[] = (data.operations || [])
-        .filter((op) => {
-          const created = Date.parse(op.created_at);
-          if (!Number.isFinite(created) || created < cutoff) return false;
-          if (op.status === "pending" || op.status === "processing" || op.status === "failed") {
-            return true;
-          }
-          // Bridge the window between completion and the document appearing in
-          // the list. After PENDING_BRIDGE_MS we stop bridging so older
-          // completed uploads (whose row simply sits on another page) don't
-          // resurface as phantom "Processing" rows.
-          if (op.status === "completed") {
-            const settled = Date.parse(op.updated_at || op.created_at);
-            return Number.isFinite(settled) && now - settled < PENDING_BRIDGE_MS;
-          }
-          return false;
-        })
-        .map((op) => ({
-          operationId: op.id,
-          id: op.document_id || op.id,
-          filename: op.filename ?? null,
-          status: op.status === "failed" ? "failed" : "processing",
-          error: op.error_message,
-          createdAt: op.created_at,
-        }));
-      setPendingUploads(uploads);
+      const [conversions, retains] = await Promise.all([
+        client.listOperations(currentBank, { type: "file_convert_retain", limit: 100 }),
+        client.listOperations(currentBank, { type: "retain", limit: 100 }),
+      ]);
+      setPendingUploads(
+        pendingUploadsFromOperations(
+          conversions.operations || [],
+          retains.operations || [],
+          Date.now()
+        )
+      );
     } catch {
       // Keep whatever we had; the Operations tab remains the detailed source of truth.
     }
@@ -907,11 +901,23 @@ export function DocumentsView() {
   }, [inFlightDocIds, documents]);
   const hasUpdatingDocs = updatingDocIds.size > 0;
 
+  const customRange = resolveCustomRange(customFrom, customTo);
+  // Whether a window is actually being sent. "Custom range" with both fields
+  // blank — or half-typed — selects a preset but filters nothing yet, so it must
+  // not count as one.
+  const hasTimeWindow =
+    dateRange === "custom"
+      ? Boolean(customRange.bounds.start_date || customRange.bounds.end_date)
+      : dateRange !== "all";
+
   // Pending rows: in-flight/failed uploads that aren't yet in the real list.
   // A tag filter hides them entirely — their tags only exist on the document
   // row the conversion hasn't produced yet, so we can't honestly match them.
+  // A time window hides them for the same reason: the timestamps it filters on
+  // belong to that same unwritten row, so a pending upload left in the table
+  // would be claiming to fall inside a window nothing has placed it in.
   const pendingRows = useMemo<PendingUpload[]>(() => {
-    if (selectedTags.length > 0) return [];
+    if (selectedTags.length > 0 || hasTimeWindow) return [];
     const realIds = new Set(documents.map((doc) => doc.id));
     const q = searchQuery.trim().toLowerCase();
     return pendingUploads
@@ -923,13 +929,22 @@ export function DocumentsView() {
           (upload.filename?.toLowerCase().includes(q) ?? false)
         );
       });
-  }, [documents, pendingUploads, searchQuery, selectedTags]);
+  }, [documents, pendingUploads, searchQuery, selectedTags, hasTimeWindow]);
 
-  const hasActiveFilters = searchQuery.trim().length > 0 || selectedTags.length > 0;
+  const contentMatchCount = countMatches(selectedDocument?.original_text ?? "", contentSearch);
+
+  const hasActiveFilters =
+    searchQuery.trim().length > 0 || selectedTags.length > 0 || dateRange !== "all";
 
   const clearFilters = () => {
     setSearchQuery("");
     setSelectedTags([]);
+    // The axis goes back to the default too — left behind, it would keep
+    // re-sorting a list the user thinks they have unfiltered.
+    setDateRange("all");
+    setTimeField("updated_at");
+    setCustomFrom("");
+    setCustomTo("");
   };
 
   // Clicking a tag chip in the table toggles it in the filter.
@@ -946,7 +961,7 @@ export function DocumentsView() {
     () => pendingRows.some((upload) => upload.status === "processing"),
     [pendingRows]
   );
-  const displayTotal = total + pendingRows.length;
+  const displayTotal = `${(total + pendingRows.length).toLocaleString()}${totalIsEstimate ? "+" : ""}`;
 
   // The detail response nests the document's metadata under `retain_params`,
   // where the list response returns it flat as `document_metadata` — same map,
@@ -968,6 +983,8 @@ export function DocumentsView() {
 
     setLoadingDocument(true);
     setSelectedDocument({ id: documentId }); // Set placeholder to show loading
+    // Carry the list search into the dialog so a "Match in text" row opens with the match highlighted.
+    setContentSearch(searchQuery.trim());
     setEditingTags(false);
     setTagInput("");
     setEditingContent(false);
@@ -1082,6 +1099,22 @@ export function DocumentsView() {
     }
   };
 
+  const retryFailedUpload = async (operationId: string) => {
+    if (!currentBank) return;
+
+    setRetryingUploadOperationId(operationId);
+    try {
+      // The stored file is kept on failure, so re-queuing the operation
+      // re-runs the upload from the saved input.
+      await client.retryOperation(currentBank, operationId);
+      await loadPendingUploads();
+    } catch {
+      // Error toast is shown automatically by the API client interceptor
+    } finally {
+      setRetryingUploadOperationId(null);
+    }
+  };
+
   const startEditTags = () => {
     setTagInput((selectedDocument?.tags ?? []).join(", "));
     setEditingTags(true);
@@ -1108,19 +1141,7 @@ export function DocumentsView() {
     const newContent = contentInput;
     if (!newContent.trim()) return;
 
-    const retainParams = selectedDocument.retain_params ?? {};
-    const item: Parameters<typeof client.retain>[0]["items"][number] = {
-      content: newContent,
-      document_id: selectedDocument.id,
-    };
-    if (retainParams.context) item.context = retainParams.context;
-    if (retainParams.event_date) item.timestamp = retainParams.event_date;
-    if (retainParams.metadata && Object.keys(retainParams.metadata).length > 0) {
-      item.metadata = retainParams.metadata;
-    }
-    if (selectedDocument.tags && selectedDocument.tags.length > 0) {
-      item.tags = selectedDocument.tags;
-    }
+    const item = editedRetainItem(newContent, selectedDocument);
 
     setSavingContent(true);
     try {
@@ -1152,7 +1173,7 @@ export function DocumentsView() {
 
     setSavingTags(true);
     try {
-      await client.updateDocument(selectedDocument.id, currentBank, newTags);
+      await client.updateDocument(selectedDocument.id, currentBank, { tags: newTags });
       setSelectedDocument({ ...selectedDocument, tags: newTags });
       // Update tags in the documents list too
       setDocuments((prev) =>
@@ -1512,6 +1533,82 @@ export function DocumentsView() {
           onMatchModeChange={setTagsMatch}
           className="flex-1 min-w-[260px]"
         />
+        <Select
+          value={dateRange}
+          onValueChange={(v) => {
+            const next = v as DateRangePreset;
+            setDateRange(next);
+            // Going back to "all" hides the axis Select, so a non-default axis
+            // would survive unseen and reappear on the next range the user picks.
+            if (next === "all") {
+              setTimeField("updated_at");
+              setCustomFrom("");
+              setCustomTo("");
+            }
+          }}
+        >
+          <SelectTrigger className="w-[150px] h-9" aria-label={t("dateRangeAriaLabel")}>
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent position="popper">
+            <SelectItem value="all">{t("dateRangeAll")}</SelectItem>
+            <SelectItem value="1h">{t("dateRangeLastHour")}</SelectItem>
+            <SelectItem value="1d">{t("dateRangeLast24Hours")}</SelectItem>
+            <SelectItem value="7d">{t("dateRangeLast7Days")}</SelectItem>
+            <SelectItem value="30d">{t("dateRangeLast30Days")}</SelectItem>
+            <SelectItem value="custom">{t("dateRangeCustom")}</SelectItem>
+          </SelectContent>
+        </Select>
+        {dateRange === "custom" && (
+          <div className="flex items-center gap-2">
+            {/* A real <label> rather than a span plus aria-label: the two together
+                name the field once but read it twice in a screen reader's browse
+                mode, and the label also makes the text click into the field. */}
+            <label htmlFor="documents-range-from" className="text-xs text-muted-foreground">
+              {t("dateRangeFrom")}
+            </label>
+            <Input
+              id="documents-range-from"
+              type="datetime-local"
+              value={customFrom}
+              onChange={(e) => setCustomFrom(e.target.value)}
+              className="h-9 w-[240px]"
+            />
+            <label htmlFor="documents-range-to" className="text-xs text-muted-foreground">
+              {t("dateRangeTo")}
+            </label>
+            <Input
+              id="documents-range-to"
+              type="datetime-local"
+              value={customTo}
+              onChange={(e) => setCustomTo(e.target.value)}
+              className="h-9 w-[240px]"
+            />
+            {/* A reversed range sends no bounds at all, so without this the list
+                would quietly show everything and look like the filter was ignored. */}
+            {customRange.reversed && (
+              <span className="text-xs text-destructive">{t("dateRangeReversed")}</span>
+            )}
+          </div>
+        )}
+        {/* Shown as soon as a range is picked, not once bounds are actually sent:
+            under "Custom range" it belongs to the form being filled in, and making
+            it appear only on the keystroke that completes a date would make the
+            toolbar jump. With no range at all it is hidden, because it is the
+            window it applies to and there is nothing to apply it to. (Both
+            document timestamps are always set, so unlike the memories axes it
+            never drops rows — the re-sort is the whole of its effect.) */}
+        {dateRange !== "all" && (
+          <Select value={timeField} onValueChange={(v) => setTimeField(v as DocumentTimeField)}>
+            <SelectTrigger className="w-[150px] h-9" aria-label={t("timeFieldAriaLabel")}>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent position="popper">
+              <SelectItem value="updated_at">{t("timeFieldUpdated")}</SelectItem>
+              <SelectItem value="created_at">{t("timeFieldCreated")}</SelectItem>
+            </SelectContent>
+          </Select>
+        )}
         {hasActiveFilters && (
           <Button
             variant="ghost"
@@ -1612,6 +1709,22 @@ export function DocumentsView() {
                             <Button
                               variant="ghost"
                               size="sm"
+                              className="h-7 text-xs text-muted-foreground hover:text-blue-600 dark:hover:text-blue-400"
+                              onClick={() => retryFailedUpload(upload.operationId)}
+                              disabled={retryingUploadOperationId === upload.operationId}
+                            >
+                              {retryingUploadOperationId === upload.operationId ? (
+                                <Spinner size="xs" />
+                              ) : (
+                                <RotateCcw className="w-3 h-3 mr-1" />
+                              )}
+                              {retryingUploadOperationId === upload.operationId
+                                ? ""
+                                : tOperations("action.retry")}
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="sm"
                               className="h-7 text-xs text-muted-foreground hover:text-red-600 dark:hover:text-red-400"
                               onClick={() => deleteFailedUpload(upload.operationId)}
                               disabled={deletingUploadOperationId === upload.operationId}
@@ -1644,6 +1757,10 @@ export function DocumentsView() {
                     documents.map((doc) => {
                       const harness = documentHarness(doc.document_metadata, doc.tags);
                       const harnessLogo = resolveHarnessLogo(harness);
+                      // Which fields the search matched; highlights the matching cells.
+                      const matchedFields: string[] = doc.matched_fields ?? [];
+                      const idMatched = matchedFields.includes("id");
+                      const textMatched = matchedFields.includes("original_text");
                       return (
                         <TableRow
                           key={doc.id}
@@ -1653,10 +1770,18 @@ export function DocumentsView() {
                           {/* Identity block: the ID reads first, with when it was
                               last touched underneath. Created-at was dropped —
                               for almost every document it repeated updated-at. */}
-                          <TableCell className="text-card-foreground">
+                          <TableCell
+                            className={`text-card-foreground ${idMatched ? "bg-amber-500/10" : ""}`}
+                          >
                             <div className="min-w-0">
                               <div className="font-mono text-sm truncate" title={doc.id}>
-                                {doc.id}
+                                {idMatched ? (
+                                  <mark className="rounded-sm bg-amber-300/60 px-0.5 text-inherit dark:bg-amber-400/30">
+                                    {doc.id}
+                                  </mark>
+                                ) : (
+                                  doc.id
+                                )}
                               </div>
                               {/* The harness logo trails the timestamp rather
                                   than leading the ID: as a leading mark it only
@@ -1677,6 +1802,11 @@ export function DocumentsView() {
                                   size={14}
                                   titlePrefix={tCommon("harness")}
                                 />
+                                {textMatched && (
+                                  <span className="rounded-full bg-amber-300/60 px-2 py-0.5 text-[11px] font-medium text-foreground dark:bg-amber-400/30">
+                                    {t("matchedInText")}
+                                  </span>
+                                )}
                                 {updatingDocIds.has(doc.id) && (
                                   <span
                                     className="inline-flex items-center gap-1.5 rounded-full bg-muted px-2 py-0.5 text-[11px] font-medium text-muted-foreground"
@@ -1698,7 +1828,10 @@ export function DocumentsView() {
                               harnessShownAsLogo={!!harnessLogo}
                             />
                           </TableCell>
-                          <TableCell className="text-card-foreground text-right tabular-nums whitespace-nowrap font-medium">
+                          <TableCell
+                            className={`text-card-foreground text-right tabular-nums whitespace-nowrap font-medium ${textMatched ? "bg-amber-500/10" : ""}`}
+                            title={textMatched ? t("matchedInText") : undefined}
+                          >
                             {formatBytes(doc.text_length || 0)}
                           </TableCell>
                           <TableCell className="text-right tabular-nums font-semibold text-foreground">
@@ -1722,7 +1855,9 @@ export function DocumentsView() {
             {totalPages > 1 && (
               <div className="flex items-center justify-between mt-3 pt-3 border-t">
                 <div className="text-xs text-muted-foreground">
-                  {offset + 1}-{Math.min(offset + ITEMS_PER_PAGE, total)} of {total}
+                  {offset + 1}-{Math.min(offset + ITEMS_PER_PAGE, total)} of{" "}
+                  {total.toLocaleString()}
+                  {totalIsEstimate ? "+" : ""}
                 </div>
                 <div className="flex items-center gap-1">
                   <Button
@@ -2130,6 +2265,31 @@ export function DocumentsView() {
                                 {selectedDocument.original_text?.length?.toLocaleString() ?? 0}{" "}
                                 chars
                               </span>
+                              <div className="relative ml-2 w-48">
+                                <Search className="absolute left-2 top-1/2 -translate-y-1/2 h-3 w-3 text-muted-foreground pointer-events-none" />
+                                <Input
+                                  type="text"
+                                  value={contentSearch}
+                                  onChange={(e) => setContentSearch(e.target.value)}
+                                  placeholder={t("contentSearchPlaceholder")}
+                                  className="h-6 pl-6 pr-6 text-xs"
+                                />
+                                {contentSearch && (
+                                  <button
+                                    type="button"
+                                    onClick={() => setContentSearch("")}
+                                    aria-label={t("clearSearch")}
+                                    className="absolute right-1.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                                  >
+                                    <X className="h-3 w-3" />
+                                  </button>
+                                )}
+                              </div>
+                              {contentMatchCount !== null && (
+                                <span className="whitespace-nowrap text-muted-foreground/70">
+                                  {t("contentSearchMatches", { count: contentMatchCount })}
+                                </span>
+                              )}
                             </div>
                             <Button
                               variant="ghost"
@@ -2145,6 +2305,7 @@ export function DocumentsView() {
                             text={selectedDocument.original_text}
                             bankId={currentBank ?? ""}
                             attachments={selectedDocument.attachments}
+                            highlight={contentSearch}
                             className="p-4 text-[11px] leading-5 text-foreground/80 whitespace-pre-wrap font-mono"
                           />
                         </div>

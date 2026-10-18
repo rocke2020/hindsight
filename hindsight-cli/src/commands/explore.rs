@@ -328,7 +328,7 @@ impl App {
                         max_tokens: query_max_tokens,
                         trace: false,
                         query_timestamp: None,
-                        prefer_observations: false,
+                        prefer_observations: None,
                         include: None,
                         tags: None,
                         tags_match: TagsMatch::Any,
@@ -359,6 +359,9 @@ impl App {
                         fact_types: None,
                         exclude_mental_models: false,
                         exclude_mental_model_ids: None,
+                        // See memory.rs: set per bank, not per CLI call.
+                        reflect_search_observations_max_tokens: None,
+                        reflect_search_observations_include_entities: None,
                     };
 
                     let result = client

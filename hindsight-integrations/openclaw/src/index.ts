@@ -2,7 +2,7 @@ import type {
   MoltbotPluginAPI,
   PluginConfig,
   PluginHookAgentContext,
-  PluginToolContext,
+  PluginHookEndedTranscript,
   MemoryResult,
   RetainRequest,
 } from "./types.js";
@@ -13,7 +13,9 @@ import {
   type MinScores,
 } from "@vectorize-io/hindsight-client";
 import { RetainQueue } from "./retain-queue.js";
+import { createMemoryProviderRuntime } from "./memory-provider.js";
 import { compileSessionPatterns, matchesSessionPattern } from "./session-patterns.js";
+import { parseSessionFile } from "./session-file.js";
 import { createHash, randomUUID } from "crypto";
 import { dirname, join } from "path";
 import * as log from "./logger.js";
@@ -21,7 +23,6 @@ import { configureLogger, setApiLogger, stopLogger } from "./logger.js";
 import { mkdirSync } from "fs";
 import { createRequire } from "module";
 import { homedir } from "os";
-import { createKnowledgeTools, TOOL_NAMES } from "@vectorize-io/hindsight-agent-sdk";
 import {
   applyConfiguredBankDefaults,
   hasConfiguredBankDefaults,
@@ -106,6 +107,34 @@ const MIN_VERSION_FOR_ASYNC_RETAIN_OPERATION_ID = "0.8.6";
 let currentPluginConfig: PluginConfig | null = null;
 let serviceGeneration = 0;
 let serviceAbortController: AbortController | null = null;
+// External-API hooks can lazy-initialize before the first service.start(). Keep
+// that lifetime cancellable: the first start() or stop() aborts it.
+//
+// It covers retain as well as recall. It used to be recall-only, but OpenClaw
+// re-evaluates this module for each plugin registry it loads and only ever calls
+// service.start() on the first one, so the hooks that actually run often belong
+// to a copy that is never started. Recall worked there and retain returned at its
+// lifecycle guard without a log line, so memory silently stopped growing. (#4828)
+const preServiceController = new AbortController();
+
+/**
+ * Snapshot the lifecycle a hook runs under: the started service's, or the
+ * pre-start one when this module copy was never started. `isCurrent()` turns
+ * false once a later start() or stop() replaces it, so in-flight work can bail.
+ * After an explicit stop() there is no lifecycle and hooks do nothing.
+ */
+function captureHookLifecycle(): { signal: AbortSignal | undefined; isCurrent: () => boolean } {
+  const generation = serviceGeneration;
+  const controller = serviceAbortController ?? (generation === 0 ? preServiceController : null);
+  return {
+    signal: controller?.signal,
+    isCurrent: () =>
+      controller !== null &&
+      (serviceAbortController ?? preServiceController) === controller &&
+      generation === serviceGeneration &&
+      !controller.signal.aborted,
+  };
+}
 
 // Track which banks have had configured defaults applied (missions + bank config).
 const banksWithDefaultsApplied = new Set<string>();
@@ -135,7 +164,8 @@ export interface BankScopedClient {
       preferObservations?: boolean;
       minScores?: MinScores;
     },
-    timeoutMs?: number
+    timeoutMs?: number,
+    signal?: globalThis.AbortSignal
   ): Promise<RecallResponse>;
   setMissions(opts: BankMissionsUpdate): Promise<void>;
 }
@@ -161,28 +191,53 @@ export function scopeClient(c: HindsightClient, bankId: string): BankScopedClien
         ...(capability === "supported" && req.operationId ? { operationId: req.operationId } : {}),
       });
     },
-    async recall(req, timeoutMs) {
-      const call = c.recall(bankId, req.query, {
-        maxTokens: req.maxTokens,
-        budget: req.budget,
-        types: req.types,
-        preferObservations: req.preferObservations,
-        minScores: req.minScores,
+    async recall(req, timeoutMs, signal) {
+      signal?.throwIfAborted();
+      // Two independent reasons to stop: the caller's service-owned signal (stop
+      // or restart) and this call's own deadline. Compose them so the transport is
+      // cancelled by whichever fires first, while the reason the caller classifies
+      // on survives — a TimeoutError for the deadline, an AbortError for a stop.
+      const deadline = new AbortController();
+      const effective = signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal;
+      let onAbort!: () => void;
+      const cancelled = new Promise<never>((_, reject) => {
+        onAbort = () => reject(effective.reason);
+        effective.addEventListener("abort", onAbort, { once: true });
       });
-      if (!timeoutMs) return call;
-      // The generated client doesn't accept a per-call AbortSignal, so we race
-      // against a TimeoutError here. The before_prompt_build caller already
-      // special-cases `DOMException { name: 'TimeoutError' }` from the old
-      // bespoke client, so we preserve that contract.
-      return Promise.race([
-        call,
-        new Promise<never>((_, reject) =>
-          setTimeout(
-            () => reject(new DOMException(`Recall timed out after ${timeoutMs}ms`, "TimeoutError")),
+      const timer = timeoutMs
+        ? setTimeout(
+            () =>
+              deadline.abort(
+                new DOMException(`Recall timed out after ${timeoutMs}ms`, "TimeoutError")
+              ),
             timeoutMs
           )
-        ),
-      ]);
+        : undefined;
+      try {
+        // A race alone only stopped the hook's wait. Forward cancellation to the
+        // client too, so its HTTP request receives the deadline and service stops.
+        //
+        // The race stays as a backstop for a transport that ignores the signal,
+        // which is not hypothetical: from client 0.10.x recall routes through
+        // `retryOnCapacity`, whose backoff sleeps in a plain setTimeout, so an
+        // abort during a 429/503 wait does not interrupt it. (#4445)
+        const response = await Promise.race([
+          c.recall(bankId, req.query, {
+            maxTokens: req.maxTokens,
+            budget: req.budget,
+            types: req.types,
+            preferObservations: req.preferObservations,
+            minScores: req.minScores,
+            signal: effective,
+          }),
+          cancelled,
+        ]);
+        effective.throwIfAborted();
+        return response;
+      } finally {
+        clearTimeout(timer);
+        effective.removeEventListener("abort", onAbort);
+      }
     },
     async setMissions(opts) {
       // createBank upserts each mission column the request explicitly sets;
@@ -447,6 +502,76 @@ export async function flushRetainQueue(
 const DEFAULT_RECALL_PROMPT_PREAMBLE =
   "Relevant memories from past conversations (prioritize recent when conflicting). Only use memories that are directly useful to continue this conversation; ignore the rest:";
 
+/**
+ * The messages a retain should work from, for a `session_end` event that carries none.
+ *
+ * OpenClaw's `buildSessionEndHookPayload()` sends `sessionId`, `sessionKey`,
+ * `messageCount`, `durationMs`, `reason`, `sessionFile` and the next session's ids -
+ * no `messages` array, and a `context` holding only ids. The forced flush added for
+ * #1726 therefore ended at its own "no messages" guard on every session close, and the
+ * turns after the last cadence boundary were never retained (#4341).
+ *
+ * The transcript the event points at is the source: one synchronous read, which is what
+ * the shutdown drain's shared 2s budget allows, and extraction still happens
+ * asynchronously in the bank's operation queue. `undefined` when there is no readable
+ * transcript, which leaves the caller's existing guard to skip the flush as before.
+ *
+ * `/new` matters here: OpenClaw emits the previous session's `session_end` lazily, on
+ * the first turn of its successor, so the old messages are gone from the live session
+ * entry by then and the file is the only copy.
+ */
+export function sessionEndMessagesFromTranscript(
+  event: unknown,
+  read: typeof parseSessionFile = parseSessionFile
+): unknown[] | undefined {
+  const payload = (event ?? {}) as Record<string, any>;
+  const sessionFile = typeof payload.sessionFile === "string" ? payload.sessionFile : undefined;
+  if (!sessionFile) return undefined;
+  const agentId = typeof payload.context?.agentId === "string" ? payload.context.agentId : "";
+  try {
+    const messages = read(sessionFile, agentId).messages;
+    return messages.length > 0 ? messages : undefined;
+  } catch {
+    // A missing, truncated or unreadable transcript is not an error worth failing the
+    // session close over; the caller skips the flush exactly as it did before.
+    return undefined;
+  }
+}
+
+// Generous bounds for one session's tail; OpenClaw applies its own caps on top.
+const ENDED_TRANSCRIPT_MAX_MESSAGES = 10_000;
+const ENDED_TRANSCRIPT_MAX_BYTES = 8 * 1024 * 1024;
+
+/**
+ * The messages of a session that just ended, for the `session_end` flush.
+ *
+ * OpenClaw 2026.9.4 moved transcripts into SQLite, so the JSONL file the event
+ * points at no longer exists and the flush found nothing (#4594). 2026.10.1 added
+ * `ctx.endedTranscript`, a bounded reader over that store; use it when the host
+ * offers one and keep the file read for older hosts.
+ */
+export async function sessionEndMessages(
+  event: unknown,
+  endedTranscript: PluginHookEndedTranscript | undefined
+): Promise<unknown[] | undefined> {
+  if (endedTranscript === undefined) return sessionEndMessagesFromTranscript(event);
+  if (!endedTranscript.available) {
+    debug(`[Hindsight Hook] session_end: transcript unavailable (${endedTranscript.reason})`);
+    return undefined;
+  }
+  try {
+    const { messages, truncated } = await endedTranscript.readTail({
+      maxMessages: ENDED_TRANSCRIPT_MAX_MESSAGES,
+      maxBytes: ENDED_TRANSCRIPT_MAX_BYTES,
+    });
+    if (truncated) debug("[Hindsight Hook] session_end: transcript truncated to its tail");
+    return messages.length > 0 ? [...messages] : undefined;
+  } catch (error) {
+    log.warn(`session_end: could not read the ended transcript: ${error}`);
+    return undefined;
+  }
+}
+
 export function formatCurrentTimeForRecall(date = new Date()): string {
   const year = date.getUTCFullYear();
   const month = String(date.getUTCMonth() + 1).padStart(2, "0");
@@ -504,6 +629,14 @@ async function lazyReinit(configOverride?: PluginConfig): Promise<void> {
 
     usingExternalApi = true;
     isInitialized = true;
+    // A copy that was never started has no retain queue, so a failed retain
+    // would be dropped instead of replayed. (#4537)
+    // ponytail: the started copy may hold the same file, so both can replay one
+    // item; the persisted operation id keeps that idempotent on API >= 0.8.6.
+    // Share one queue per process via globalThis if duplicates show up on older APIs.
+    if (!retainQueue && serviceGeneration === 0 && !preServiceController.signal.aborted) {
+      initRetainQueue(config, 0, preServiceController.signal);
+    }
     // Replace the rejected initPromise with a resolved one
     initPromise = Promise.resolve();
     debug("[Hindsight] ✓ Lazy re-initialization succeeded");
@@ -560,7 +693,10 @@ if (typeof global !== "undefined") {
     ): Promise<BankScopedClient | null> => {
       if (!client) return null;
       const config = currentPluginConfig || {};
-      const bankId = usesStaticBank(config) ? getStaticBankId(config) : deriveBankId(ctx, config);
+      // deriveBankId already returns the static bank when dynamicBankId is false,
+      // so the branch that used to stand here was redundant — and it routed around
+      // the agentBankMap lookup for static configs. (#3890)
+      const bankId = deriveBankId(ctx, config);
       const scoped = scopeClient(client, bankId);
 
       // Stamp configured defaults onto this bank on first use (recall or retain).
@@ -598,8 +734,105 @@ function getConfiguredBankId(pluginConfig: PluginConfig): string | undefined {
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
+/**
+ * The bank an agent's memory lives in when it depends on the agent alone: an
+ * `agentBankMap` entry, a static bank, or agent-only dynamic banking. Undefined
+ * when the bank is keyed by user, channel or provider, which an agent id can't
+ * pick.
+ */
+export function agentOnlyBankId(agentId: string, pluginConfig: PluginConfig): string | undefined {
+  const ctx: PluginHookAgentContext = { agentId };
+  const mapped = mappedBankIdForAgent(ctx, pluginConfig);
+  if (mapped) return mapped;
+  if (usesStaticBank(pluginConfig)) return getStaticBankId(pluginConfig);
+  const fields = pluginConfig.dynamicBankGranularity?.length
+    ? pluginConfig.dynamicBankGranularity
+    : DEFAULT_DYNAMIC_BANK_GRANULARITY;
+  return fields.every((field) => field === "agent") ? deriveBankId(ctx, pluginConfig) : undefined;
+}
+
+/** The initialized client and its options, initializing lazily like the hooks do. */
+async function readyClient(): Promise<{
+  client: HindsightClient;
+  options: HindsightClientOptions;
+} | null> {
+  await (global as any).__hindsightClient?.waitForReady();
+  return client && clientOptions ? { client, options: clientOptions } : null;
+}
+
+function authHeaders(options: HindsightClientOptions): Record<string, string> {
+  return options.apiKey ? { Authorization: `Bearer ${options.apiKey}` } : {};
+}
+
 function usesStaticBank(pluginConfig: PluginConfig): boolean {
   return pluginConfig.dynamicBankId === false;
+}
+
+/**
+ * Normalise the optional `agentBankMap` (agentId -> bankId).
+ *
+ * The value comes from user-edited config, so an entry whose bank is not a
+ * non-empty string is dropped rather than trusted — an empty one would otherwise
+ * route that agent to a bank literally named "". A map left with no usable entry
+ * is treated as unset. (#3890)
+ */
+export function normalizeAgentBankMap(input: unknown): Record<string, string> | undefined {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return undefined;
+
+  const normalized: Record<string, string> = {};
+  const dropped: string[] = [];
+  for (const [agentId, bankId] of Object.entries(input as Record<string, unknown>)) {
+    const trimmedAgentId = agentId.trim();
+    const trimmedBank = typeof bankId === "string" ? bankId.trim() : "";
+    if (!trimmedAgentId || !trimmedBank) {
+      dropped.push(agentId);
+      continue;
+    }
+    // Key on the trimmed id. Storing the raw key would keep an entry that can
+    // never match a resolved agent id — inert rather than wrong, and silent.
+    normalized[trimmedAgentId] = trimmedBank;
+  }
+
+  // Silently dropped config keys have bitten this plugin before (#1443), so say so.
+  if (dropped.length > 0) {
+    log.warn(
+      `agentBankMap: ignoring ${dropped.length} entr${dropped.length === 1 ? "y" : "ies"} with a missing or blank bank id (${dropped.join(", ")})`
+    );
+  }
+
+  return Object.keys(normalized).length > 0 ? normalized : undefined;
+}
+
+/**
+ * The bank an agent is explicitly mapped to, if any.
+ *
+ * `agentBankMap` exists so one gateway can mix topologies: several agents share a
+ * named bank while the rest keep their derived per-agent/channel/user banks
+ * (#3890). The mapped name is used exactly as configured — `bankIdPrefix` is
+ * deliberately not applied, because the operator named this bank themselves.
+ */
+function mappedBankIdForAgent(
+  ctx: PluginHookAgentContext | undefined,
+  pluginConfig: PluginConfig
+): string | undefined {
+  const map = pluginConfig.agentBankMap;
+  if (!map || !ctx) return undefined;
+
+  const resolvedCtx = resolveSessionIdentity(ctx);
+  const agentId =
+    resolvedCtx?.agentId ||
+    (resolvedCtx?.sessionKey ? parseSessionKey(resolvedCtx.sessionKey).agentId : undefined);
+  // Object.hasOwn, not a plain lookup: an agent literally called "toString" or
+  // "constructor" would otherwise inherit a function from the prototype, which is
+  // truthy and is not a bank id.
+  if (!agentId || !Object.hasOwn(map, agentId)) return undefined;
+
+  // Re-check the value instead of trusting the caller to have normalised it: the
+  // backfill CLI builds its PluginConfig straight from openclaw.json and never
+  // passes through normalizeAgentBankMap, so it would otherwise back-fill into a
+  // differently-trimmed bank than the live gateway writes to.
+  const mapped = map[agentId];
+  return typeof mapped === "string" && mapped.trim().length > 0 ? mapped.trim() : undefined;
 }
 
 function getDefaultBankId(pluginConfig: PluginConfig): string {
@@ -1246,13 +1479,20 @@ export function resolveAndCacheIdentity(options: ResolveAndCacheIdentityOptions)
     options.pluginConfig?.dynamicBankId === false &&
     typeof options.pluginConfig?.bankId === "string" &&
     options.pluginConfig.bankId.length > 0;
+  // A mapped agent is pinned the same way a static bank is: its bank comes from
+  // the map, not from the dispatch surface, so a surface mismatch cannot route
+  // the turn into the wrong bank and must not skip it. (#3890)
+  const mappedBanking =
+    options.pluginConfig !== undefined &&
+    mappedBankIdForAgent(resolvedCtx ?? effectiveCtx, options.pluginConfig) !== undefined;
 
   if (
     sessionProvider &&
     options.dispatchChannel &&
     sessionProvider !== options.dispatchChannel &&
     bankRoutingDependsOnSurface &&
-    !staticBanking
+    !staticBanking &&
+    !mappedBanking
   ) {
     const skipReason = finalSkipReason(
       `dispatch surface ${options.dispatchChannel} does not match session provider ${sessionProvider}`
@@ -1300,7 +1540,11 @@ export function getIdentitySkipReason(
     pluginConfig?.dynamicBankId === false &&
     typeof pluginConfig?.bankId === "string" &&
     pluginConfig.bankId.length > 0;
-  const allowCliSessions = agentBanking || staticBanking;
+  //   - the agent has an explicit agentBankMap entry → the operator named that
+  //     bank for this agent, so its sessions belong there too (#3890)
+  const mappedBanking =
+    pluginConfig !== undefined && mappedBankIdForAgent(resolvedCtx, pluginConfig) !== undefined;
+  const allowCliSessions = agentBanking || staticBanking || mappedBanking;
 
   if (typeof sessionKey === "string") {
     if (/^agent:[^:]+:(cron|heartbeat|subagent):/.test(sessionKey)) {
@@ -1387,6 +1631,15 @@ export function deriveBankId(
   ctx: PluginHookAgentContext | undefined,
   pluginConfig: PluginConfig
 ): string {
+  // An explicit agent -> bank mapping wins over both the static bank and dynamic
+  // derivation, so a gateway can give one group of agents a shared bank while the
+  // rest keep derived ones (#3890). Resolved only when a map is configured, so the
+  // common path is untouched.
+  const mappedBankId = mappedBankIdForAgent(ctx, pluginConfig);
+  if (mappedBankId) {
+    return mappedBankId;
+  }
+
   if (pluginConfig.dynamicBankId === false) {
     return getStaticBankId(pluginConfig);
   }
@@ -1439,84 +1692,6 @@ export function deriveBankId(
   return pluginConfig.bankIdPrefix ? `${pluginConfig.bankIdPrefix}-${baseBankId}` : baseBankId;
 }
 
-function usesUserScopedBanking(pluginConfig: PluginConfig): boolean {
-  if (usesStaticBank(pluginConfig)) {
-    return false;
-  }
-  const granularity = pluginConfig.dynamicBankGranularity?.length
-    ? pluginConfig.dynamicBankGranularity
-    : DEFAULT_DYNAMIC_BANK_GRANULARITY;
-  return granularity.includes("user");
-}
-
-export interface KnowledgeToolBankResolution {
-  bankId: string;
-  resolvedCtx: PluginHookAgentContext | undefined;
-  identityError?: string;
-}
-
-/**
- * Resolve the Hindsight bank for knowledge tools using the same identity path as
- * auto-recall/retain. When user-scoped dynamic banking is enabled, unresolved
- * identity must not silently route to the shared default or anonymous bank.
- */
-export function resolveBankIdForKnowledgeTools(
-  toolCtx: PluginToolContext,
-  pluginConfig: PluginConfig
-): KnowledgeToolBankResolution {
-  if (usesStaticBank(pluginConfig)) {
-    return { bankId: getStaticBankId(pluginConfig), resolvedCtx: undefined };
-  }
-
-  const hookCtx: PluginHookAgentContext = {
-    agentId: toolCtx.agentId,
-    sessionKey: toolCtx.sessionKey,
-    workspaceDir: toolCtx.workspaceDir,
-  };
-
-  const { resolvedCtx, skipReason } = resolveAndCacheIdentity({
-    sessionKey: toolCtx.sessionKey,
-    ctx: hookCtx,
-    pluginConfig,
-  });
-  const { reason: identityReason } = getIdentitySkipReason(resolvedCtx, pluginConfig);
-  const effectiveSkip = skipReason ?? identityReason;
-  const bankId = deriveBankId(resolvedCtx, pluginConfig);
-
-  if (usesUserScopedBanking(pluginConfig)) {
-    const userSegment = resolvedCtx?.senderId || "anonymous";
-    if (effectiveSkip) {
-      return {
-        bankId,
-        resolvedCtx,
-        identityError:
-          `Hindsight knowledge tools skipped: ${formatIdentitySkipReason(effectiveSkip)}. ` +
-          "Knowledge tools use the same per-user memory bank as auto-recall/retain.",
-      };
-    }
-    if (userSegment === "anonymous") {
-      return {
-        bankId,
-        resolvedCtx,
-        identityError:
-          "Hindsight knowledge tools skipped: missing stable sender identity. " +
-          "Knowledge tools use the same per-user memory bank as auto-recall/retain.",
-      };
-    }
-    if (bankId === getDefaultBankId(pluginConfig)) {
-      return {
-        bankId,
-        resolvedCtx,
-        identityError:
-          "Hindsight knowledge tools skipped: could not resolve per-user memory bank. " +
-          "Knowledge tools use the same per-user memory bank as auto-recall/retain.",
-      };
-    }
-  }
-
-  return { bankId, resolvedCtx };
-}
-
 /**
  * Render the event window a memory carries. `mentioned_at` says when the fact
  * was stated; `occurred_start`/`occurred_end` say when the event itself
@@ -1554,6 +1729,7 @@ const NO_KEY_REQUIRED_PROVIDERS = new Set([
   "ollama",
   "openai-codex",
   "claude-code",
+  "cursor",
   "github-copilot",
 ]);
 
@@ -1981,6 +2157,7 @@ export function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
         ? config.bankId.trim()
         : undefined,
     bankIdPrefix: config.bankIdPrefix,
+    agentBankMap: normalizeAgentBankMap(config.agentBankMap),
     retainTags: normalizeRetainTags(config.retainTags),
     retainSource:
       typeof config.retainSource === "string" && config.retainSource.trim().length > 0
@@ -2054,6 +2231,16 @@ export function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
     skipStatelessSessions: config.skipStatelessSessions !== false,
     debug: config.debug ?? false,
     debugPerfTiming: config.debugPerfTiming === true,
+    // Both were missing from this whitelist, so the logger always ran at
+    // `info` with a 5-minute summary whatever the user configured.
+    logLevel:
+      config.logLevel && ["off", "error", "warning", "info", "debug"].includes(config.logLevel)
+        ? config.logLevel
+        : undefined,
+    logSummaryIntervalMs:
+      typeof config.logSummaryIntervalMs === "number" && config.logSummaryIntervalMs >= 0
+        ? config.logSummaryIntervalMs
+        : undefined,
     // Retain queue: kept off the strict whitelist before — user values were
     // silently dropped before queue init read them. (#1443)
     retainQueuePath:
@@ -2066,7 +2253,6 @@ export function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
       typeof config.retainQueueFlushIntervalMs === "number" && config.retainQueueFlushIntervalMs > 0
         ? config.retainQueueFlushIntervalMs
         : undefined,
-    enableKnowledgeTools: config.enableKnowledgeTools === true,
     senderPrefixPattern,
   };
 }
@@ -2090,7 +2276,9 @@ export default function (api: MoltbotPluginAPI) {
     // Get plugin config first (needed for debug flag and service registration)
     const pluginConfig = getPluginConfig(api);
     // If logLevel is 'debug', also enable legacy debug flag
-    debugEnabled = pluginConfig.debug ?? pluginConfig.logLevel === "debug";
+    // `debug` is always a boolean here (getPluginConfig defaults it, and so does
+    // the schema), so `??` never reached logLevel and `logLevel: "debug"` was a no-op.
+    debugEnabled = pluginConfig.debug === true || pluginConfig.logLevel === "debug";
 
     // Configure structured logger — route through OpenClaw's api.logger for consistent formatting
     if (api.logger) setApiLogger(api.logger);
@@ -2113,7 +2301,9 @@ export default function (api: MoltbotPluginAPI) {
     api.registerService({
       id: "hindsight-memory",
       async start() {
+        preServiceController.abort();
         serviceAbortController?.abort();
+        inflightRecalls.clear();
         const serviceController = new AbortController();
         serviceAbortController = serviceController;
         const startGeneration = ++serviceGeneration;
@@ -2393,8 +2583,10 @@ export default function (api: MoltbotPluginAPI) {
       async stop() {
         try {
           serviceGeneration++;
+          preServiceController.abort();
           serviceAbortController?.abort();
           serviceAbortController = null;
+          inflightRecalls.clear();
           debug("[Hindsight] Service stopping...");
 
           // Only stop daemon if in local mode
@@ -2449,7 +2641,14 @@ export default function (api: MoltbotPluginAPI) {
     debug("[Hindsight] Registering agent hooks...");
     log.info("registering agent hooks");
 
-    api.on("before_dispatch", async (event: any, ctx?: PluginHookAgentContext) => {
+    // Inbound identity capture: cache the sender and dispatch surface per session
+    // before the agent runs, for banks keyed by user or channel.
+    //
+    // This used `before_dispatch`, which carries the same fields. OpenClaw refuses
+    // to start or resume a Goal while any plugin holds `before_dispatch` (it can't
+    // replay it after a restart), so the plugin blocked Goals. `message_received`
+    // fires earlier on the same inbound path and is not on that list. (#5177)
+    api.on("message_received", async (event: any, ctx?: PluginHookAgentContext) => {
       try {
         const sessionKey =
           ctx?.sessionKey ?? (typeof event?.sessionKey === "string" ? event.sessionKey : undefined);
@@ -2457,8 +2656,9 @@ export default function (api: MoltbotPluginAPI) {
           return;
         }
 
+        // A message hook's channelId is the surface ("telegram", "webchat").
         const dispatchChannel =
-          (typeof event?.channel === "string" ? event.channel : undefined) ||
+          (typeof ctx?.channelId === "string" ? ctx.channelId : undefined) ||
           ctx?.messageProvider ||
           parseSessionKey(sessionKey).provider;
         const { resolvedCtx, skipReason } = resolveAndCacheIdentity({
@@ -2475,7 +2675,7 @@ export default function (api: MoltbotPluginAPI) {
 
         if (skipReason) {
           debug(
-            `[Hindsight] before_dispatch marked session ${sessionKey} to skip this turn: ${formatIdentitySkipReason(skipReason)}`
+            `[Hindsight] message_received marked session ${sessionKey} to skip this turn: ${formatIdentitySkipReason(skipReason)}`
           );
           logSkipOnce("dispatch", sessionKey, skipReason);
           return;
@@ -2485,15 +2685,15 @@ export default function (api: MoltbotPluginAPI) {
         }
 
         debug(
-          `[Hindsight] before_dispatch cached identity for ${sessionKey}: ${resolvedCtx.messageProvider}/${resolvedCtx.channelId} sender=${resolvedCtx.senderId}`
+          `[Hindsight] message_received cached identity for ${sessionKey}: ${resolvedCtx.messageProvider}/${resolvedCtx.channelId} sender=${resolvedCtx.senderId}`
         );
       } catch (error) {
-        log.warn(`before_dispatch identity cache error: ${error}`);
+        log.warn(`message_received identity cache error: ${error}`);
       }
     });
 
     // No `before_agent_start` registration: the callback used to call
-    // `resolveAndCacheIdentity()` and emit a debug log, but `before_dispatch`
+    // `resolveAndCacheIdentity()` and emit a debug log, but `message_received`
     // already populates the identity cache earlier in the inbound path,
     // `before_prompt_build` re-resolves before recall (and can infer
     // `senderId` from prompt content when ctx is missing it), and `agent_end`
@@ -2503,6 +2703,9 @@ export default function (api: MoltbotPluginAPI) {
     // Auto-recall: Inject relevant memories before agent processes the message
     // Hook signature: (event, ctx) where event has {prompt, messages?} and ctx has agent context
     api.on("before_prompt_build", async (event: any, ctx?: PluginHookAgentContext) => {
+      const recallLifecycle = captureHookLifecycle();
+      const isCurrentRecall = recallLifecycle.isCurrent;
+      if (!isCurrentRecall()) return;
       // Optional perf instrumentation (#1406). Captured here at hook entry so
       // the early-return paths below don't influence the measurement of slow
       // recall calls — perf lines are only emitted on the recall path.
@@ -2634,9 +2837,11 @@ export default function (api: MoltbotPluginAPI) {
         }
 
         await clientGlobal.waitForReady();
+        if (!isCurrentRecall()) return;
 
         // Get client configured for this context's bank (async to handle mission setup)
         const client = await clientGlobal.getClientForContext(resolvedCtxForRecall);
+        if (!isCurrentRecall()) return;
         if (!client) {
           debug("[Hindsight] Client not initialized, skipping auto-recall");
           return;
@@ -2664,14 +2869,22 @@ export default function (api: MoltbotPluginAPI) {
               preferObservations: pluginConfig.preferObservations,
               minScores: pluginConfig.recallMinScores,
             },
-            recallTimeoutMs
+            recallTimeoutMs,
+            recallLifecycle.signal
           );
           inflightRecalls.set(recallKey, recallPromise);
-          void recallPromise.catch(() => {}).finally(() => inflightRecalls.delete(recallKey));
+          void recallPromise
+            .catch(() => {})
+            .finally(() => {
+              // An old generation can settle after start() installed a successor.
+              if (inflightRecalls.get(recallKey) === recallPromise)
+                inflightRecalls.delete(recallKey);
+            });
         }
 
         const recallStart = pluginConfig.debugPerfTiming ? Date.now() : 0;
         const response = await recallPromise;
+        if (!isCurrentRecall()) return;
         const recallElapsedMs = pluginConfig.debugPerfTiming ? Date.now() - recallStart : 0;
 
         if (!response.results || response.results.length === 0) {
@@ -2744,9 +2957,18 @@ ${memoriesFormatted}
             `[Hindsight] Auto-recall timed out after ${pluginConfig.recallTimeoutMs ?? DEFAULT_RECALL_TIMEOUT_MS}ms, skipping memory injection`
           );
         } else if (error instanceof Error && error.name === "AbortError") {
-          log.warn(
-            `[Hindsight] Auto-recall aborted after ${pluginConfig.recallTimeoutMs ?? DEFAULT_RECALL_TIMEOUT_MS}ms, skipping memory injection`
-          );
+          // An AbortError now has two sources. The deadline is handled above as a
+          // TimeoutError; this branch is reached when the service was stopped or
+          // restarted mid-recall, which is not a timeout — quoting recallTimeoutMs
+          // there reports a deadline that never elapsed, with a number unrelated
+          // to the time actually spent. (#4450)
+          if (recallLifecycle.signal?.aborted) {
+            debug("[Hindsight] Auto-recall cancelled: service stopped, skipping memory injection");
+          } else {
+            log.warn(
+              `[Hindsight] Auto-recall aborted after ${pluginConfig.recallTimeoutMs ?? DEFAULT_RECALL_TIMEOUT_MS}ms, skipping memory injection`
+            );
+          }
         } else {
           log.error("auto-recall error", error);
         }
@@ -2767,13 +2989,7 @@ ${memoriesFormatted}
       const force = retainOptions.force === true;
       const hookName = retainOptions.hookName;
       const retainGeneration = serviceGeneration;
-      const retainController = serviceAbortController;
-      const retainSignal = retainController?.signal;
-      const retainLifecycleIsCurrent = () =>
-        retainController !== null &&
-        serviceAbortController === retainController &&
-        retainGeneration === serviceGeneration &&
-        !retainSignal?.aborted;
+      const { signal: retainSignal, isCurrent: retainLifecycleIsCurrent } = captureHookLifecycle();
       if (!retainLifecycleIsCurrent()) return;
       // Optional perf instrumentation (#1406). Only emitted when an actual
       // retain RPC fires; the many early-return skip paths are not measured.
@@ -2876,10 +3092,18 @@ ${memoriesFormatted}
           return;
         }
 
-        if (
-          !Array.isArray(event.context?.sessionEntry?.messages ?? event.messages) ||
-          (event.context?.sessionEntry?.messages ?? event.messages ?? []).length === 0
-        ) {
+        // Resolved once: `session_end` carries no transcript, so the forced flush
+        // has to fetch it. Without this the guard below ended every session-close
+        // flush before it began. (#4341)
+        let eventMessages = event.context?.sessionEntry?.messages ?? event.messages;
+        if (force && (!Array.isArray(eventMessages) || eventMessages.length === 0)) {
+          eventMessages = await sessionEndMessages(event, ctx?.endedTranscript);
+          if (Array.isArray(eventMessages)) {
+            debug(`[Hindsight Hook] session_end: read ${eventMessages.length} messages`);
+          }
+        }
+
+        if (!Array.isArray(eventMessages) || eventMessages.length === 0) {
           debug("[Hindsight Hook] No messages in event, skipping retention");
           return;
         }
@@ -2891,7 +3115,7 @@ ${memoriesFormatted}
 
         // Chunked retention: skip non-Nth turns and use a sliding window when firing
         const retainEveryN = pluginConfig.retainEveryNTurns ?? 1;
-        const allMessages = event.context?.sessionEntry?.messages ?? event.messages ?? [];
+        const allMessages = eventMessages;
         let messagesToRetain = allMessages;
         let retainFullWindow = false;
 
@@ -3113,53 +3337,57 @@ ${memoriesFormatted}
     debug("[Hindsight] Hooks registered");
     log.info("agent hooks registered");
 
-    // Register knowledge tools (opt-in via enableKnowledgeTools config flag)
-    if (pluginConfig.enableKnowledgeTools && typeof api.registerTool === "function") {
-      try {
-        const apiUrl = (() => {
-          const ext = detectExternalApi(pluginConfig);
-          return ext?.apiUrl || `http://localhost:${pluginConfig.apiPort || 9077}`;
-        })();
-        const apiToken = pluginConfig.hindsightApiToken || undefined;
-
-        // Factory: called per session with agent context, returns tools scoped to that bank.
-        // Identity is resolved the same way as auto-recall/retain so PluginToolContext
-        // (which lacks senderId/messageProvider) still routes to the per-user bank.
-        const factory = (ctx: PluginToolContext) => {
-          const resolution = resolveBankIdForKnowledgeTools(ctx, pluginConfig);
-          const tools = createKnowledgeTools({
-            apiUrl,
-            apiToken,
-            bankId: resolution.bankId,
-          });
-          return tools.map((t) => ({
-            name: t.name,
-            label: t.label,
-            description: t.description,
-            parameters: t.parameters,
-            async execute(_id: string, params: Record<string, unknown>) {
-              if (resolution.identityError) {
-                return {
-                  content: [{ type: "text", text: resolution.identityError }],
-                  details: {},
-                };
-              }
-              const config = currentPluginConfig || pluginConfig;
-              await ensureBankDefaultsApplied(resolution.bankId, config);
-              return { ...(await t.execute(params)), details: {} };
+    // OpenClaw's own memory surfaces read through this when Hindsight holds the
+    // memory slot; without it they all report "memory plugin unavailable". (#4916)
+    api.registerMemoryCapability?.({
+      providerRuntime: createMemoryProviderRuntime({
+        providerId: "hindsight-openclaw",
+        agentBank: (agentId) => agentOnlyBankId(agentId, currentPluginConfig || pluginConfig),
+        recall: async (bankId, query, signal) => {
+          const live = await readyClient();
+          if (!live) throw new Error("Hindsight client is not initialized");
+          const config = currentPluginConfig || pluginConfig;
+          const response = await scopeClient(live.client, bankId).recall(
+            {
+              query,
+              maxTokens: config.recallMaxTokens,
+              budget: config.recallBudget,
+              types: config.recallTypes,
             },
+            config.recallTimeoutMs,
+            signal
+          );
+          return (response.results ?? []).map((r) => ({
+            id: r.id,
+            text: r.text,
+            score: r.scores?.final,
           }));
-        };
-
-        api.registerTool(factory, {
-          names: [...TOOL_NAMES],
-          optional: false,
-        });
-        log.info("knowledge tools registered");
-      } catch (err) {
-        log.warn(`knowledge tools registration failed: ${err}`);
-      }
-    }
+        },
+        getMemory: async (bankId, memoryId, signal) => {
+          const live = await readyClient();
+          if (!live) throw new Error("Hindsight client is not initialized");
+          const res = await fetch(
+            `${live.options.baseUrl.replace(/\/$/, "")}/v1/default/banks/${encodeURIComponent(bankId)}/memories/${encodeURIComponent(memoryId)}`,
+            { headers: authHeaders(live.options), signal }
+          );
+          if (res.status === 404) return null;
+          if (!res.ok) throw new Error(`Hindsight memory lookup failed: HTTP ${res.status}`);
+          const body = (await res.json()) as { text?: unknown };
+          return typeof body.text === "string" ? body.text : null;
+        },
+        healthy: async () => {
+          const live = await readyClient().catch(() => null);
+          if (!live) return false;
+          // Bounded: OpenClaw's status call waits on this, and a hung API must read
+          // as unavailable rather than hang the Memory page.
+          const res = await fetch(`${live.options.baseUrl.replace(/\/$/, "")}/health`, {
+            headers: authHeaders(live.options),
+            signal: AbortSignal.timeout(5000),
+          }).catch(() => null);
+          return res?.ok === true;
+        },
+      }),
+    });
   } catch (error) {
     log.error("plugin loading error", error);
     if (error instanceof Error) {

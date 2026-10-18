@@ -15,17 +15,52 @@ from .base import SQLDialect, bm25_score_gate
 class KnowledgeBm25Arm:
     """Backend-specific BM25 clauses for the knowledge-page full-text arm.
 
-    ``score_expr`` is a relevance score where higher = more relevant (used in the
-    SELECT list of the BM25-only fallback). ``order_by`` is the arm's ranking
-    expression (kept separate so distance-based backends can order by the raw,
-    index-friendly ``ASC`` distance). ``match_filter`` is a WHERE predicate that
-    keeps only genuine term matches, already prefixed with ``AND `` — empty when
-    the backend ranks every row and needs no gate.
+    ``order_by`` is the arm's ranking expression (distance-based backends order by
+    the raw, index-friendly ``ASC`` distance rather than a negated score).
+    ``match_filter`` is a WHERE predicate that keeps only genuine term matches,
+    already prefixed with ``AND `` — empty when the backend ranks every row and
+    needs no gate.
+
+    There is deliberately no raw-score field: each backend's operator returns its
+    own scale (``ts_rank_cd``, a negated distance, ``paradedb.score``), and the
+    caller ranks off ``order_by`` and normalizes the rank instead, so the score it
+    reports means the same thing on every backend.
     """
 
-    score_expr: str
     order_by: str
     match_filter: str
+
+
+def pg_search_should(fn: str, fields: tuple[str, ...], text_param: str, tokenizer: str, max_query_terms: int) -> str:
+    """The ``paradedb.boolean(should => ...)`` clause array for a pg_search BM25 arm.
+
+    With a configured tokenizer, the query is tokenized in SQL by the index's own
+    tokenizer and only its distinct word tokens are searched — multi-char words
+    first (single CJK chars are mostly particles: 的 了 在), capped at
+    ``max_query_terms`` — as exact term queries over ``fields``. This replaced
+    matching the raw sentence, which ORs every token, whitespace and punctuation
+    included: jieba emits " " as a term that matches every row containing a space,
+    and a long Chinese question fanned out over the global index (#4313). Terms
+    rather than a re-joined ``match`` string, because re-joining reintroduces that
+    whitespace term.
+
+    ngram tokenizers emit overlapping grams, so pruning them would just keep the
+    query's first few characters; they, and the ParadeDB default tokenizer (which
+    keeps a CJK run as one token), keep the raw ``match``. ``tokenizer`` is the
+    normalized config value (``normalize_pg_search_tokenizer``, a whitelist), so it
+    is safe to inline — it is the same ``pdb.<tokenizer>`` the index DDL uses.
+    """
+    if tokenizer and not tokenizer.startswith(("ngram", "edge_ngram")):
+        cap = f" LIMIT {max_query_terms}" if max_query_terms > 0 else ""
+        values = ", ".join(f"('{f}')" for f in fields)
+        return (
+            f"ARRAY(SELECT {fn}.term(f, t) FROM ("
+            f"SELECT t FROM unnest({text_param}::text::pdb.{tokenizer}::text[]) WITH ORDINALITY u(t, o)"
+            f" WHERE t !~ '^[[:space:][:punct:]]*$'"
+            f" GROUP BY t ORDER BY char_length(t) > 1 DESC, min(o){cap}"
+            f") k CROSS JOIN (VALUES {values}) v(f))"
+        )
+    return "ARRAY[" + ", ".join(f"{fn}.match('{f}', {text_param})" for f in fields) + "]"
 
 
 def knowledge_bm25_arm(
@@ -34,6 +69,9 @@ def knowledge_bm25_arm(
     table_alias: str,
     text_param: str,
     pg_search_function_schema: str = "paradedb",
+    pg_search_tokenizer: str = "",
+    max_query_terms: int = 0,
+    backend_type: str = "postgresql",
 ) -> KnowledgeBm25Arm:
     """BM25 clauses for ``search_knowledge_pages`` on a given text-search backend.
 
@@ -60,6 +98,19 @@ def knowledge_bm25_arm(
     a = table_alias
     p = text_param
 
+    if backend_type == "oracle":
+        # Oracle Text: CONTAINS/SCORE over the CTXSYS.CONTEXT index
+        # idx_mental_models_text_search on mental_models(content), the same shape the
+        # memory-recall arm uses on memory_units(text). ``text_param`` carries the
+        # OR-joined, escaped terms from OracleDialect.prepare_bm25_text. The PG
+        # text-search extensions do not exist here, so this wins over them.
+        return KnowledgeBm25Arm(
+            order_by="SCORE(1) DESC",
+            # ACCUM instead of the OR the dialect joins terms with: pages matching more
+            # query terms rank higher, which OR (max of term scores) does not do.
+            match_filter=f"AND CONTAINS({a}.content, REPLACE({p}, ' OR ', ' ACCUM '), 1) > 0",
+        )
+
     if text_search_extension == "vchord":
         # VectorChord BM25 over the bm25vector search_vector column, identical to
         # build_bm25_arm's vchord form. This only returns rows because the
@@ -69,7 +120,6 @@ def knowledge_bm25_arm(
         # <&> is the NEGATIVE score (lower = more relevant); negate it.
         expr = f"-({a}.search_vector <&> to_bm25query('idx_mental_models_text_search', tokenize({p}, 'llmlingua2')))"
         return KnowledgeBm25Arm(
-            score_expr=expr,
             order_by=f"{expr} DESC",
             # Gate on a positive score: the operator ranks every row, so a bare
             # LIMIT would pad the arm with zero-score non-matches.
@@ -80,13 +130,12 @@ def knowledge_bm25_arm(
         # ParadeDB pg_search: BM25 index over (id, name, content), key_field='id'.
         # Fan the query across both indexed text fields with paradedb.boolean.
         score = f"{pg_search_function_schema}.score({a}.id)"
+        should = pg_search_should(
+            pg_search_function_schema, ("name", "content"), p, pg_search_tokenizer, max_query_terms
+        )
         return KnowledgeBm25Arm(
-            score_expr=score,
             order_by=f"{score} DESC",
-            match_filter=(
-                f"AND {a}.id @@@ {pg_search_function_schema}.boolean(should => ARRAY["
-                f"{pg_search_function_schema}.match('name', {p}), {pg_search_function_schema}.match('content', {p})])"
-            ),
+            match_filter=f"AND {a}.id @@@ {pg_search_function_schema}.boolean(should => {should})",
         )
 
     if text_search_extension == "pg_textsearch":
@@ -95,7 +144,6 @@ def knowledge_bm25_arm(
         # order by the raw ASC distance so the index drives the ordering.
         distance = f"{a}.content <@> to_bm25query({p}, 'idx_mental_models_text_search')"
         return KnowledgeBm25Arm(
-            score_expr=f"-({distance})",
             order_by=f"{distance} ASC",
             match_filter="",
         )
@@ -118,7 +166,6 @@ def knowledge_bm25_arm(
             f"FROM unnest(pgroonga_tokenize({p}, 'tokenizer', 'TokenBigram', 'normalizer', 'NormalizerNFKC150')) AS elem)"
         )
         return KnowledgeBm25Arm(
-            score_expr=score,
             order_by=f"{score} DESC, {a}.id",
             match_filter=f"AND {document} &@~ {query_expr}",
         )
@@ -137,7 +184,6 @@ def knowledge_bm25_arm(
     # (search_knowledge_pages runs no reranker either way).
     score = f"ts_rank_cd({a}.search_vector, to_tsquery('english', {p}))"
     return KnowledgeBm25Arm(
-        score_expr=score,
         order_by=f"{score} DESC",
         match_filter=f"AND {a}.search_vector @@ to_tsquery('english', {p})",
     )
@@ -318,6 +364,8 @@ class PostgreSQLDialect(SQLDialect):
         bm25_language: str = "english",
         bm25_min_score: float = 0.0,
         pg_search_function_schema: str = "paradedb",
+        pg_search_tokenizer: str = "",
+        max_query_terms: int = 0,
         extra_where: str = "",
     ) -> str:
         # Whether the branch's own WHERE enforces ``bm25_min_score``. Branches that
@@ -366,16 +414,15 @@ class PostgreSQLDialect(SQLDialect):
             # ParadeDB pg_search: BM25 index over (id, text, context, text_signals)
             # with key_field='id'. The @@@ operator on the key_field requires a
             # field-qualified query (`text:foo`); to keep the bind-parameter form,
-            # we fan the query out across all indexed text fields with paradedb.boolean.
+            # we fan the query out with paradedb.boolean over `text` and
+            # `text_signals` (`context` is left out: it multiplies the postings
+            # scanned for little recall signal — #4313).
             bm25_score_expr = f"{pg_search_function_schema}.score(id)"
             bm25_order_by = f"{pg_search_function_schema}.score(id) DESC"
-            bm25_where_filter = (
-                f"AND id @@@ {pg_search_function_schema}.boolean(should => ARRAY["
-                f"{pg_search_function_schema}.match('text', {text_param}), "
-                f"{pg_search_function_schema}.match('context', {text_param}), "
-                f"{pg_search_function_schema}.match('text_signals', {text_param})"
-                f"])"
+            should = pg_search_should(
+                pg_search_function_schema, ("text", "text_signals"), text_param, pg_search_tokenizer, max_query_terms
             )
+            bm25_where_filter = f"AND id @@@ {pg_search_function_schema}.boolean(should => {should})"
         else:  # native tsvector
             # bm25_language is validated as a PG identifier in HindsightConfig.validate(),
             # so embedding it as a SQL literal here is safe.

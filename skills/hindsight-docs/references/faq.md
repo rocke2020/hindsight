@@ -89,7 +89,9 @@ Browse all supported integrations in the Integrations Hub.
 - OpenRouter
 - Requesty
 - OpenAI Codex
+- ChatGPT
 - Claude Code
+- Cursor
 - GitHub Copilot
 - AWS Bedrock
 - Fireworks AI

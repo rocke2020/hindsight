@@ -100,7 +100,7 @@ results = await asyncio.gather(*tasks, return_exceptions=True)
 
 ### Bank/Tenant Isolation in Queries
 - **Bank isolation is a hard security invariant: no query may read, count, update, or delete another bank's rows.** Tenant isolation is enforced at the schema level (the resolved `search_path` / `fq_table(...)` qualifier, gated by `_authenticate_tenant`); bank isolation is enforced *within* a schema by a `bank_id` predicate on every statement that touches a multi-bank table.
-- **Every SQL statement against a multi-bank table must be constrained by `bank_id`** — directly in the `WHERE`, or transitively (see below). Multi-bank tables carry a `bank_id` column: `memory_units`, `documents`, `entities`, `entity_links`, `mental_models`, `knowledge_pages`, `memory_links`, `observation_history`, and similar.
+- **Every SQL statement against a multi-bank table must be constrained by `bank_id`** — directly in the `WHERE`, or transitively (see below). Multi-bank tables carry a `bank_id` column: `memory_units`, `documents`, `entities`, `mental_models`, `knowledge_pages`, `memory_links`, `observation_history`, and similar.
 - **The trap: filtering by a caller-supplied, non-globally-unique key without `bank_id`.** Keys like `document_id` and `mental_models.id` are unique only *per bank* (their PK is composite, e.g. `(id, bank_id)`), so the *same* id legally exists in every bank. A statement like `UPDATE memory_units SET tags = $1 WHERE document_id = $2` — no `bank_id` — silently reads/writes **every** bank's rows that share the id. This is the exact defect from #3429/#3430. Adding `AND bank_id = $n` fixes it.
 - **Three ways a statement is legitimately scoped** (accept these; flag anything that fits none):
   1. **Explicit** `WHERE ... AND bank_id = $n`.
@@ -150,6 +150,11 @@ than one thread needs a guard, and must never be iterated while another thread m
 mutate it (`RuntimeError: dictionary changed size during iteration` at best; a C
 extension handed borrowed references into a resizing dict can segfault). Prefer
 warm-once-under-a-lock over locking the hot path.
+
+### Documentation Code Examples
+- **Every code example in `hindsight-docs/docs/` that calls Hindsight must come from a tested example file, never an inline fenced block.** That means SDK calls (Python, Node.js, Go), `hindsight ...` CLI commands, and `curl` against `/v1/...`. Put the code in `hindsight-docs/examples/api/<page>.{py,mjs,sh,go}` between `# [docs:<section>]` / `# [/docs:<section>]` markers (`//` in JS/Go), and show it with `<CodeSnippet code={...} section="<section>" language="..." />` (see `docs/developer/api/memory-banks.mdx`). CI runs every example file against a live server (`scripts/test-doc-examples.sh`), so a renamed method or flag breaks the build instead of silently breaking the docs.
+- Give tabs for every language whose SDK or CLI supports the call, like the sibling sections on the page. A `.md` page that needs a snippet becomes `.mdx`.
+- Fine to leave inline: install commands, env/config snippets, endpoint signature lines (`GET /v1/...`), JSON request/response shapes, and commands that need infra CI can't run (embedded server startup, admin DB commands, FUSE mounts).
 
 ### Branch Hygiene
 - **Always start new feature branches from `origin/main`** — rebase to ensure a clean base.
@@ -323,7 +328,7 @@ For each changed handler in `hindsight-api-slim/hindsight_api/api/` (e.g. `http.
 
 For **every SQL statement added or changed** in the diff (grep the diff for `conn.fetch`, `conn.fetchrow`, `conn.fetchval`, `conn.execute`, `executemany`, and any raw `SELECT`/`INSERT`/`UPDATE`/`DELETE` f-strings, including multi-line ones), verify it cannot touch another bank's rows — see **Bank/Tenant Isolation in Queries** above.
 
-For each statement against a multi-bank table (`memory_units`, `documents`, `entities`, `entity_links`, `mental_models`, `knowledge_pages`, `memory_links`, `observation_history`, …), confirm it is scoped by one of the three legitimate mechanisms:
+For each statement against a multi-bank table (`memory_units`, `documents`, `entities`, `mental_models`, `knowledge_pages`, `memory_links`, `observation_history`, …), confirm it is scoped by one of the three legitimate mechanisms:
 1. explicit `AND bank_id = $n`;
 2. a globally-unique single-column PK (`*.id` uuid, or the bank-encoded `chunks.chunk_id`) — **not** a composite-PK id like `documents.id`/`document_id` or `mental_models.id`;
 3. transitively, through a globally-unique id set that was itself selected from a bank-scoped query in the same call.
@@ -418,7 +423,7 @@ If a migration adds a new PostgreSQL table (look for `CREATE TABLE` / `op.create
 If the diff adds a new configuration field (a new `ENV_*` / `HINDSIGHT_*` env var
 in `hindsight-api-slim/hindsight_api/config.py`):
 - **`.env.example`** (repo root) — must add the variable (commented if optional)
-  alongside the docs entry in `hindsight-docs/docs/developer/configuration.md`.
+  alongside the docs entry in `hindsight-docs/docs/developer/configuration.mdx`.
   A flag added to `config.py` but absent from `.env.example` is a **should fix**.
 - **`hindsight-embed/hindsight_embed/env.example`** — the bundled copy must stay
   byte-identical to the repo-root `.env.example` (it seeds embed/profile configs).
@@ -455,6 +460,12 @@ Any new httpx use or sync HTTP call in production code is a **must fix** — see
 SDK client where an async one exists, a sync call pushed into `to_thread` /
 `run_in_executor`, an `aiohttp.ClientSession` created outside `LoopLocalSession`, and any
 `# noqa: TID251` that is not configuring or classifying a third-party SDK.
+
+### 11g. Check docs code examples come from tested snippets
+
+If the diff touches `hindsight-docs/docs/**`, look for new or changed fenced blocks (```` ```python ````, ```` ```bash ````, ```` ```typescript ````, ```` ```go ````, …) that call Hindsight: SDK client methods, `hindsight <cmd>` CLI commands, or `curl` to `/v1/...`. Each must be a `<CodeSnippet>` backed by a section in `hindsight-docs/examples/api/` (see Documentation Code Examples). Also check the example file actually exercises the call (not just prints it) and cleans up its banks. Flag an inline API example as a **must fix**.
+
+The live `/developer/...` URLs serve the latest snapshot in `hindsight-docs/versioned_docs/version-<latest>/`, not `docs/` (that is `/developer/next/`); a release syncs `docs/` into it. A docs fix meant to be live before the next release must be copied into that snapshot too.
 
 ### 11d. Check concurrency primitives
 
@@ -516,6 +527,7 @@ Present a clear summary organized by severity:
   harness, dialect, provider or language variant that skips a lifecycle step the others perform
 - An `asyncio` lock/semaphore/event created at import time or owned by a process-wide
   singleton, or a `threading.Lock` held across an `await` (see step 11d)
+- An inline docs code example that calls Hindsight (SDK, CLI, or `curl /v1/...`) instead of a `<CodeSnippet>` from a tested `hindsight-docs/examples/api/` file (see step 11g)
 - A change that works on only some of the supported interpreters, 3.11 through 3.14
   (see Supported interpreters)
 

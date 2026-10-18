@@ -59,9 +59,15 @@ import type {
   AsyncOperationSubmitResponse,
   CreateKnowledgePageResponse,
   CreateMentalModelResponse,
+  Base64AttachmentSource,
   DirectiveListResponse,
   DirectiveResponse,
   DocumentResponse,
+  DryRunExtractRequest,
+  DryRunExtractionResult,
+  ExtractedFact,
+  ExtractedFactAttachment,
+  ExtractionChunk,
   KnowledgeNode,
   KnowledgePageBundleResponse,
   KnowledgePageResponse,
@@ -116,16 +122,35 @@ export function retryAfterMs(response: Response | undefined): number | null {
 export async function retryOnCapacity<T extends { response?: Response }>(
   send: () => Promise<T>,
   maxAttempts: number,
-  random: () => number = Math.random
+  random: () => number = Math.random,
+  signal?: AbortSignal
 ): Promise<T> {
+  signal?.throwIfAborted();
   let result = await send();
+  signal?.throwIfAborted();
   for (let attempt = 1; attempt < maxAttempts; attempt++) {
     const status = result.response?.status;
     if (status !== 429 && status !== 503) return result;
     const wait = retryAfterMs(result.response) ?? FALLBACK_BACKOFF_MS * 2 ** (attempt - 1);
     // Full jitter: sleep somewhere in [0, wait] so a synchronised burst spreads out.
-    await new Promise((resolve) => setTimeout(resolve, random() * wait));
+    // A cancelled caller must not wait out Retry-After or start another request.
+    // Clean up on either outcome: successful reads should not accumulate listeners.
+    await new Promise<void>((resolve, reject) => {
+      const onAbort = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        reject(signal?.reason);
+      };
+      const timer = setTimeout(() => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve();
+      }, random() * wait);
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted) onAbort();
+    });
+    signal?.throwIfAborted();
     result = await send();
+    signal?.throwIfAborted();
   }
   return result;
 }
@@ -137,10 +162,12 @@ export interface HindsightClientOptions {
    */
   apiKey?: string;
   /**
-   * Override the default `User-Agent` header. Integrations should set this to
-   * identify themselves (e.g. `"hindsight-ai-sdk/1.2.0"`). Browsers ignore
-   * attempts to set `User-Agent`; this only takes effect in Node.js / Bun /
-   * Deno runtimes. Defaults to `hindsight-client-typescript/<version>`.
+   * Product token placed in front of the client's own in the `User-Agent`
+   * header. Integrations should set this to identify themselves (e.g.
+   * `"hindsight-ai-sdk/1.2.0"` is sent as
+   * `"hindsight-ai-sdk/1.2.0 hindsight-client-typescript/<version>"`). Browsers
+   * ignore attempts to set `User-Agent`; this only takes effect in Node.js /
+   * Bun / Deno runtimes. Defaults to `hindsight-client-typescript/<version>`.
    */
   userAgent?: string;
   /** Optional headers sent with every request. */
@@ -231,6 +258,12 @@ export interface MentalModelTriggerOptions {
   includeChunks?: boolean;
   recallMaxTokens?: number;
   recallChunksMaxTokens?: number;
+  /** Token budget for the refresh's search_observations calls. Omit for the shipped 5000. */
+  reflectSearchObservationsMaxTokens?: number;
+  /** Whether search_observations attaches resolved entity names, which can be over half the tool payload. Omit for enabled. */
+  reflectSearchObservationsIncludeEntities?: boolean;
+  /** How many agent steps a refresh may spend, as a multiple of the server's reflect iteration limit: 'low' halves it, 'mid' keeps it, 'high' doubles it. Omit for 'mid'. */
+  budget?: "low" | "mid" | "high";
   /** JSON Schema for structured output, stored alongside the markdown content. */
   responseSchema?: Record<string, unknown>;
   /** Record how each refresh reached its result under reflect_response.trace. */
@@ -262,6 +295,9 @@ function toTriggerBody(trigger: MentalModelTriggerOptions): MentalModelTriggerIn
     include_chunks: trigger.includeChunks,
     recall_max_tokens: trigger.recallMaxTokens,
     recall_chunks_max_tokens: trigger.recallChunksMaxTokens,
+    reflect_search_observations_max_tokens: trigger.reflectSearchObservationsMaxTokens,
+    reflect_search_observations_include_entities: trigger.reflectSearchObservationsIncludeEntities,
+    budget: trigger.budget,
     response_schema: trigger.responseSchema,
     keep_trace: trigger.keepTrace,
   };
@@ -285,6 +321,25 @@ function warnIfOperationIdDropped(
   }
 }
 
+/**
+ * Tag filter for the knowledge-base tree and search, with recall's semantics: the
+ * server default `tagsMatch` is "any", which also returns untagged pages.
+ */
+export interface KnowledgeTagFilterOptions {
+  tags?: string[];
+  tagsMatch?: "any" | "all" | "any_strict" | "all_strict" | "exact";
+  tagGroups?: Array<TagGroupLeaf | TagGroupAndInput | TagGroupOrInput | TagGroupNotInput>;
+}
+
+function knowledgeTagQuery(options?: KnowledgeTagFilterOptions) {
+  return {
+    ...(options?.tags?.length ? { tags: options.tags } : {}),
+    ...(options?.tagsMatch ? { tags_match: options.tagsMatch } : {}),
+    // A GET carries the boolean tree as one JSON-encoded query param.
+    ...(options?.tagGroups?.length ? { tag_groups: JSON.stringify(options.tagGroups) } : {}),
+  };
+}
+
 export class HindsightClient {
   private client: Client;
   private maxAttempts: number;
@@ -292,7 +347,11 @@ export class HindsightClient {
   constructor(options: HindsightClientOptions) {
     const headers: Record<string, string> = {
       ...options.headers,
-      "User-Agent": options.userAgent ?? DEFAULT_USER_AGENT,
+      // Prefix rather than replace, so the server still learns the client version behind an
+      // integration. Before, a caller's value replaced the default and the version was lost.
+      "User-Agent": options.userAgent
+        ? `${options.userAgent} ${DEFAULT_USER_AGENT}`
+        : DEFAULT_USER_AGENT,
     };
     if (options.apiKey) {
       headers.Authorization = `Bearer ${options.apiKey}`;
@@ -504,7 +563,7 @@ export class HindsightClient {
     query: string,
     options?: {
       types?: string[];
-      /** When recalling raw facts ('world'/'experience') together with 'observation', drop any raw fact a returned observation was consolidated from, so the observation supersedes it (no duplicate content). Disabled by default; no effect unless 'observation' and at least one raw type are both in types. */
+      /** When recalling raw facts ('world'/'experience') together with 'observation', drop any raw fact a returned observation was consolidated from, so the observation supersedes it (no duplicate content). No effect unless 'observation' and at least one raw type are both in types. Omitted: the bank's recall_prefer_observations config decides (false unless configured). */
       preferObservations?: boolean;
       maxTokens?: number;
       budget?: Budget;
@@ -566,7 +625,9 @@ export class HindsightClient {
           },
           signal: options?.signal,
         }),
-      this.maxAttempts
+      this.maxAttempts,
+      Math.random,
+      options?.signal
     );
 
     return this.validateResponse(response, "recall");
@@ -597,6 +658,10 @@ export class HindsightClient {
       excludeMentalModels?: boolean;
       /** Exclude specific mental models by ID from reflection. */
       excludeMentalModelIds?: string[];
+      /** Token budget for the agent's search_observations calls. Omit to use the bank's reflect_default_options, then the shipped default. */
+      reflectSearchObservationsMaxTokens?: number;
+      /** Whether search_observations attaches resolved entity names, which can be over half the tool payload. Omit to use the bank default (enabled). */
+      reflectSearchObservationsIncludeEntities?: boolean;
       /** If true, the response includes a 'based_on' field listing the memories, mental models, and directives used. */
       includeFacts?: boolean;
       /** If true, the response includes a 'trace' field with the tool calls and LLM calls made during reflection (trace.tool_calls / trace.llm_calls). */
@@ -632,11 +697,16 @@ export class HindsightClient {
             fact_types: options?.factTypes,
             exclude_mental_models: options?.excludeMentalModels,
             exclude_mental_model_ids: options?.excludeMentalModelIds,
+            reflect_search_observations_max_tokens: options?.reflectSearchObservationsMaxTokens,
+            reflect_search_observations_include_entities:
+              options?.reflectSearchObservationsIncludeEntities,
             include,
           },
           signal: options?.signal,
         }),
-      this.maxAttempts
+      this.maxAttempts,
+      Math.random,
+      options?.signal
     );
 
     return this.validateResponse(response, "reflect");
@@ -656,6 +726,19 @@ export class HindsightClient {
       state?: "valid" | "invalidated";
       documentId?: string;
       entityId?: string;
+      /**
+       * Time axis to filter and order by. Also drops memories with no value on
+       * that column, so `total` counts only the ones inside the window.
+       */
+      timeField?: "created_at" | "updated_at" | "mentioned_at" | "occurred_start" | "occurred_end";
+      /** ISO-8601, inclusive. */
+      startDate?: string;
+      /** ISO-8601, exclusive. */
+      endDate?: string;
+      /** Filter by the memories' tags. */
+      tags?: string[];
+      /** How `tags` match; the server defaults to "any". */
+      tagsMatch?: "any" | "all" | "any_strict" | "all_strict" | "exact";
       signal?: AbortSignal;
     }
   ): Promise<ListMemoryUnitsResponse> {
@@ -671,6 +754,11 @@ export class HindsightClient {
         state: options?.state,
         document_id: options?.documentId,
         entity_id: options?.entityId,
+        time_field: options?.timeField,
+        start_date: options?.startDate,
+        end_date: options?.endDate,
+        tags: options?.tags,
+        tags_match: options?.tagsMatch,
       },
       signal: options?.signal,
     });
@@ -870,8 +958,11 @@ export class HindsightClient {
       maxObservationsPerScope?: number;
       /** Per-scope observation caps, overriding maxObservationsPerScope. */
       observationScopeLimits?: Record<string, unknown>[];
+      consolidationStrategies?: Record<string, unknown>[];
       /** Consolidate automatically after retain() rather than on demand. */
       enableAutoConsolidation?: boolean;
+      /** When the server has a decision model, let it settle restatements, new facts and chatter before the consolidation LLM call. */
+      consolidationUseDecisionModel?: boolean;
       /** Number of LLM calls to batch during consolidation. */
       consolidationLlmBatchSize?: number;
       /** Concurrent LLM calls during consolidation. */
@@ -884,12 +975,22 @@ export class HindsightClient {
       consolidationSourceFactsMaxTokensPerObservation?: number;
       /** Debounce between mental-model refreshes. */
       mentalModelMinRefreshIntervalSeconds?: number;
+      /** Trigger fields merged over the built-in default for new knowledge pages. */
+      knowledgePageDefaultTrigger?: Record<string, unknown>;
+      /** Default reflect options for this bank, applied whenever a reflect request (or a mental model's trigger) leaves the option unset: reflect_search_observations_max_tokens, reflect_search_observations_include_entities. */
+      reflectDefaultOptions?: Record<string, unknown>;
+      /** When the server has a decision model, reflect lets it prune the evidence and decide when to stop (fewer LLM calls). False keeps agent turns. */
+      reflectUseDecisionModel?: boolean;
+      /** The same, for knowledge-page refreshes. */
+      mentalModelRefreshUseDecisionModel?: boolean;
       /** Token budget for source facts during reflect. -1 disables. */
       reflectSourceFactsMaxTokens?: number;
       /** Token budget for facts returned by recall. */
       recallMaxTokens?: number;
       /** Include source chunks in recall results. */
       recallIncludeChunks?: boolean;
+      /** Default prefer_observations for recall requests that omit it. */
+      recallPreferObservations?: boolean;
       /** Token budget for those chunks. */
       recallChunksMaxTokens?: number;
       /** How the per-query result budget is derived: 'fixed' or 'adaptive'. */
@@ -965,8 +1066,12 @@ export class HindsightClient {
       updates.max_observations_per_scope = options.maxObservationsPerScope;
     if (options.observationScopeLimits !== undefined)
       updates.observation_scope_limits = options.observationScopeLimits;
+    if (options.consolidationStrategies !== undefined)
+      updates.consolidation_strategies = options.consolidationStrategies;
     if (options.enableAutoConsolidation !== undefined)
       updates.enable_auto_consolidation = options.enableAutoConsolidation;
+    if (options.consolidationUseDecisionModel !== undefined)
+      updates.consolidation_use_decision_model = options.consolidationUseDecisionModel;
     if (options.consolidationLlmBatchSize !== undefined)
       updates.consolidation_llm_batch_size = options.consolidationLlmBatchSize;
     if (options.consolidationLlmParallelism !== undefined)
@@ -981,11 +1086,21 @@ export class HindsightClient {
     if (options.mentalModelMinRefreshIntervalSeconds !== undefined)
       updates.mental_model_min_refresh_interval_seconds =
         options.mentalModelMinRefreshIntervalSeconds;
+    if (options.knowledgePageDefaultTrigger !== undefined)
+      updates.knowledge_page_default_trigger = options.knowledgePageDefaultTrigger;
+    if (options.reflectDefaultOptions !== undefined)
+      updates.reflect_default_options = options.reflectDefaultOptions;
+    if (options.reflectUseDecisionModel !== undefined)
+      updates.reflect_use_decision_model = options.reflectUseDecisionModel;
+    if (options.mentalModelRefreshUseDecisionModel !== undefined)
+      updates.mental_model_refresh_use_decision_model = options.mentalModelRefreshUseDecisionModel;
     if (options.reflectSourceFactsMaxTokens !== undefined)
       updates.reflect_source_facts_max_tokens = options.reflectSourceFactsMaxTokens;
     if (options.recallMaxTokens !== undefined) updates.recall_max_tokens = options.recallMaxTokens;
     if (options.recallIncludeChunks !== undefined)
       updates.recall_include_chunks = options.recallIncludeChunks;
+    if (options.recallPreferObservations !== undefined)
+      updates.recall_prefer_observations = options.recallPreferObservations;
     if (options.recallChunksMaxTokens !== undefined)
       updates.recall_chunks_max_tokens = options.recallChunksMaxTokens;
     if (options.recallBudgetFunction !== undefined)
@@ -1263,15 +1378,19 @@ export class HindsightClient {
 
   /**
    * Refresh a mental model to update with current knowledge.
+   *
+   * `mode: "full"` regenerates the content from scratch this once, whatever the
+   * model's trigger mode is; the trigger is not changed.
    */
   async refreshMentalModel(
     bankId: string,
     mentalModelId: string,
-    options?: { signal?: AbortSignal }
+    options?: { mode?: "full"; signal?: AbortSignal }
   ): Promise<AsyncOperationSubmitResponse> {
     const response = await sdk.refreshMentalModel({
       client: this.client,
       path: { bank_id: bankId, mental_model_id: mentalModelId },
+      ...(options?.mode ? { body: { mode: options.mode } } : {}),
       signal: options?.signal,
     });
 
@@ -1394,11 +1513,12 @@ export class HindsightClient {
    */
   async getKnowledgeBaseTree(
     bankId: string,
-    options?: { signal?: AbortSignal }
+    options?: KnowledgeTagFilterOptions & { signal?: AbortSignal }
   ): Promise<KnowledgeTreeResponse> {
     const response = await sdk.getKnowledgeBaseTree({
       client: this.client,
       path: { bank_id: bankId },
+      query: knowledgeTagQuery(options),
       signal: options?.signal,
     });
 
@@ -1490,7 +1610,7 @@ export class HindsightClient {
   async searchKnowledgeBase(
     bankId: string,
     query: string,
-    options?: { limit?: number; signal?: AbortSignal }
+    options?: KnowledgeTagFilterOptions & { limit?: number; signal?: AbortSignal }
   ): Promise<KnowledgePageSearchResponse> {
     const response = await sdk.searchKnowledgeBase({
       client: this.client,
@@ -1498,6 +1618,7 @@ export class HindsightClient {
       query: {
         q: query,
         ...(options?.limit !== undefined ? { limit: options.limit } : {}),
+        ...knowledgeTagQuery(options),
       },
       signal: options?.signal,
     });
@@ -1604,12 +1725,31 @@ export class HindsightClient {
    */
   async listDocuments(
     bankId: string,
-    options?: { limit?: number; offset?: number; signal?: AbortSignal }
+    options?: {
+      /** Case-insensitive substring match on document ID or text (unindexed; for browsing). */
+      q?: string;
+      limit?: number;
+      offset?: number;
+      /** Time axis to filter and order by; `updated_at` is the default ordering. */
+      timeField?: "created_at" | "updated_at";
+      /** ISO-8601, inclusive. */
+      startDate?: string;
+      /** ISO-8601, exclusive. */
+      endDate?: string;
+      signal?: AbortSignal;
+    }
   ): Promise<ListDocumentsResponse> {
     const response = await sdk.listDocuments({
       client: this.client,
       path: { bank_id: bankId },
-      query: { limit: options?.limit, offset: options?.offset },
+      query: {
+        q: options?.q,
+        limit: options?.limit,
+        offset: options?.offset,
+        time_field: options?.timeField,
+        start_date: options?.startDate,
+        end_date: options?.endDate,
+      },
       signal: options?.signal,
     });
 
@@ -1690,18 +1830,176 @@ export class HindsightClient {
       signal: options?.signal,
     });
     const submission = this.validateResponse(submitResponse, "exportDocuments");
-    const operationId = submission.operation_id;
+    return this.downloadOperationArchive(bankId, submission.operation_id, options);
+  }
 
+  /**
+   * Export a whole bank as a transfer ZIP archive (blocking convenience).
+   *
+   * Three flags decide what the archive carries. `includeData` covers the memories
+   * and everything backing them (documents, facts, observations, attachments and
+   * their bytes, the curation archive, the operations log and the maintenance
+   * queues); `includeBankConfig` the bank's own config, mental models and their
+   * history, knowledge pages, directives and webhooks; `includeHistory` the audit
+   * and LLM-request logs. Embeddings never travel — the importing instance
+   * regenerates them, which is what makes an archive portable.
+   *
+   * @throws {HindsightError} if the export fails, times out, or completes without an archive.
+   */
+  async exportBank(
+    bankId: string,
+    options?: {
+      includeData?: boolean;
+      includeBankConfig?: boolean;
+      includeHistory?: boolean;
+      /** Milliseconds between operation-status polls (default 2000). */
+      pollIntervalMs?: number;
+      /** Maximum milliseconds to wait for the export to finish (default 300000). */
+      timeoutMs?: number;
+      signal?: AbortSignal;
+    }
+  ): Promise<Uint8Array> {
+    const submitResponse = await sdk.exportBankTransfer({
+      client: this.client,
+      path: { bank_id: bankId },
+      query: {
+        ...(options?.includeData !== undefined ? { include_data: options.includeData } : {}),
+        ...(options?.includeBankConfig !== undefined
+          ? { include_bank_config: options.includeBankConfig }
+          : {}),
+        ...(options?.includeHistory !== undefined
+          ? { include_history: options.includeHistory }
+          : {}),
+      },
+      signal: options?.signal,
+    });
+    const submission = this.validateResponse(submitResponse, "exportBankTransfer");
+    return this.downloadOperationArchive(bankId, submission.operation_id, options);
+  }
+
+  /**
+   * Restore a bank archive into a fresh bank, and resolve with the operation id.
+   *
+   * The restore runs in the background (facts are re-embedded and entities
+   * re-resolved); poll `sdk.getOperationStatus` for its progress and counts.
+   *
+   * `targetBankId` must NOT already exist — this restores a whole bank rather than
+   * merging into one. `bankId` is simply the bank the operation is recorded
+   * against, because the target does not exist yet. To fold an archive's documents
+   * into an existing bank instead, use `sdk.importDocuments`.
+   */
+  async importBank(
+    bankId: string,
+    archive: Blob | File,
+    options?: {
+      targetBankId?: string;
+      includeData?: boolean;
+      includeBankConfig?: boolean;
+      includeHistory?: boolean;
+      signal?: AbortSignal;
+    }
+  ): Promise<string> {
+    const response = await sdk.importBankTransfer({
+      client: this.client,
+      path: { bank_id: bankId },
+      query: {
+        ...(options?.targetBankId !== undefined ? { target_bank_id: options.targetBankId } : {}),
+        ...(options?.includeData !== undefined ? { include_data: options.includeData } : {}),
+        ...(options?.includeBankConfig !== undefined
+          ? { include_bank_config: options.includeBankConfig }
+          : {}),
+        ...(options?.includeHistory !== undefined
+          ? { include_history: options.includeHistory }
+          : {}),
+      },
+      body: { file: archive },
+      signal: options?.signal,
+    });
+    const submission = this.validateResponse(response, "importBankTransfer");
+    return submission.operation_id;
+  }
+
+  /**
+   * Copy a bank into a new one, and resolve with the clone operation's id.
+   *
+   * The clone starts with the source's memories as they are at clone time and
+   * evolves independently from then on. It runs server-side as the export and
+   * import back to back, so no archive travels over the wire and no LLM is called;
+   * poll `sdk.getOperationStatus` for progress and the per-component counts.
+   *
+   * `targetBankId` must NOT already exist. Note that webhooks travel with
+   * `includeBankConfig`: a clone made with the defaults will call the source's
+   * webhook endpoints.
+   */
+  async cloneBank(
+    bankId: string,
+    targetBankId: string,
+    options?: {
+      includeData?: boolean;
+      includeBankConfig?: boolean;
+      includeHistory?: boolean;
+      signal?: AbortSignal;
+    }
+  ): Promise<string> {
+    const response = await sdk.cloneBank({
+      client: this.client,
+      path: { bank_id: bankId },
+      query: {
+        target_bank_id: targetBankId,
+        ...(options?.includeData !== undefined ? { include_data: options.includeData } : {}),
+        ...(options?.includeBankConfig !== undefined
+          ? { include_bank_config: options.includeBankConfig }
+          : {}),
+        ...(options?.includeHistory !== undefined
+          ? { include_history: options.includeHistory }
+          : {}),
+      },
+      signal: options?.signal,
+    });
+    const submission = this.validateResponse(response, "cloneBank");
+    return submission.operation_id;
+  }
+
+  /**
+   * Poll an export operation to completion and download the archive it produced.
+   * Shared by `exportDocuments` and `exportBank` — both submit an operation whose
+   * `result_metadata` names the finished archive.
+   */
+  private async downloadOperationArchive(
+    bankId: string,
+    operationId: string,
+    options?: { pollIntervalMs?: number; timeoutMs?: number; signal?: AbortSignal }
+  ): Promise<Uint8Array> {
     const pollInterval = options?.pollIntervalMs ?? 2000;
     const timeout = options?.timeoutMs ?? 300000;
     const deadline = Date.now() + timeout;
+    const timedOut = () =>
+      new HindsightError(`Export operation ${operationId} did not complete within ${timeout}ms`);
     let resultMetadata: Record<string, unknown> | null | undefined;
     for (;;) {
-      const statusResponse = await sdk.getOperationStatus({
-        client: this.client,
-        path: { bank_id: bankId, operation_id: operationId },
-        signal: options?.signal,
+      // The deadline bounds the in-flight status request and the sleep too, so
+      // a slow poll or a long pollIntervalMs can't overrun it.
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        throw timedOut();
+      }
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const expired = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(timedOut()), remaining);
       });
+      let statusResponse;
+      try {
+        statusResponse = await Promise.race([
+          sdk.getOperationStatus({
+            client: this.client,
+            path: { bank_id: bankId, operation_id: operationId },
+            signal: options?.signal,
+          }),
+          expired,
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
       const status = this.validateResponse(statusResponse, "getOperationStatus");
       if (status.status === "completed") {
         resultMetadata = status.result_metadata;
@@ -1712,10 +2010,12 @@ export class HindsightClient {
           `Export operation ${operationId} ${status.status}: ${status.error_message ?? ""}`
         );
       }
-      if (Date.now() >= deadline) {
-        throw new HindsightError(
-          `Export operation ${operationId} did not complete within ${timeout}ms`
-        );
+      // Sleeping out a budget that can't fit another poll just burns the
+      // remainder, and on a coarse clock it can leave enough slack for a second
+      // poll the caller didn't ask for (the Python wrapper hit exactly that on
+      // Windows, whose timers wake up to ~16ms early).
+      if (deadline - Date.now() <= pollInterval) {
+        throw timedOut();
       }
       await new Promise((resolve) => setTimeout(resolve, pollInterval));
     }
@@ -1724,6 +2024,15 @@ export class HindsightClient {
       ?.download_url;
     if (!downloadUrl) {
       throw new HindsightError(`Export operation ${operationId} completed without a download_url`);
+    }
+    if (/^https?:\/\//i.test(downloadUrl)) {
+      // Signed object-store URLs need their own request: the API client prefixes
+      // its base URL and forwards Hindsight credentials to every request.
+      const response = await fetch(downloadUrl, { signal: options?.signal });
+      if (!response.ok) {
+        throw new HindsightError(`downloadFile failed: HTTP ${response.status}`, response.status);
+      }
+      return new Uint8Array(await response.arrayBuffer());
     }
     // Fetch the server-provided download_url directly (it carries the raw,
     // slash-bearing storage key). Going through the templated `downloadFile`
@@ -1785,6 +2094,10 @@ export function recallResponseToPromptString(response: RecallResponse): string {
 
 // Re-export types for convenience
 export type {
+  Base64AttachmentSource,
+  TextContentBlock,
+  ImageContentBlock,
+  FileContentBlock,
   RetainRequest,
   RetainResponse,
   RecallRequest,
@@ -1815,6 +2128,11 @@ export type {
   DirectiveListResponse,
   DirectiveResponse,
   DocumentResponse,
+  DryRunExtractRequest,
+  DryRunExtractionResult,
+  ExtractedFact,
+  ExtractedFactAttachment,
+  ExtractionChunk,
   KnowledgeNode,
   KnowledgePageBundleResponse,
   KnowledgePageResponse,

@@ -2,13 +2,14 @@
 LLM wrapper for unified configuration across providers.
 """
 
+import importlib.util
 import json
 import logging
 import re
 import time
 import uuid
 from contextlib import AsyncExitStack, asynccontextmanager
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Union
 
 from json_repair import repair_json
 from pydantic import BaseModel
@@ -16,36 +17,38 @@ from pydantic import BaseModel
 from .._cross_loop import CrossLoopSemaphore
 from .response_models import LLMCallResult
 
-# Vertex AI imports (conditional - for LLMProvider to pass credentials to GeminiLLM)
+# Vertex AI credentials (for LLMProvider to pass to GeminiLLM). Only checked for
+# here; google-auth is imported where a key is actually loaded, not on every start.
 try:
-    from google.oauth2 import service_account
-
-    VERTEXAI_AVAILABLE = True
-except ImportError:
+    VERTEXAI_AVAILABLE = importlib.util.find_spec("google.oauth2") is not None
+except ModuleNotFoundError:  # no `google` namespace package at all
     VERTEXAI_AVAILABLE = False
 
 from ..config import (
     ENV_CONSOLIDATION_LLM_MAX_CONCURRENT,
+    ENV_MENTAL_MODEL_REFRESH_LLM_MAX_CONCURRENT,
     ENV_REFLECT_LLM_MAX_CONCURRENT,
     ENV_RETAIN_LLM_MAX_CONCURRENT,
     _get_raw_config,
 )
+
+# Re-exported: this module is where callers have always imported it from.
+from ..provider_auth import requires_api_key as requires_api_key
 from .cache_affinity import parse_cache_affinity
 from .llm_interface import (
     LLM_TOOL_CHOICE_AUTO,
     LLMInterface,
     LLMToolChoice,
     LLMToolChoiceMode,
+    PromptCachePrefix,
 )
 from .llm_interface import (
     OutputTooLongError as OutputTooLongError,
 )
 from .llm_transport import configure_http_logging
 
-# Re-exported: this module is where callers have always imported it from.
-from .provider_auth import requires_api_key as requires_api_key
-
 if TYPE_CHECKING:
+    from .multi_llm import MultiLLMProvider
     from .response_models import LLMToolCallResult
 
 logger = logging.getLogger(__name__)
@@ -84,6 +87,11 @@ def _build_per_op_semaphores() -> dict[str, CrossLoopSemaphore]:
         ("retain", ENV_RETAIN_LLM_MAX_CONCURRENT, config.retain_llm_max_concurrent),
         ("reflect", ENV_REFLECT_LLM_MAX_CONCURRENT, config.reflect_llm_max_concurrent),
         ("consolidation", ENV_CONSOLIDATION_LLM_MAX_CONCURRENT, config.consolidation_llm_max_concurrent),
+        (
+            "mental_model_refresh",
+            ENV_MENTAL_MODEL_REFRESH_LLM_MAX_CONCURRENT,
+            config.mental_model_refresh_llm_max_concurrent,
+        ),
     ):
         # None is "unset" (config maps an absent or empty value onto it); the env name is
         # carried alongside purely so the error names the knob the operator actually set.
@@ -97,14 +105,27 @@ def _build_per_op_semaphores() -> dict[str, CrossLoopSemaphore]:
 
 _per_op_llm_semaphores: dict[str, CrossLoopSemaphore] = _build_per_op_semaphores()
 
+# Operation labels (and call scopes) of the automatic mental-model refresh: the reflect
+# pass itself, its dry run, and the structured delta/retraction ops that follow it.
+_MENTAL_MODEL_REFRESH_SCOPES = (
+    "refresh_mental_model",
+    "dry_run_refresh_mental_model",
+    "mental_model_delta_ops",
+)
+
 
 def _scope_to_operation(scope: str) -> str | None:
     """Map a call scope to its per-operation concurrency bucket.
 
     Returns None for scopes that don't belong to a tracked operation
-    (verification probes, bank_mission, memory_think, mental_model_delta_ops),
-    which then run under the global cap only.
+    (verification probes, bank_mission, memory_think), which then run under the
+    global cap only.
     """
+    # The background mental-model refresh, its dry run and its delta ops form one
+    # bucket, separate from interactive reflect: capping it is how an operator stops
+    # the background job from starving the interactive path (issue #4463).
+    if scope.startswith(_MENTAL_MODEL_REFRESH_SCOPES):
+        return "mental_model_refresh"
     if scope.startswith("retain"):
         return "retain"
     if scope.startswith("reflect"):
@@ -117,10 +138,19 @@ def _scope_to_operation(scope: str) -> str | None:
 def _semaphores_for_scope(scope: str) -> list[CrossLoopSemaphore]:
     """Return the semaphores a call with the given scope must acquire.
 
-    Always includes the global semaphore; includes the per-op semaphore when
-    one is configured for the scope's operation bucket.
+    Always includes the global semaphore; includes the per-op semaphore when one
+    is configured for the call's bucket — the refresh bucket when the call runs
+    under a refresh operation, otherwise the bucket of its scope.
     """
+    from .llm_trace import current_trace_context
+
+    # The refresh runs the reflect agent, whose calls are scoped reflect/
+    # reflect_tool_call/final_rewrite/...: classify by the operation the call runs
+    # under first, or those calls would land in the interactive reflect bucket (#5027).
+    trace_ctx = current_trace_context()
     op = _scope_to_operation(scope)
+    if trace_ctx is not None and trace_ctx.operation and trace_ctx.operation.startswith(_MENTAL_MODEL_REFRESH_SCOPES):
+        op = "mental_model_refresh"
     per_op = _per_op_llm_semaphores.get(op) if op is not None else None
     if per_op is None:
         return [_global_llm_semaphore]
@@ -508,21 +538,8 @@ def create_llm_provider(
     """
     ollama_num_ctx = _validate_ollama_num_ctx(ollama_num_ctx)
 
-    from .providers import (
-        AnthropicLLM,
-        ClaudeCodeLLM,
-        CodexLLM,
-        FireworksLLM,
-        GeminiLLM,
-        GitHubCopilotLLM,
-        LiteLLMLLM,
-        LiteLLMRouterLLM,
-        LlamaCppLLM,
-        MockLLM,
-        NoneLLM,
-        OpenAICompatibleLLM,
-        OpenAIResponsesLLM,
-    )
+    # Each provider (and its SDK) loads only when chosen; see providers/__init__.py.
+    from . import providers
 
     provider_lower = provider.lower()
     if provider_lower == "gemini":
@@ -533,7 +550,7 @@ def create_llm_provider(
         gemini_service_tier = None
 
     if provider_lower == "openai-codex":
-        return CodexLLM(
+        return providers.CodexLLM(
             provider=provider,
             api_key=api_key,
             base_url=base_url,
@@ -544,8 +561,18 @@ def create_llm_provider(
             timeout=timeout,
         )
 
+    elif provider_lower == "cursor":
+        return providers.CursorLLM(
+            provider=provider,
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            timeout=timeout,
+        )
+
     elif provider_lower == "claude-code":
-        return ClaudeCodeLLM(
+        return providers.ClaudeCodeLLM(
             provider=provider,
             api_key=api_key,
             base_url=base_url,
@@ -554,7 +581,7 @@ def create_llm_provider(
         )
 
     elif provider_lower == "github-copilot":
-        return GitHubCopilotLLM(
+        return providers.GitHubCopilotLLM(
             provider=provider,
             api_key=api_key,
             base_url=base_url,
@@ -564,7 +591,7 @@ def create_llm_provider(
         )
 
     elif provider_lower == "mock":
-        return MockLLM(
+        return providers.MockLLM(
             provider=provider,
             api_key=api_key,
             base_url=base_url,
@@ -573,7 +600,7 @@ def create_llm_provider(
         )
 
     elif provider_lower == "none":
-        return NoneLLM(
+        return providers.NoneLLM(
             provider=provider,
             api_key=api_key,
             base_url=base_url,
@@ -582,7 +609,7 @@ def create_llm_provider(
         )
 
     elif provider_lower in ("gemini", "vertexai"):
-        return GeminiLLM(
+        return providers.GeminiLLM(
             provider=provider,
             api_key=api_key,
             base_url=base_url,
@@ -599,7 +626,7 @@ def create_llm_provider(
         )
 
     elif provider_lower == "anthropic":
-        return AnthropicLLM(
+        return providers.AnthropicLLM(
             provider=provider,
             api_key=api_key,
             base_url=base_url,
@@ -611,7 +638,7 @@ def create_llm_provider(
         )
 
     elif provider_lower == "litellm":
-        return LiteLLMLLM(
+        return providers.LiteLLMLLM(
             provider=provider,
             api_key=api_key,
             base_url=base_url,
@@ -631,7 +658,7 @@ def create_llm_provider(
                 "to a JSON object accepted by litellm.Router. "
                 "See https://docs.litellm.ai/docs/routing."
             )
-        return LiteLLMRouterLLM(
+        return providers.LiteLLMRouterLLM(
             provider=provider,
             api_key=api_key,
             base_url=base_url,
@@ -647,7 +674,7 @@ def create_llm_provider(
     elif provider_lower == "bedrock":
         # Bedrock is a first-class alias backed by LiteLLM with auto-prefixed model names
         bedrock_model = model if model.startswith("bedrock/") else f"bedrock/{model}"
-        return LiteLLMLLM(
+        return providers.LiteLLMLLM(
             provider=provider,
             api_key=api_key,
             base_url=base_url,
@@ -664,7 +691,7 @@ def create_llm_provider(
         from ..config import get_config
 
         config = get_config()
-        return LlamaCppLLM(
+        return providers.LlamaCppLLM(
             provider=provider,
             api_key=api_key,
             base_url=base_url,
@@ -684,7 +711,7 @@ def create_llm_provider(
         # Fireworks online inference is OpenAI-compatible; FireworksLLM adds the
         # native (non-OpenAI) batch API on top. The existing LiteLLM
         # ``fireworks_ai/...`` online path (provider="litellm") is untouched.
-        return FireworksLLM(
+        return providers.FireworksLLM(
             provider=provider,
             api_key=api_key,
             base_url=base_url,
@@ -733,11 +760,26 @@ def create_llm_provider(
             timeout=timeout,
         )
 
+    elif provider_lower == "chatgpt":
+        # The public Responses API billed to a ChatGPT plan through OpenAI's
+        # Sign in with ChatGPT flow (credentials from `hindsight-admin chatgpt login`).
+        from hindsight_api.engine.providers.chatgpt_llm import ChatGPTLLM
+
+        return ChatGPTLLM(
+            provider=provider,
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            extra_body=extra_body,
+            timeout=timeout,
+        )
+
     elif provider_lower == "openai-responses":
         # OpenAI Responses API (/v1/responses). Unlike chat/completions, it
         # supports reasoning + function tools together, so reflect's tool loop
         # can run with a real reasoning_effort. See OpenAIResponsesLLM.
-        return OpenAIResponsesLLM(
+        return providers.OpenAIResponsesLLM(
             provider=provider,
             api_key=api_key,
             base_url=base_url,
@@ -765,7 +807,7 @@ def create_llm_provider(
         "atlas",
         "meta",
     ):
-        return OpenAICompatibleLLM(
+        return providers.OpenAICompatibleLLM(
             provider=provider,
             api_key=api_key,
             base_url=base_url,
@@ -943,7 +985,9 @@ class LLMProvider:
             "llamacpp",
             "vertexai",
             "openai-codex",
+            "chatgpt",
             "claude-code",
+            "cursor",
             "github-copilot",
             "mock",
             "none",
@@ -1017,6 +1061,8 @@ class LLMProvider:
                         "Vertex AI service account auth requires 'google-auth' package. "
                         "Install with: pip install google-auth"
                     )
+                from google.oauth2 import service_account
+
                 vertexai_credentials = service_account.Credentials.from_service_account_file(
                     service_account_key,
                     scopes=["https://www.googleapis.com/auth/cloud-platform"],
@@ -1160,6 +1206,22 @@ class LLMProvider:
             return None
         return self._provider_impl
 
+    async def _cached_prefix_for(self, prompt_cache: PromptCachePrefix) -> str | None:
+        """This provider's cache handle for ``prompt_cache``, or None to call uncached.
+
+        Caching is a soft optimisation: a cache-side error never blocks the call.
+        """
+        if not self._provider_impl.supports_prompt_caching():
+            return None
+        try:
+            return await self._provider_impl.get_or_create_cached_prefix(
+                system_instruction=prompt_cache.system_instruction,
+                response_schema=prompt_cache.response_schema,
+            )
+        except Exception:
+            logger.exception("Cache prefix lookup failed; falling back to uncached call")
+            return None
+
     async def call(
         self,
         messages: list[dict[str, str]],
@@ -1172,7 +1234,48 @@ class LLMProvider:
         max_backoff: float | None = None,
         skip_validation: bool = False,
         strict_schema: bool | None = None,
-        cached_prefix: str | None = None,
+        prompt_cache: PromptCachePrefix | None = None,
+    ) -> LLMCallResult:
+        """Make an LLM API call with retry logic — see ``_call`` for the arguments.
+
+        An installed LLM request extension decides first how the call is sent: its
+        credentials, or a different LLM altogether, which then runs the call in this
+        one's place. Decided before anything else so a refused call creates nothing
+        (e.g. a provider-side prompt cache) on the way to being refused.
+        """
+        from ..extensions.llm_request import bind_llm_request
+
+        bound = await bind_llm_request(self)
+        try:
+            return await (bound.llm or self)._call(
+                messages=messages,
+                response_format=response_format,
+                max_completion_tokens=max_completion_tokens,
+                temperature=temperature,
+                scope=scope,
+                max_retries=max_retries,
+                initial_backoff=initial_backoff,
+                max_backoff=max_backoff,
+                skip_validation=skip_validation,
+                strict_schema=strict_schema,
+                prompt_cache=prompt_cache,
+            )
+        finally:
+            bound.reset()
+
+    async def _call(
+        self,
+        messages: list[dict[str, str]],
+        response_format: Any | None = None,
+        max_completion_tokens: int | None = None,
+        temperature: float | None = None,
+        scope: str = "memory",
+        max_retries: int | None = None,
+        initial_backoff: float | None = None,
+        max_backoff: float | None = None,
+        skip_validation: bool = False,
+        strict_schema: bool | None = None,
+        prompt_cache: PromptCachePrefix | None = None,
     ) -> LLMCallResult:
         """
         Make an LLM API call with retry logic.
@@ -1195,6 +1298,9 @@ class LLMProvider:
                 inherits the server-level HINDSIGHT_API_LLM_STRICT_SCHEMA flag; an explicit
                 True or False wins over it, so a caller can force strict output on -- or off --
                 for its own scope. Providers without a strict mode ignore it.
+            prompt_cache: The cacheable prompt prefix, or None. Resolved to a cache
+                handle by THIS provider, so each member of a multi-LLM chain uses its
+                own. Providers without explicit caching ignore it.
 
         Returns:
 
@@ -1272,6 +1378,7 @@ class LLMProvider:
         # hand so the error path below can attach it if parsing/validation fails.
         usage_token = set_response_usage(None)
         try:
+            cached_prefix = await self._cached_prefix_for(prompt_cache) if prompt_cache is not None else None
             # Providers that own retry loops acquire the shared permits for each
             # upstream attempt so backoff never occupies request capacity.
             attempt_gated = self._provider_impl.supports_attempt_scoped_concurrency()
@@ -1320,6 +1427,7 @@ class LLMProvider:
                         input_tokens=usage.input_tokens if usage else 0,
                         output_tokens=usage.output_tokens if usage else 0,
                         cached_tokens=usage.cached_tokens if usage else 0,
+                        thoughts_tokens=usage.thoughts_tokens if usage else 0,
                         duration=time.monotonic() - call_start,
                         error=e,
                     )
@@ -1344,6 +1452,47 @@ class LLMProvider:
         return sanitize_value(result)
 
     async def call_with_tools(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        max_completion_tokens: int | None = None,
+        temperature: float | None = None,
+        scope: str = "tools",
+        max_retries: int | None = None,
+        initial_backoff: float | None = None,
+        max_backoff: float | None = None,
+        tool_choice: LLMToolChoice = LLM_TOOL_CHOICE_AUTO,
+        cached_prefix: str | None = None,
+        cached_prefix_message_count: int = 0,
+    ) -> "LLMToolCallResult":
+        """Make an LLM call with tool calling — see ``_call_with_tools`` for the arguments.
+
+        Like ``call``, an installed LLM request extension decides first how it is sent.
+        """
+        from ..extensions.llm_request import bind_llm_request
+
+        bound = await bind_llm_request(self)
+        receiver = bound.llm or self
+        try:
+            return await receiver._call_with_tools(
+                messages=messages,
+                tools=tools,
+                max_completion_tokens=max_completion_tokens,
+                temperature=temperature,
+                scope=scope,
+                max_retries=max_retries,
+                initial_backoff=initial_backoff,
+                max_backoff=max_backoff,
+                tool_choice=tool_choice,
+                # A cache handle belongs to the LLM that created it; another LLM
+                # cannot read it, so a delegated call sends its prefix uncached.
+                cached_prefix=cached_prefix if receiver is self else None,
+                cached_prefix_message_count=cached_prefix_message_count if receiver is self else 0,
+            )
+        finally:
+            bound.reset()
+
+    async def _call_with_tools(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
@@ -1468,6 +1617,7 @@ class LLMProvider:
                         input_tokens=usage.input_tokens if usage else 0,
                         output_tokens=usage.output_tokens if usage else 0,
                         cached_tokens=usage.cached_tokens if usage else 0,
+                        thoughts_tokens=usage.thoughts_tokens if usage else 0,
                         duration=time.monotonic() - call_start,
                         error=e,
                     )
@@ -1711,7 +1861,7 @@ class ConfiguredLLMProvider:
 
     def __init__(
         self,
-        provider: "LLMProvider",
+        provider: "AnyLLMProvider",
         gemini_safety_settings: list | None,
         trace_ctx: Any | None = None,
     ) -> None:
@@ -1805,3 +1955,15 @@ class ConfiguredLLMProvider:
 
 # Backwards compatibility alias
 LLMConfig = LLMProvider
+
+#: Anything a call site can use as "the LLM to call".
+#:
+#: Three unrelated classes are interchangeable here and none subclasses another:
+#: :class:`LLMProvider`, :class:`ConfiguredLLMProvider` (``with_config()``, which delegates every
+#: attribute to the provider it wraps) and ``MultiLLMProvider`` (a fallback chain presenting the
+#: same surface). Annotating a parameter with :class:`LLMProvider` alone therefore rejects two of
+#: the three, and the call sites that pass them are correct code a nominal check reads as wrong.
+#:
+#: Widening only: every existing caller stays valid. A function that genuinely needs the concrete
+#: class -- to reach something the wrappers do not forward -- should keep naming it.
+AnyLLMProvider = Union["LLMProvider", "ConfiguredLLMProvider", "MultiLLMProvider"]

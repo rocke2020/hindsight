@@ -21,6 +21,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from pydantic import BaseModel
 
+from hindsight_api.engine.llm_interface import (
+    LLM_TOOL_CHOICE_AUTO,
+    LLM_TOOL_CHOICE_NONE,
+    LLM_TOOL_CHOICE_REQUIRED,
+    LLMToolChoice,
+)
+
 pytestmark = pytest.mark.asyncio
 
 EPHEMERAL = {"type": "ephemeral"}
@@ -47,7 +54,7 @@ def _text_response(text: str = "ok"):
     block.text = text
     resp = MagicMock()
     resp.content = [block]
-    resp.usage = MagicMock(input_tokens=10, output_tokens=2, cache_read_input_tokens=0)
+    resp.usage = MagicMock(input_tokens=10, output_tokens=2, cache_read_input_tokens=0, cache_creation_input_tokens=0)
     resp.stop_reason = "end_turn"
     return resp
 
@@ -55,7 +62,7 @@ def _text_response(text: str = "ok"):
 def _tool_response():
     resp = MagicMock()
     resp.content = []
-    resp.usage = MagicMock(input_tokens=10, output_tokens=2, cache_read_input_tokens=0)
+    resp.usage = MagicMock(input_tokens=10, output_tokens=2, cache_read_input_tokens=0, cache_creation_input_tokens=0)
     resp.stop_reason = "end_turn"
     return resp
 
@@ -148,6 +155,57 @@ async def test_call_with_tools_marks_system_and_last_message():
     assert messages[0] == {"role": "user", "content": "Question?"}
     assert messages[1] == {"role": "assistant", "content": "Working on it."}
     assert messages[2]["content"] == [{"type": "text", "text": "Latest turn.", "cache_control": EPHEMERAL}]
+
+
+@pytest.mark.parametrize(
+    ("choice", "expected"),
+    [
+        (LLMToolChoice.named("recall"), {"type": "tool", "name": "recall"}),
+        (LLM_TOOL_CHOICE_REQUIRED, {"type": "any"}),
+        (LLM_TOOL_CHOICE_NONE, {"type": "none"}),
+        # auto is Anthropic's default: the field stays off the wire.
+        (LLM_TOOL_CHOICE_AUTO, None),
+    ],
+)
+async def test_call_with_tools_maps_tool_choice_without_narrowing(choice, expected):
+    provider = _make_provider()
+    provider._client.messages.create = AsyncMock(return_value=_tool_response())
+    tools = [
+        {"function": {"name": "recall", "description": "d", "parameters": {"type": "object"}}},
+        {"function": {"name": "done", "description": "d", "parameters": {"type": "object"}}},
+    ]
+
+    with patch("hindsight_api.engine.providers.anthropic_llm.get_metrics_collector"):
+        await provider.call_with_tools(
+            messages=[{"role": "user", "content": "Question?"}],
+            tools=tools,
+            tool_choice=choice,
+            max_retries=0,
+        )
+
+    params = provider._client.messages.create.await_args.kwargs
+    assert params.get("tool_choice") == expected
+    assert [tool["name"] for tool in params["tools"]] == ["recall", "done"]
+
+
+async def test_call_with_tools_rejects_unknown_named_tool():
+    provider = _make_provider()
+
+    with pytest.raises(ValueError, match="exactly one declared tool"):
+        await provider.call_with_tools(
+            messages=[{"role": "user", "content": "Question?"}],
+            tools=[
+                {
+                    "function": {
+                        "name": "recall",
+                        "description": "d",
+                        "parameters": {"type": "object"},
+                    }
+                }
+            ],
+            tool_choice=LLMToolChoice.named("missing"),
+            max_retries=0,
+        )
 
 
 async def test_call_with_tools_marks_last_block_of_tool_result_message():
@@ -246,3 +304,19 @@ async def test_call_with_tools_keeps_empty_tool_result_block():
     assert [m["role"] for m in messages] == ["user", "assistant", "user"]
     assert messages[-1]["content"][0]["type"] == "tool_result"
     assert messages[-1]["content"][0]["content"] == ""
+
+
+def test_usage_counts_cache_reads_and_writes_as_input():
+    """Anthropic reports cache reads/writes apart from input_tokens; usage counts them in it (#5541)."""
+    from types import SimpleNamespace
+
+    from hindsight_api.engine.providers.anthropic_llm import _usage_from_anthropic_response
+
+    response = SimpleNamespace(
+        usage=SimpleNamespace(
+            input_tokens=10, output_tokens=30, cache_read_input_tokens=1000, cache_creation_input_tokens=200
+        )
+    )
+    usage = _usage_from_anthropic_response(response)
+
+    assert (usage.input_tokens, usage.output_tokens, usage.cached_tokens) == (1210, 30, 1000)

@@ -68,15 +68,20 @@ describe("full bank config surface mapping", () => {
   test("maps the consolidation, retain and security groups onto the updates map", async () => {
     await client.updateBankConfig("bank", {
       enableAutoConsolidation: false,
+      consolidationUseDecisionModel: false,
       consolidationLlmBatchSize: 4,
       consolidationLlmParallelism: 2,
       consolidationMaxMemoriesPerRound: 50,
       consolidationSourceFactsMaxTokens: 2048,
       consolidationSourceFactsMaxTokensPerObservation: 128,
       mentalModelMinRefreshIntervalSeconds: 3600,
+      knowledgePageDefaultTrigger: { refresh_cron: "0 * * * *" },
       reflectSourceFactsMaxTokens: 1024,
       maxObservationsPerScope: 25,
       observationScopeLimits: [{ scope: "team", limit: 10 }],
+      consolidationStrategies: [
+        { scopes: [{ tags: ["company:*"] }], observations_mission: "Trends only." },
+      ],
       retainDefaultStrategy: "fast",
       retainStrategies: { fast: { retain_extraction_mode: "concise" } },
       retainChunkBatchSize: 64,
@@ -90,15 +95,20 @@ describe("full bank config surface mapping", () => {
     const body = mockedUpdateConfig.mock.calls[0][0].body as any;
     expect(body.updates).toEqual({
       enable_auto_consolidation: false,
+      consolidation_use_decision_model: false,
       consolidation_llm_batch_size: 4,
       consolidation_llm_parallelism: 2,
       consolidation_max_memories_per_round: 50,
       consolidation_source_facts_max_tokens: 2048,
       consolidation_source_facts_max_tokens_per_observation: 128,
       mental_model_min_refresh_interval_seconds: 3600,
+      knowledge_page_default_trigger: { refresh_cron: "0 * * * *" },
       reflect_source_facts_max_tokens: 1024,
       max_observations_per_scope: 25,
       observation_scope_limits: [{ scope: "team", limit: 10 }],
+      consolidation_strategies: [
+        { scopes: [{ tags: ["company:*"] }], observations_mission: "Trends only." },
+      ],
       retain_default_strategy: "fast",
       retain_strategies: { fast: { retain_extraction_mode: "concise" } },
       retain_chunk_batch_size: 64,

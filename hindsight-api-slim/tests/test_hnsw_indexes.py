@@ -171,7 +171,7 @@ async def test_bank_creation_alone_creates_no_vector_indexes(memory, request_con
     """
     bank_id = f"test_hnsw_empty_{uuid.uuid4().hex[:8]}"
     try:
-        await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+        await memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
 
         indexes = await _get_bank_vector_indexes(memory._pool, bank_id)
         assert indexes == [], f"bank creation must not create vector indexes, got: {indexes}"
@@ -238,7 +238,7 @@ async def test_retain_idempotent_bank_creation(memory, request_context):
 @pytest.mark.asyncio
 async def test_retrieve_semantic_bm25_grouped_by_fact_type(memory, request_context):
     """Combined retrieval groups typed semantic and BM25 candidates by fact type."""
-    from hindsight_api.engine.search.retrieval import retrieve_semantic_bm25_combined_sql
+    from hindsight_api.engine.memories.pg.recall import retrieve_semantic_bm25_combined_sql
 
     bank_id = f"test_retrieval_{uuid.uuid4().hex[:8]}"
     try:
@@ -315,7 +315,7 @@ async def test_fetch_unit_dates_ignores_noncanonical_uuid_inputs(memory, request
 @pytest.mark.asyncio
 async def test_recall_reuses_semantic_pool_for_graph_seeds(memory, request_context, monkeypatch):
     """Default recall must not issue a second ANN query for graph entry points."""
-    from hindsight_api.engine.search import link_expansion_retrieval
+    from hindsight_api.engine.memories.pg import link_expansion
 
     async def fail_find_semantic_seeds(*args, **kwargs):
         raise AssertionError("default recall should reuse the combined semantic candidate pool")
@@ -327,7 +327,7 @@ async def test_recall_reuses_semantic_pool_for_graph_seeds(memory, request_conte
             content="Alice is a software engineer at TechCorp.",
             request_context=request_context,
         )
-        monkeypatch.setattr(link_expansion_retrieval, "_find_semantic_seeds", fail_find_semantic_seeds)
+        monkeypatch.setattr(link_expansion, "_find_semantic_seeds", fail_find_semantic_seeds)
 
         result = await memory.recall_async(
             bank_id=bank_id,
@@ -342,7 +342,7 @@ async def test_recall_reuses_semantic_pool_for_graph_seeds(memory, request_conte
 
 
 @pytest.mark.asyncio
-# Asserts *how* the graph arm seeds — that recall calls link_expansion_retrieval's
+# Asserts *how* the graph arm seeds — that recall calls link_expansion's
 # _find_semantic_seeds — rather than what it returns. A store with its own graph
 # retrieval never goes through that function, so the assertion is specific to the
 # SQL retrieval path.
@@ -350,9 +350,9 @@ async def test_recall_reuses_semantic_pool_for_graph_seeds(memory, request_conte
 async def test_recall_keeps_graph_seed_query_for_stricter_semantic_floor(memory, request_context, monkeypatch):
     """A semantic floor above the graph floor must retain the dedicated seed query."""
     from hindsight_api.engine.response_models import MinScores
-    from hindsight_api.engine.search import link_expansion_retrieval
+    from hindsight_api.engine.memories.pg import link_expansion
 
-    original_find_semantic_seeds = link_expansion_retrieval._find_semantic_seeds
+    original_find_semantic_seeds = link_expansion._find_semantic_seeds
     graph_seed_fact_types: list[str] = []
 
     async def record_find_semantic_seeds(*args, **kwargs):
@@ -366,7 +366,7 @@ async def test_recall_keeps_graph_seed_query_for_stricter_semantic_floor(memory,
             content="Alice is a software engineer at TechCorp.",
             request_context=request_context,
         )
-        monkeypatch.setattr(link_expansion_retrieval, "_find_semantic_seeds", record_find_semantic_seeds)
+        monkeypatch.setattr(link_expansion, "_find_semantic_seeds", record_find_semantic_seeds)
 
         await memory.recall_async(
             bank_id=bank_id,

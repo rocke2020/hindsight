@@ -88,36 +88,45 @@ def memory_unit_columns(alias: str = "", *, indent: int = 0) -> str:
     return (",\n" + " " * indent).join(lines)
 
 
-def document_serialization_sql(table: str, alias: str) -> str:
-    """SQL predicate keeping one document to a single in-flight retain.
+def key_serialization_sql(table: str, alias: str) -> str:
+    """SQL predicate keeping one ``serialization_key`` to a single in-flight run.
 
-    A retain that targets exactly one document carries it in
-    ``serialization_key``. Appending to a document is a read-modify-write over
+    Two kinds of work carry a key. A retain that targets exactly one document
+    carries that document: appending to a document is a read-modify-write over
     its whole text, so two concurrent retains for one document can only produce
-    a lost update or a wasted extraction — never more throughput. This
-    predicate makes the queue reflect that: a candidate is claimable only when
-    no peer for the same document is already ``processing``, and only when it
-    is the oldest claimable pending peer for that document.
+    a lost update or a wasted extraction — never more throughput. A mental-model
+    refresh carries ``mental_model:<id>``: two refreshes of one model both write
+    the model, so the one that finished second used to win regardless of which
+    read more, and in delta mode they moved each other's watermark.
+
+    This predicate makes the queue reflect that: a candidate is claimable only
+    when no peer for the same key is already ``processing``, and only when it is
+    the oldest claimable pending peer for that key. Peers must also share the
+    candidate's ``operation_type``: document ids are caller-supplied, so a key
+    alone cannot keep a document from colliding with a model's refreshes.
 
     Ordering, not just exclusion, is the point. Appends are cumulative, so the
     order they commit in is the order the document ends up in; claiming them by
     ``(created_at, operation_id)`` makes that the submission order. It also
     stops a single claim batch from taking several peers at once, which
-    excluding busy documents alone would not prevent.
+    excluding busy keys alone would not prevent.
 
     Rows with a NULL ``serialization_key`` — multi-document batches, and every
-    non-retain operation — are unaffected, and documents are independent of one
-    another, so this costs no parallelism across a busy bank: only the retains
-    that were racing each other for one document are put in a line.
+    operation whose runs are independent — are unaffected, and keys are
+    independent of one another, so this costs no parallelism across a busy bank:
+    only the operations that were racing each other for one document, or one
+    model, are put in a line.
 
-    A peer wedged in 'processing' holds its document until claim recovery
-    releases it, the same caveat ``bank_serialization_sql`` carries and the same
-    general gap.
+    A peer wedged in 'processing' holds its key until claim recovery releases
+    it, the same caveat ``bank_serialization_sql`` carries and the same general
+    gap.
 
     The candidate row is always 'pending' and the 'pending' branch is
     strictly-older, so the subquery can never match the candidate itself. The
     fragment carries no SQL comments on purpose — it is rewritten for Oracle by
-    regex (``db/oracle.py``).
+    regex (``db/oracle.py``), and the peer alias is left at the ``doc_peer`` it
+    was born with for the same reason: nothing about this text is worth a
+    rewriter surprise.
 
     Args:
         table: Fully-qualified async_operations table.
@@ -128,6 +137,7 @@ def document_serialization_sql(table: str, alias: str) -> str:
             SELECT 1 FROM {table} doc_peer
             WHERE doc_peer.bank_id = {alias}.bank_id
               AND doc_peer.serialization_key = {alias}.serialization_key
+              AND doc_peer.operation_type = {alias}.operation_type
               AND (
                   doc_peer.status = 'processing'
                   OR (doc_peer.status = 'pending'
@@ -416,6 +426,26 @@ class DataAccessOps(ABC):
 
         PG uses INSERT ... SELECT FROM unnest() with RETURNING.
         Non-PG inserts row-by-row with individual RETURNING.
+        """
+        ...
+
+    @abstractmethod
+    async def delete_unit_links(
+        self,
+        conn: DatabaseConnection,
+        table: str,
+        bank_id: str,
+        unit_ids: list,
+        keep_link_types: list[str] | None = None,
+    ) -> None:
+        """Delete the memory_links incident to ``unit_ids`` (except ``keep_link_types``).
+
+        Callers run it before deleting the units themselves: the FK cascade removes a
+        link from whichever endpoint it reaches first, so two transactions deleting
+        units on either end of a bidirectional pair lock the pair in opposite orders
+        and deadlock (#4251). PG locks the links in one total order first — the
+        order ``delete_chunks_by_ids`` uses. Oracle deletes them plainly (see
+        ``prune_stale_cooccurrences`` for that dialect asymmetry).
         """
         ...
 
@@ -904,6 +934,16 @@ class DataAccessOps(ABC):
     # -- Task claiming operations ------------------------------------------
 
     @abstractmethod
+    async def fetch_reconcilable_batch_parents(self, conn: DatabaseConnection, table: str) -> list[ResultRow]:
+        """Find pending payload-less batch parents without unfinished same-bank children.
+
+        A pre-filter for the worker's startup recovery, which rechecks each
+        candidate under a row lock: returning a healthy parent costs one wasted
+        transaction, omitting a stranded one leaves it stranded forever.
+        """
+        ...
+
+    @abstractmethod
     async def prune_terminal_operations(
         self,
         conn: DatabaseConnection,
@@ -937,8 +977,9 @@ class DataAccessOps(ABC):
         Implementations must apply :func:`bank_serialization_sql` to every query
         that can return a ``graph_maintenance`` or ``consolidation`` row, so at
         most one such row per bank is ever in flight, and
-        :func:`document_serialization_sql` to every query that can return a
-        ``retain`` row, so at most one retain per document is ever in flight.
+        :func:`key_serialization_sql` to every query that can return a row
+        carrying a ``serialization_key`` — a single-document retain or a mental
+        model's refresh — so at most one run per key is ever in flight.
 
         The shared pool must additionally be claimed with one row taken for the
         bank after ``bank_cursor`` — deficit round robin with a quantum of one
@@ -1010,6 +1051,6 @@ class DataAccessOps(ABC):
 
     def _get_mu_table(self) -> str:
         """Get the fully-qualified memory_units table name."""
-        from ..schema import fq_table
+        from ..schema import fq_store_table
 
-        return fq_table("memory_units")
+        return fq_store_table("memory_units")

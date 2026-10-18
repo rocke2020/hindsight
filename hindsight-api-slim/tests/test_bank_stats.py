@@ -31,7 +31,7 @@ async def test_bank_id(memory):
     # Create the bank. Bank-scoped reads 404 for a bank nobody created (#4175),
     # so a stats test that only invents an id would exercise that path instead of
     # the empty-bank one it is about.
-    await memory.get_bank_profile(bank_id, request_context=RequestContext())
+    await memory.ensure_bank_profile(bank_id, request_context=RequestContext())
     return bank_id
 
 
@@ -377,7 +377,7 @@ async def test_reflect_uses_freshness_not_bank_stats(memory, test_bank_id):
 
     Counts calls to `_compute_bank_stats` (the heavy loader) during a reflect
     invocation; it must stay at zero — reflect should route through
-    `get_bank_freshness` instead.
+    the freshness read (`_bank_freshness`) instead.
     """
     from hindsight_api.extensions import RequestContext
 

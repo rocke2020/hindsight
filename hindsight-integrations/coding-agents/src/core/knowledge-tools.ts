@@ -15,6 +15,7 @@
  * (core/survey.ts).
  */
 import { z } from "zod";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -54,6 +55,21 @@ const NON_DESTRUCTIVE_WRITE_ANNOTATIONS: ToolSafetyAnnotations = {
   idempotentHint: false,
   openWorldHint: false,
 };
+
+/**
+ * Returned alongside every search result set.
+ *
+ * Phrased as an obligation triggered by the CALL, not by the agent judging that it "used" a page: a
+ * model that paraphrases a snippet into its own prose does not register itself as having quoted
+ * anything, and silently absorbs the memory instead of crediting it.
+ */
+const CREDIT_REMINDER =
+  "Crediting is mandatory, not a judgement call: if anything these results contribute reaches your " +
+  "reply — quoted, paraphrased, or merely confirming what you were going to say — open that part " +
+  'with "> 🧠 **From Hindsight memory (<page>)** — <the specific facts you drew on>". Rewriting a ' +
+  "snippet in your own words does not make it yours. If none of them bear on the turn, ignore them " +
+  "silently — an unhelpful search needs no mention. These are past records: check a claim that " +
+  "something was fixed or works against the code before relying on it.";
 
 export interface ToolSpec {
   name: string;
@@ -109,8 +125,12 @@ export function buildKnowledgeTools(
     reflectTimeoutMs?: number;
     /** Reflect budget for `hindsight_reflect` (cfg.reflectBudget, default "high"). */
     reflectBudget?: "low" | "mid" | "high";
+    /** cfg.toolGuideExtra, added after the crediting note so it lands with the results too. */
+    toolGuideExtra?: string;
   } = {}
 ): ToolSpec[] {
+  const extra = opts.toolGuideExtra?.trim();
+  const crediting = extra ? `${CREDIT_REMINDER} ${extra}` : CREDIT_REMINDER;
   return [
     {
       name: "hindsight_sync_status",
@@ -188,22 +208,38 @@ export function buildKnowledgeTools(
         "hybrid full-text + semantic search, server-side. Call this when the user's question may " +
         "be answered by the project's accumulated knowledge (architecture, conventions, decisions, " +
         "initiatives) rather than by reading code. Returns ranked pages with a relevance snippet; " +
-        "read a full page with hindsight_read_knowledge_page. When a result informs your answer, " +
-        "credit it visibly: start that part with a markdown blockquote header " +
-        '"> 🧠 **From Hindsight memory (<page name>)** — <the facts you drew on>".',
+        // Same sentence the payload carries, from the same constant: two copies of a rule this
+        // fiddly drift apart, and the description is what a host shows when the tool is listed.
+        "read a full page with hindsight_read_knowledge_page. " +
+        crediting,
       inputSchema: { query: z.string().describe("what to look for") },
       annotations: READ_ONLY_ANNOTATIONS,
       handler: async (args: { query: string }) => {
         try {
-          const hits = await client.searchKnowledgePages(args.query, 3);
-          return ok(
-            hits.map((h) => ({
+          // Limit comes from the client (`pageSearchLimit`), so the tool and the hook's injection
+          // can never drift apart — this used to pass its own literal 3.
+          const hits = await client.searchKnowledgePages(args.query);
+          // No `score`. The server fuses BM25 and vector search with reciprocal rank fusion, so the
+          // number is ~1/(60+rank) summed over two retrievers: a perfect top hit scores about 0.03
+          // and nothing ever approaches 1. Handed that, a model reads a strong match as 3% relevant
+          // and discounts it. The hits arrive in rank order, which is the ranking that means
+          // something here.
+          // The reminder rides WITH the hits, not only in the session guide. Measured on real
+          // sessions: the agent searched, got ten on-topic pages, wrote an answer built from them
+          // and credited nothing — then credited correctly the moment the user asked "where did you
+          // see that?". The guide had scrolled far up the context by then; the instruction that
+          // lands at the same moment as the results is the one that can still be acted on.
+          return ok({
+            pages: hits.map((h) => ({
               page: h.name,
               page_id: h.id,
+              // The question the page answers — the same `description` the list and read tools
+              // carry, so a hit says what the page is FOR, not just how it opens.
+              ...(h.source_query ? { description: h.source_query } : {}),
               snippet: h.snippet,
-              score: h.score,
-            }))
-          );
+            })),
+            crediting,
+          });
         } catch (e) {
           return err(e);
         }
@@ -306,11 +342,17 @@ export function buildKnowledgeTools(
       inputSchema: { title: z.string(), content: z.string() },
       annotations: NON_DESTRUCTIVE_WRITE_ANNOTATIONS,
       handler: guarded(async ({ title, content }) => {
+        const slug = title
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, "-")
+          .replace(/^-+|-+$/g, "");
+        // ASCII-only slugs erased non-Latin titles (or shared the "doc" fallback),
+        // overwriting unrelated documents. Hash the original title, not its content,
+        // so re-ingestion still updates it; "--" cannot occur in a legacy slug.
         const docId =
-          title
-            .toLowerCase()
-            .replace(/[^a-z0-9]+/g, "-")
-            .replace(/^-+|-+$/g, "") || "doc";
+          /[^\x00-\x7f]/.test(title) || !slug
+            ? `${slug || "doc"}--${createHash("sha256").update(title).digest("hex")}`
+            : slug;
         const stamp = opts.stampFor?.();
         const metadata = {
           ...stamp?.metadata,

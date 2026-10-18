@@ -8,7 +8,9 @@ import asyncio
 import io
 import json
 import logging
+import os
 import struct
+import uuid
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -19,11 +21,13 @@ import asyncpg
 import typer
 
 from ..config import DEFAULT_DATABASE_SCHEMA, HindsightConfig, load_dotenv_for_entrypoint
-from ..engine.memories import get_memories
+from ..db_url import is_oracle_url
+from ..engine.memories import get_memories, sql_memories
 from ..engine.memory_engine import _current_schema
-from ..engine.retain.bank_utils import _vector_index_clause
+from ..engine.retain.bank_utils import _vector_index_clause, bank_indexes_are_store_owned
 from ..engine.schema import fq_table_explicit as _fq_table
-from ..engine.transfer import export_bank
+from ..engine.storage import bank_storage_prefix, create_file_storage
+from ..engine.transfer import TransferScope, stream_export_bank
 from ..engine.vector_index_health import (
     BankIndexResult,
     drop_orphaned_bank_indexes,
@@ -55,13 +59,12 @@ app = typer.Typer(name="hindsight-admin", help="Hindsight administrative command
 # are intentionally absent — admin backup/restore is PostgreSQL-only.
 BACKUP_TABLES = [
     "banks",
+    # After "banks" for the same reason as "attachments" below: it FKs to it.
+    "bank_aliases",
     # After "banks": attachments references it, so restore's forward COPY needs
     # the parent present, and the reversed TRUNCATE must clear the child first.
     "attachments",
     "documents",
-    # After both of its parents: document_attachments references documents (id, bank_id)
-    # and names a attachments row.
-    "document_attachments",
     "entities",
     "chunks",
     "memory_units",
@@ -342,6 +345,8 @@ async def _backup(
     extension-augmented list from ``_effective_backup_tables()``.
     """
     backup_tables = backup_tables if backup_tables is not None else BACKUP_TABLES
+    # sql_memories(), not get_memories(): backup reads this Postgres schema's own tables, whatever the store.
+    pg_store = sql_memories()
     conn = await asyncpg.connect(database_url)
     try:
         tables: dict[str, Any] = {}
@@ -380,9 +385,9 @@ async def _backup(
                     data = buffer.getvalue()
                     zf.writestr(f"{table}.bin", data)
 
-                    # Get row count for manifest
-                    qualified_table = _fq_table(table, schema)
-                    row_count = await conn.fetchval(f"SELECT COUNT(*) FROM {qualified_table}")
+                    # Get row count for manifest. Through the Postgres store, which alone may
+                    # name its own tables (#4969) — this walks every table of the schema.
+                    row_count = await pg_store.admin_count_rows(conn=conn, schema=schema, table=table)
                     tables[table] = {
                         "rows": row_count,
                         "size_bytes": len(data),
@@ -429,10 +434,13 @@ async def _restore(
             # restored or none are, preventing partial/inconsistent state.
             async with conn.transaction():
                 typer.echo("  Clearing existing data...")
-                # Truncate tables in reverse order (respects FK constraints)
-                for table in reversed(backup_tables):
-                    qualified_table = _fq_table(table, schema)
-                    await conn.execute(f"TRUNCATE TABLE {qualified_table} CASCADE")
+                # Truncate tables in reverse order (respects FK constraints). Through the
+                # Postgres store, which alone may name its own tables (#4969).
+                # sql_memories(), not get_memories(): restore rewrites this Postgres schema's own tables,
+                # whatever the store.
+                await sql_memories().admin_truncate_tables(
+                    conn=conn, schema=schema, tables=list(reversed(backup_tables))
+                )
 
                 # Restore tables in forward order
                 for i, table in enumerate(backup_tables, 1):
@@ -684,6 +692,28 @@ async def _resolve_schemas(base_schema: str | None) -> list[str]:
     return list(dict.fromkeys(schemas))
 
 
+@dataclass
+class RepairSweep:
+    """What one ``repair-bank`` run did, and which schemas it could not do at all.
+
+    A dataclass rather than a second return value: the bank list alone cannot
+    distinguish "nothing needed doing" from "never got there", and the command must
+    exit non-zero for the second.
+
+    ``skipped_schemas`` means "not fully reconciled — re-run once the cause is
+    cleared". A schema that failed partway appears in BOTH lists: the banks it did
+    reconcile are real work that must still be reported (their failed-index names
+    appear nowhere else), and the ones it did not still need the re-run. A schema
+    whose banks were all repaired never appears here, even if the orphan sweep after
+    them failed; that is reported on its own line and left out, because telling an
+    operator to re-run a sweep that already did its work is how a report stops being
+    believed.
+    """
+
+    banks: list[BankIndexResult]
+    skipped_schemas: list[str]
+
+
 async def _run_repair_bank(
     db_url: str,
     *,
@@ -691,7 +721,7 @@ async def _run_repair_bank(
     schema: str | None,
     bank_id: str | None,
     dry_run: bool,
-) -> list[BankIndexResult]:
+) -> RepairSweep:
     """Reconcile per-(bank, fact_type) vector index coverage over a raw connection.
 
     A single autocommit connection is used because ``CREATE INDEX CONCURRENTLY``
@@ -708,24 +738,71 @@ async def _run_repair_bank(
 
     conn = await _admin_connect(db_url)
     results: list[BankIndexResult] = []
+    skipped_schemas: list[str] = []
     try:
         for target_schema in schemas:
+            # The whole schema is inside the guard, not just list_bank_ids. Planning a
+            # bank can now raise — a memories store that cannot say who owns a bank
+            # must not be guessed at, or a transient blip would have the sweep rebuild
+            # every index it failed on (#4615). That is worth failing on, but per
+            # SCHEMA: an unreachable store used to take the whole command down with a
+            # bare traceback from inside a list comprehension, so a deployment whose
+            # admin process cannot reach the store repaired nothing at all, including
+            # the ordinary SQL-owned banks the operator ran this for.
+            # Appended as they complete, not built as a comprehension: a comprehension
+            # binds nothing until it finishes, so a blip partway through discarded every
+            # reconcile that had already run. See RepairSweep for what that means for
+            # the two lists.
+            bank_ids: list[str] = []
+            schema_results: list[BankIndexResult] = []
             try:
                 bank_ids = [bank_id] if bank_id else await list_bank_ids(conn, target_schema)
+                for bid in bank_ids:
+                    schema_results.append(
+                        await reconcile_bank_vector_indexes(conn, target_schema, bid, index_clause, dry_run=dry_run)
+                    )
             except Exception as exc:  # noqa: BLE001 — one bad schema must not abort the sweep
-                typer.echo(f"  schema '{target_schema}': skipped ({exc})", err=True)
+                results.extend(schema_results)
+                done = f", {len(schema_results)} of {len(bank_ids)} bank(s) done" if schema_results else ""
+                typer.echo(f"  schema '{target_schema}': skipped ({exc}){done}", err=True)
+                skipped_schemas.append(target_schema)
+                if isinstance(exc, asyncpg.PostgresConnectionError | asyncpg.InterfaceError):
+                    # The sweep holds ONE connection for every schema, so this is not a
+                    # property of the schema it happened on — every remaining schema
+                    # fails the same way. Mark them unlooked-at and stop rather than
+                    # print the same error once per tenant. Stop, not re-raise: raising
+                    # reaches repair_bank's asyncio.run with no handler and discards
+                    # every report, which is what the reporting split exists to avoid.
+                    remaining = schemas[schemas.index(target_schema) + 1 :]
+                    if remaining:
+                        typer.echo(
+                            f"  stopping: the shared connection is gone, so "
+                            f"{len(remaining)} further schema(s) were not attempted.",
+                            err=True,
+                        )
+                    skipped_schemas.extend(remaining)
+                    break
                 continue
-            schema_results = [
-                await reconcile_bank_vector_indexes(conn, target_schema, bid, index_clause, dry_run=dry_run)
-                for bid in bank_ids
-            ]
             results.extend(schema_results)
             # Only in --all mode: an index whose bank row is gone is unreachable
-            # from every bank-scoped path, so this is the one place that can
-            # collect it. Normally finds nothing — delete_bank drops a bank's
-            # indexes while it still knows their names — but a deployment that
-            # hit the #3485 wall could not run delete_bank at all.
-            orphans = [] if bank_id else await drop_orphaned_bank_indexes(conn, target_schema, dry_run=dry_run)
+            # from every bank-scoped path, so this is the one place that can collect
+            # it. Normally finds nothing — delete_bank drops a bank's indexes while it
+            # still knows their names — but a deployment that hit the #3485 wall could
+            # not run delete_bank at all.
+            #
+            # Best-effort, and deliberately NOT a "skipped schema": the banks here were
+            # reconciled, and reporting the schema as skipped would tell the operator
+            # to re-run a sweep that already did its work. Per-index drop failures are
+            # handled inside drop_orphaned_bank_indexes; this catches only the catalog
+            # read behind it.
+            orphans: list[str] = []
+            if not bank_id:
+                try:
+                    orphans = await drop_orphaned_bank_indexes(conn, target_schema, dry_run=dry_run)
+                except Exception as exc:  # noqa: BLE001 — the banks were repaired; orphan collection is a nicety
+                    typer.echo(
+                        f"  schema '{target_schema}': banks repaired, but orphan collection failed ({exc})", err=True
+                    )
             if orphans:
                 typer.echo(
                     f"  schema '{target_schema}': {len(orphans)} orphaned index(es) "
@@ -740,7 +817,7 @@ async def _run_repair_bank(
                 f"{sum(r.would_drop for r in schema_results)} to-drop (dry-run), "
                 f"{sum(r.failed for r in schema_results)} failed"
             )
-        return results
+        return RepairSweep(banks=results, skipped_schemas=skipped_schemas)
     finally:
         await conn.close()
 
@@ -778,6 +855,13 @@ def repair_bank(
     restored around it, or one whose access method drifted after a backend
     switch. Nothing is dropped in that mode.
 
+    A bank whose memories a custom store owns is outside all of this, decided per
+    bank rather than per deployment: it has no rows in memory_units, so nothing is
+    built for it and nothing it already carries is taken away (#4615). Such a bank
+    reports 0 present, 0 created either way; query pg_indexes to see what one still
+    holds. If the store cannot say who owns a bank, that schema is reported skipped
+    and this exits non-zero rather than guessing and rebuilding.
+
     With a threshold set, a (bank, fact_type) earns its index once it holds that
     many rows; below it the planner answers the same query exactly, and faster,
     from the (bank_id, fact_type) B-tree plus a top-N sort. This command then
@@ -814,7 +898,7 @@ def repair_bank(
     if dry_run:
         typer.echo("Dry run: no indexes will be created or dropped.")
 
-    results = asyncio.run(
+    sweep = asyncio.run(
         _run_repair_bank(
             config.database_url,
             base_schema=config.database_schema,
@@ -823,6 +907,7 @@ def repair_bank(
             dry_run=dry_run,
         )
     )
+    results = sweep.banks
 
     total_banks = len(results)
     total_present = sum(r.already_present for r in results)
@@ -832,15 +917,394 @@ def repair_bank(
     total_would_drop = sum(r.would_drop for r in results)
     total_failed = sum(r.failed for r in results)
     typer.echo(
-        f"Done: {len(results)} schema(s), {total_banks} bank(s) scanned, "
+        f"Done: {total_banks} bank(s) scanned, "
         f"{total_present} already present, {total_created} created, {total_dropped} dropped, "
         f"{total_skipped} to-create (dry-run), {total_would_drop} to-drop (dry-run), "
         f"{total_failed} failed"
     )
+    # Both are reported before either exits. They are independent — a sweep can have
+    # failed builds in one schema and be unable to look at another — and raising on
+    # the first swallowed the index names, which appear nowhere else and are the whole
+    # point of the failed line.
     if total_failed:
         failed_names = [name for r in results for name in r.failed_indexes]
         typer.echo(f"Failed indexes (dropped, retry with a re-run): {', '.join(failed_names)}", err=True)
+    if sweep.skipped_schemas:
+        # Some or all of a skipped schema's banks were not reconciled, so a run that
+        # reported only successes would read as converged while whole tenants — or the
+        # tail of one — still carry whatever they carried.
+        typer.echo(
+            f"Skipped {len(sweep.skipped_schemas)} schema(s): "
+            f"{', '.join(sweep.skipped_schemas)}. Re-run once the cause is cleared.",
+            err=True,
+        )
+    if total_failed or sweep.skipped_schemas:
         raise typer.Exit(1)
+
+
+class RenameBankError(Exception):
+    """A rename-bank precondition failed; nothing was changed."""
+
+
+# FKs whose own columns include bank_id and that cannot be deferred as declared.
+_RIGID_BANK_ID_FKS_SQL = """
+    SELECT c.conrelid::regclass::text AS tbl, c.conname
+    FROM pg_constraint c
+    JOIN pg_namespace n ON n.oid = c.connamespace
+    WHERE c.contype = 'f' AND n.nspname = $1 AND NOT c.condeferrable
+      AND EXISTS (
+          SELECT 1 FROM pg_attribute a
+          WHERE a.attrelid = c.conrelid AND a.attnum = ANY (c.conkey) AND a.attname = 'bank_id'
+      )
+"""
+
+
+async def _set_fks_deferrable(conn: asyncpg.Connection, fks: list[asyncpg.Record], clause: str) -> None:
+    """Flip the given FKs' deferrability in one short transaction.
+
+    ``ALTER CONSTRAINT`` only touches the catalog, but it still takes a table lock
+    and queues behind any open transaction on the table — and everything else
+    queues behind it. ``lock_timeout`` turns a long wait into a loud failure
+    instead of a tenant-wide stall.
+    """
+    async with conn.transaction():
+        await conn.execute("SET LOCAL lock_timeout = '5s'")
+        for fk in fks:
+            await conn.execute(f"ALTER TABLE {fk['tbl']} ALTER CONSTRAINT {_quote_identifier(fk['conname'])} {clause}")
+
+
+async def _rename_bank(
+    conn: asyncpg.Connection, schema: str, old_bank_id: str, new_bank_id: str, *, dry_run: bool
+) -> dict[str, int]:
+    """Move every row of ``old_bank_id`` to ``new_bank_id`` in one transaction.
+
+    ``bank_id`` is the key every bank-scoped table carries, several composite FKs
+    included (``documents(id, bank_id)``, ``mental_models(id, bank_id)``), so no
+    update order satisfies an immediate FK check. The FKs are made DEFERRABLE
+    just for the rename and put back afterwards, each flip in its own short
+    transaction — doing it inside the rename would hold those table locks, and
+    block every bank in the schema, for its whole duration. This is runtime DDL
+    rather than a migration on purpose: rename is a rare admin operation, and the
+    schema stays exactly as the migrations declare it.
+
+    Only FKs this call flipped are put back. If that restore cannot happen (the
+    process dies, or the restore times out on a lock) they stay DEFERRABLE
+    INITIALLY IMMEDIATE, which checks every normal write exactly as before; a
+    later rename will not restore them, since it only flips what it finds
+    NOT DEFERRABLE, so the failure is reported with the constraint names.
+
+    Returns the rows moved per table (tables the bank had no rows in are omitted).
+    """
+    rigid = await conn.fetch(_RIGID_BANK_ID_FKS_SQL, schema)
+    try:
+        await _set_fks_deferrable(conn, rigid, "DEFERRABLE INITIALLY IMMEDIATE")
+    except asyncpg.exceptions.LockNotAvailableError as exc:
+        raise RenameBankError(
+            "could not lock the bank tables within 5s to prepare the rename; retry when fewer long transactions run"
+        ) from exc
+    try:
+        return await _move_bank_rows(conn, schema, old_bank_id, new_bank_id, dry_run=dry_run)
+    finally:
+        # Never raise from here: it would replace the rename's own outcome (success
+        # or its real error) with a failure that leaves every write checked as before.
+        try:
+            await _set_fks_deferrable(conn, rigid, "NOT DEFERRABLE")
+        except Exception as exc:  # noqa: BLE001
+            names = ", ".join(f"{fk['tbl']}.{fk['conname']}" for fk in rigid)
+            typer.echo(
+                f"Warning: could not restore NOT DEFERRABLE on {names} ({exc}). They still enforce every write "
+                "as before; restore with ALTER TABLE ... ALTER CONSTRAINT ... NOT DEFERRABLE.",
+                err=True,
+            )
+
+
+async def _move_bank_rows(
+    conn: asyncpg.Connection, schema: str, old_bank_id: str, new_bank_id: str, *, dry_run: bool
+) -> dict[str, int]:
+    """The rename transaction proper; the bank_id FKs must already be DEFERRABLE.
+
+    Deferring them lets the tables move in any order, and forcing them back to
+    IMMEDIATE before the commit — or before the dry run's rollback — makes a
+    missed table fail the whole rename instead of stranding rows. Tables are read
+    from the catalog, so extension tables and tables added later are covered
+    without a list to maintain.
+
+    The ``FOR UPDATE`` on the bank row serialises the rename against writers:
+    anything inserting a FK child of the bank takes a key-share lock on that row,
+    so it either commits before the rename reads, or waits and then fails its FK
+    check rather than writing under an id that no longer exists.
+    """
+    banks = _fq_table("banks", schema)
+    tx = conn.transaction()
+    await tx.start()
+    try:
+        if not await conn.fetchval(f"SELECT 1 FROM {banks} WHERE bank_id = $1 FOR UPDATE", old_bank_id):
+            raise RenameBankError(f"bank '{old_bank_id}' does not exist in schema '{schema}'")
+        if await conn.fetchval(f"SELECT 1 FROM {banks} WHERE bank_id = $1", new_bank_id):
+            raise RenameBankError(f"bank '{new_bank_id}' already exists in schema '{schema}'")
+        # An operation's task_payload names its bank, so one run after the rename
+        # would work on (and could recreate) the old id.
+        active = await conn.fetchval(
+            f"SELECT count(*) FROM {_fq_table('async_operations', schema)} "
+            "WHERE bank_id = $1 AND status IN ('pending', 'processing')",
+            old_bank_id,
+        )
+        if active:
+            raise RenameBankError(
+                f"bank '{old_bank_id}' has {active} pending or processing operation(s); "
+                "wait for them to finish or cancel them, then retry"
+            )
+        tables = await conn.fetch(
+            """
+            SELECT c.table_name
+            FROM information_schema.columns c
+            JOIN information_schema.tables t
+              ON t.table_schema = c.table_schema AND t.table_name = c.table_name
+            WHERE c.table_schema = $1 AND c.column_name = 'bank_id' AND t.table_type = 'BASE TABLE'
+            ORDER BY c.table_name
+            """,
+            schema,
+        )
+        await conn.execute("SET CONSTRAINTS ALL DEFERRED")
+        # Every table, store tables included, so the rewrite goes through the Postgres store,
+        # which alone may name its own tables (#4969).
+        # sql_memories(), not get_memories(): the rename walks this Postgres schema's own tables, whatever the store.
+        moved = await sql_memories().admin_move_bank_id(
+            conn=conn,
+            schema=schema,
+            tables=[row["table_name"] for row in tables],
+            old_bank_id=old_bank_id,
+            new_bank_id=new_bank_id,
+        )
+        await conn.execute("SET CONSTRAINTS ALL IMMEDIATE")
+    except BaseException:
+        await tx.rollback()
+        raise
+    if dry_run:
+        await tx.rollback()
+    else:
+        await tx.commit()
+    return moved
+
+
+async def _move_bank_files(conn: asyncpg.Connection, db_url: str, schema: str, old_id: str, new_id: str) -> int:
+    """Re-key the bank's stored files, now that its rows carry the new id.
+
+    A file's key spells the bank id (``bank_storage_prefix``), and no column move
+    reaches inside a key: left alone, the bank's bytes stay under the old prefix,
+    where neither the download route nor ``delete_bank``'s sweep — both of which
+    look under the bank's *current* prefix — can reach them. The sweep missing
+    them is the leak (#4502): on S3 or GCS the bank goes and its bytes stay, still
+    billed.
+
+    Copy first, repoint the row, and only then drop the old prefix, so an
+    interrupted move leaves every row pointing at bytes that exist.
+
+    ponytail: copies through this process, one object at a time. A server-side
+    copy (S3 CopyObject) or, on the native backend, an UPDATE of file_storage
+    would move bytes without reading them — worth it if renames get big or common.
+    """
+    old_prefix = bank_storage_prefix(old_id, schema)
+    new_prefix = bank_storage_prefix(new_id, schema)
+    # Only the native backend needs a pool; building one unconditionally keeps
+    # this from branching on the storage type. Resolved like _admin_connect does,
+    # so a pg0:// URL reaches the embedded server it already started.
+    pool = await asyncpg.create_pool(await resolve_database_url(db_url), min_size=1, max_size=2)
+    try:
+        storage = create_file_storage(
+            storage_type=HindsightConfig.from_env().file_storage_type,
+            pool_getter=lambda: pool,
+            schema=schema,
+        )
+        # Keys written before the tenant layout sit outside the prefix and stay where
+        # they are: delete_bank sweeps those from their rows, which the rename carries
+        # to the new id. `documents` is a store table, so the Postgres store reads and
+        # repoints the keys (#4969).
+        # sql_memories(), not get_memories(): the rename walks this Postgres schema's own tables, whatever the store.
+        pg_store = sql_memories()
+        rows = await pg_store.admin_bank_file_keys(conn=conn, schema=schema, bank_id=new_id, prefix=old_prefix)
+        columns = {"attachments": "storage_key", "documents": "file_storage_key"}
+        moved = 0
+        for row in rows:
+            new_key = new_prefix + row["key"][len(old_prefix) :]
+            try:
+                data = await storage.retrieve(row["key"])
+            except FileNotFoundError:
+                # The row outlived its bytes (an earlier leak swept, a manual
+                # cleanup). Leave it pointing where it does rather than at a key
+                # with nothing behind it, and carry on: the rename is committed.
+                typer.echo(f"Warning: {row['key']} has no stored bytes; its row keeps the old key.")
+                continue
+            await storage.store(file_data=data, key=new_key)
+            await pg_store.admin_repoint_file_key(
+                conn=conn,
+                schema=schema,
+                table=row["table_name"],
+                column=columns[row["table_name"]],
+                bank_id=new_id,
+                old_key=row["key"],
+                new_key=new_key,
+            )
+            moved += 1
+        # The originals, plus whatever else the bank left under the old prefix:
+        # export and import archives, which no row names and which their
+        # operation can produce again.
+        try:
+            await storage.delete_prefix(old_prefix)
+        except Exception as exc:  # noqa: BLE001
+            typer.echo(f"Warning: could not clear the old prefix {old_prefix} ({exc}); its files are now orphans.")
+        return moved
+    finally:
+        await pool.close()
+
+
+async def _run_rename_bank(
+    db_url: str, schema: str, old_bank_id: str, new_bank_id: str, *, dry_run: bool
+) -> dict[str, int]:
+    """Rename the bank, then move its stored files and rebuild its vector indexes.
+
+    Those indexes are partial on a ``bank_id`` literal, so after the rename they
+    cover nothing; the reconcile sees the stale predicate and rebuilds them
+    CONCURRENTLY, which is why it runs after the commit, outside the transaction.
+    Until it finishes, recall on the bank runs without its index.
+    """
+    # Same unreachable-store case the reconcile below now handles, reported the same
+    # way: this runs before anything is changed, so refusing is free and a traceback
+    # would just look like a crash.
+    try:
+        old_is_store_owned = bank_indexes_are_store_owned(old_bank_id)
+    except Exception as exc:  # noqa: BLE001 — cannot verify the precondition, so do not proceed
+        raise RenameBankError(
+            f"cannot tell whether bank '{old_bank_id}' keeps its memories outside SQL ({exc}); "
+            f"nothing was changed. Re-run once the memories store is reachable."
+        ) from exc
+    if old_is_store_owned:
+        raise RenameBankError(f"bank '{old_bank_id}' keeps its memories outside SQL; rename is not supported for it")
+    conn = await _admin_connect(db_url)
+    try:
+        moved = await _rename_bank(conn, schema, old_bank_id, new_bank_id, dry_run=dry_run)
+        if not dry_run:
+            files = await _move_bank_files(conn, db_url, schema, old_bank_id, new_bank_id)
+            typer.echo(f"Stored files: {files} re-keyed under the new bank id")
+        index_clause = _vector_index_clause()
+        if not dry_run and index_clause is not None:
+            # The rename is already committed here, so a failure in the rebuild must
+            # not surface as a bare traceback that buries that fact. Planning can now
+            # raise (a memories store that cannot say who owns the new id is not
+            # guessed at — see bank_indexes_are_store_owned), and the honest report is
+            # "the rename worked, the index did not".
+            try:
+                result = await reconcile_bank_vector_indexes(conn, schema, new_bank_id, index_clause)
+            except Exception as exc:  # noqa: BLE001 — the rename is committed; say so rather than traceback
+                typer.echo(
+                    f"Vector indexes: could not be rebuilt ({exc}). The rename itself succeeded. "
+                    f"Re-run `hindsight-admin repair-bank --bank {new_bank_id}` once the cause is cleared; "
+                    f"until then recall on this bank runs without its index.",
+                    err=True,
+                )
+                return moved
+            typer.echo(f"Vector indexes: {result.created} rebuilt, {result.dropped} dropped, {result.failed} failed")
+            if result.failed:
+                typer.echo(f"Re-run `hindsight-admin repair-bank --bank {new_bank_id}` to retry.", err=True)
+        return moved
+    finally:
+        await conn.close()
+
+
+@app.command(name="rename-bank")
+def rename_bank(
+    old_bank_id: str = typer.Option(..., "--from", help="Current bank id."),
+    new_bank_id: str = typer.Option(..., "--to", help="New bank id. Must not exist yet."),
+    schema: str | None = typer.Option(
+        None,
+        "--schema",
+        "-s",
+        help="Database schema the bank lives in. Defaults to the configured base schema.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Run the whole rename, report what would move, then roll back.",
+    ),
+) -> None:
+    """Rename a bank's id in place, keeping every memory, document and mental model.
+
+    One transaction moves every row of the bank to the new id. Stop the bank's
+    clients first: anything still calling the old id gets a 404 or, if it creates
+    banks on demand, a new empty bank under the old id. Refused while the bank
+    has pending or processing operations.
+    """
+    if not new_bank_id.strip() or new_bank_id == old_bank_id:
+        typer.echo("Error: --to must be a non-empty id different from --from.", err=True)
+        raise typer.Exit(2)
+
+    config = HindsightConfig.from_env()
+    if not config.database_url:
+        typer.echo("Error: Database URL not configured.", err=True)
+        typer.echo("Set HINDSIGHT_API_DATABASE_URL environment variable.", err=True)
+        raise typer.Exit(1)
+
+    # The rename flips FK deferrability with PostgreSQL's ALTER CONSTRAINT and runs
+    # over asyncpg; Oracle can only change deferrability by recreating the
+    # constraint. Refuse before connecting rather than fail halfway.
+    if is_oracle_url(config.database_url):
+        typer.echo("Error: rename-bank is PostgreSQL-only; Oracle backends are not supported.", err=True)
+        raise typer.Exit(1)
+
+    target_schema = schema or config.database_schema or DEFAULT_DATABASE_SCHEMA
+    typer.echo(f"Renaming bank '{old_bank_id}' -> '{new_bank_id}' in schema '{target_schema}'...")
+    try:
+        moved = asyncio.run(
+            _run_rename_bank(config.database_url, target_schema, old_bank_id, new_bank_id, dry_run=dry_run)
+        )
+    except RenameBankError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    for table, count in sorted(moved.items()):
+        typer.echo(f"  {table}: {count}")
+    if dry_run:
+        typer.echo(f"Dry run: {sum(moved.values())} row(s) would move; rolled back.")
+    else:
+        typer.echo(
+            f"Renamed: {sum(moved.values())} row(s) moved. Point clients and API keys at '{new_bank_id}'; "
+            "API servers may serve the old id from cache until bank_info_cache_ttl_seconds elapses."
+        )
+
+
+class _SingleConnectionPool:
+    """Pool adapter over the admin CLI's one raw connection.
+
+    File storage takes a pool because the API serves many requests from one; the
+    CLI has a single connection and a single export running on it, so acquiring
+    hands the same connection back. Only the native (PostgreSQL) backend touches
+    this at all — an S3/GCS/Azure deployment never calls the pool.
+    """
+
+    def __init__(self, conn: asyncpg.Connection) -> None:
+        self._conn = conn
+
+    async def acquire(self) -> asyncpg.Connection:
+        return self._conn
+
+    async def release(self, conn: asyncpg.Connection) -> None:
+        """No-op: the caller owns the connection's lifetime, and closes it."""
+
+
+def _admin_file_storage(conn: asyncpg.Connection, schema: str) -> Any:
+    """File storage for an export run from the CLI, on this instance's config.
+
+    Attachment bytes live here rather than in a column, so a bank with
+    attachments cannot be exported without it.
+    """
+    from ..engine.storage import create_file_storage
+
+    config = HindsightConfig.from_env()
+    return create_file_storage(
+        storage_type=config.file_storage_type,
+        pool_getter=lambda: _SingleConnectionPool(conn),
+        schema=schema,
+    )
 
 
 async def _run_export_bank(db_url: str, bank_id: str, output: Path, schema: str, include_history: bool) -> int:
@@ -861,19 +1325,31 @@ async def _run_export_bank(db_url: str, bank_id: str, output: Path, schema: str,
         # contextvar); set it so the raw connection targets the right schema.
         _current_schema.set(schema)
         # _admin_connect registers JSON codecs, so row dumps already contain
-        # decoded Python values (including JSON scalar strings).
-        data = await export_bank(
-            conn,
-            bank_id,
-            include_history=include_history,
-            bank_rows_json_encoding="decoded",
-            memories=get_memories(),
-        )
+        total_bytes = 0
+        tmp_output = output.with_suffix(f"{output.suffix}.tmp.{uuid.uuid4().hex[:8]}")
+        try:
+            with tmp_output.open("wb") as fp:
+                async for chunk in stream_export_bank(
+                    conn,
+                    bank_id,
+                    scope=TransferScope(data=True, bank_config=True, history=include_history),
+                    bank_rows_json_encoding="decoded",
+                    memories=get_memories(),
+                    file_storage=_admin_file_storage(conn, schema),
+                ):
+                    fp.write(chunk)
+                    total_bytes += len(chunk)
+                fp.flush()
+            os.replace(tmp_output, output)
+        finally:
+            if tmp_output.exists():
+                try:
+                    tmp_output.unlink()
+                except OSError:
+                    pass
+        return total_bytes
     finally:
         await conn.close()
-
-    output.write_bytes(data)
-    return len(data)
 
 
 @app.command(name="export-bank")
@@ -920,7 +1396,6 @@ async def _run_import_bank(archive_path: Path, schema: str, target_bank_id: str 
     from ..engine.memory_engine import MemoryEngine
     from ..models import RequestContext
 
-    archive_bytes = archive_path.read_bytes()
     # run_migrations=True so a fresh target instance is provisioned at this
     # instance's embedding dimension / vector / text-search backend before restore.
     engine = MemoryEngine(run_migrations=True)
@@ -928,12 +1403,14 @@ async def _run_import_bank(archive_path: Path, schema: str, target_bank_id: str 
     try:
         _current_schema.set(schema)
         context = RequestContext(internal=True, user_initiated=True)
-        return await engine.import_bank_async(
-            archive_bytes,
-            context,
-            target_bank_id=target_bank_id,
-            include_history=include_history,
-        )
+        # The open file, not its bytes: the restore reads the archive entry by entry.
+        with archive_path.open("rb") as archive:
+            return await engine.import_bank_async(
+                archive,
+                context,
+                target_bank_id=target_bank_id,
+                scope=TransferScope(data=True, bank_config=True, history=include_history),
+            )
     finally:
         await engine.close()
 
@@ -1173,6 +1650,17 @@ def worker_status(
                 f"  running={running_for}  last_update={last_update} ago"
             )
         typer.echo("")
+
+
+@app.command(
+    name="chatgpt",
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True, "help_option_names": []},
+)
+def chatgpt(ctx: typer.Context):
+    """Sign in with ChatGPT for the chatgpt LLM provider (login | status | logout)."""
+    from ..engine.providers.chatgpt_auth import main as chatgpt_main
+
+    raise typer.Exit(chatgpt_main(ctx.args))
 
 
 def main():

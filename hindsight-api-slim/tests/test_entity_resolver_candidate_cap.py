@@ -19,8 +19,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from hindsight_api.engine import entity_resolver as entity_resolver_module
-from hindsight_api.engine.entity_resolver import EntityResolver
+from hindsight_api.engine.memories.pg import entity_resolver as entity_resolver_module
+from hindsight_api.engine.memories.pg.entity_resolver import EntityResolver
 
 
 def _make_resolver(max_candidates: int = 200) -> EntityResolver:
@@ -59,19 +59,26 @@ async def test_scoring_is_capped_at_max_candidates():
     """Only the top `max_candidates` per mention reach the scoring loop.
 
     Counted on the word-level check rather than on ``SequenceMatcher``: it runs once per
-    candidate that reaches scoring and is used nowhere else. ``SequenceMatcher`` is no longer
+    candidate that reaches scoring, and nowhere else here (see below). ``SequenceMatcher`` is no longer
     one-per-candidate (the word-level check calls it too, and a candidate the trigram gate
     rejects never reaches the name score), and the trigram helpers are also used by the
     O(N^2) in-batch pass — so counting either measures the shape of the scoring code rather
     than the cap this test exists to pin.
+
+    The in-batch pass runs the word-level check too, on the names this batch is about to create.
+    So the four mentions are mutually dissimilar, each with its own candidate pool: no in-batch
+    pair clears the 0.5 trigram bar to reach the check, and the count stays exactly the scoring
+    loop's.
     """
     resolver = _make_resolver(max_candidates=50)
-    candidates = _candidates(1000)
-    entities_data = [{"text": f"Acme Corporation {i}", "nearby_entities": []} for i in range(4)]
-    all_candidates = {e["text"]: candidates for e in entities_data}
+    entities_data = [
+        {"text": name, "nearby_entities": []}
+        for name in ("Acme Corporation", "Globex Industries", "Initech Systems", "Umbrella Holdings")
+    ]
+    all_candidates = {e["text"]: _candidates(1000, e["text"]) for e in entities_data}
 
     with patch(
-        "hindsight_api.engine.entity_resolver._tokens_are_compatible",
+        "hindsight_api.engine.memories.pg.entity_resolver._tokens_are_compatible",
         wraps=entity_resolver_module._tokens_are_compatible,
     ) as gate:
         await resolver._resolve_from_candidates(

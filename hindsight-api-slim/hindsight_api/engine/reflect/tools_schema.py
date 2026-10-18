@@ -19,7 +19,9 @@ TOOL_SEARCH_MENTAL_MODELS = {
         "description": (
             "Search user-curated mental models (stored reflect responses). These are high-quality, manually created "
             "summaries about specific topics. Use FIRST when the question might be covered by an "
-            "existing mental model. Returns mental models with their content and last refresh time."
+            "existing mental model. Returns the best-matching page IN FULL, and a SNIPPET of each other hit "
+            "with its size and last refresh time — call read_mental_models to read in full any of those that "
+            "look like they answer the question."
         ),
         "parameters": {
             "type": "object",
@@ -108,6 +110,38 @@ TOOL_RECALL = {
     },
 }
 
+TOOL_READ_MENTAL_MODELS = {
+    "type": "function",
+    "function": {
+        "name": "read_mental_models",
+        "description": (
+            "Read mental models in full, by id, after search_mental_models showed you their snippets. "
+            "Ask only for the ones whose snippet looks relevant: a page is long, and every page you read "
+            "stays in the conversation for the rest of this reflect."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": "Brief explanation of why you're reading these (for debugging)",
+                },
+                "mental_model_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Ids of the mental models to read, exactly as search_mental_models gave them",
+                },
+                "max_tokens": {
+                    "type": "integer",
+                    "description": "Token budget for the pages returned (default 6000). Reading stops at the "
+                    "first page that would cross it; the rest come back under not_read.",
+                },
+            },
+            "required": ["reason", "mental_model_ids"],
+        },
+    },
+}
+
 TOOL_EXPAND = {
     "type": "function",
     "function": {
@@ -148,11 +182,41 @@ _DONE_ANSWER_DEFAULT_LANGUAGE = (
     "language directive in the system prompt specifies a different language, follow that directive instead."
 )
 
+#: Appended to both ``done`` descriptions. The stopping condition is what the
+#: model weighs at the moment it picks this tool over another search, and
+#: "gathered enough information" alone left *enough* undefined — so a page that
+#: merely shared the question's topic read as enough, and the reflect loop had
+#: already released the forced lower layers (see agent.py's short-circuit, and
+#: #4567). The retrieval-levels section of the system prompt carries the same
+#: rule once; this is the copy at the decision point. Measured on the reporter's
+#: banks, this wording alone did not make the model recall before a negative, so
+#: the absence half is also enforced in code through ``answer_found`` below.
+_DONE_SUFFICIENCY_GATE = (
+    " You have NOT gathered enough while the levels you searched do not STATE the answer: a result that only "
+    "shares the question's topic is not an answer, so search the next level (search_observations, then recall) "
+    "instead of answering around it. Never call done to report that nothing is known unless recall has already "
+    "run on the question's key terms."
+)
+
+#: The model's own verdict on whether it found the answer. Prose can't be
+#: checked, a bool can: when it is false and recall has not run yet, the agent
+#: loop refuses the ``done`` and forces a recall first (#4567).
+_DONE_ANSWER_FOUND_PROPERTY = {
+    "type": "boolean",
+    "description": (
+        "true if what you retrieved states the answer to the question. false if you are reporting that "
+        "nothing (or not enough) is known about it."
+    ),
+}
+
 TOOL_DONE_ANSWER = {
     "type": "function",
     "function": {
         "name": "done",
-        "description": "Signal completion with your final answer. Use this when you have gathered enough information to answer the question.",
+        "description": (
+            "Signal completion with your final answer. Use this when you have gathered enough information "
+            "to answer the question." + _DONE_SUFFICIENCY_GATE
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -179,8 +243,9 @@ TOOL_DONE_ANSWER = {
                     "items": {"type": "string"},
                     "description": "Array of observation IDs that support your answer",
                 },
+                "answer_found": _DONE_ANSWER_FOUND_PROPERTY,
             },
-            "required": ["answer"],
+            "required": ["answer", "answer_found"],
         },
     },
 }
@@ -250,7 +315,7 @@ def _done_tool_for_document(base: dict) -> dict:
     params["required"] = ["document"] + [name for name in params.get("required", []) if name != "answer"]
     tool["function"]["description"] = (
         "Signal completion with your final answer, as a structured document. Use this when you have "
-        "gathered enough information to answer the question."
+        "gathered enough information to answer the question." + _DONE_SUFFICIENCY_GATE
     )
     return tool
 
@@ -324,12 +389,13 @@ def _build_done_tool_with_directives(directive_rules: list[str]) -> dict:
                         "items": {"type": "string"},
                         "description": "Array of observation IDs that support your answer",
                     },
+                    "answer_found": _DONE_ANSWER_FOUND_PROPERTY,
                     "directive_compliance": {
                         "type": "string",
                         "description": f"REQUIRED: Confirm your answer complies with ALL directives. List each directive and how your answer follows it:\n{rules_list}\n\nFormat: 'Directive 1: [how answer complies]. Directive 2: [how answer complies]...'",
                     },
                 },
-                "required": ["answer", "directive_compliance"],
+                "required": ["answer", "answer_found", "directive_compliance"],
             },
         },
     }
@@ -375,6 +441,8 @@ def get_reflect_tools(
 
     if include_mental_models:
         tools.append(TOOL_SEARCH_MENTAL_MODELS)
+        # Search returns snippets; this is how the model gets a page in full.
+        tools.append(TOOL_READ_MENTAL_MODELS)
     if include_observations:
         tools.append(TOOL_SEARCH_OBSERVATIONS)
     if include_recall:

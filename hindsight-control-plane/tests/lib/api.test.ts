@@ -60,6 +60,30 @@ describe("ControlPlaneClient error handling", () => {
     );
   });
 
+  it("sends a refused UI session to the login form", async () => {
+    fetchSpy.mockResolvedValueOnce(
+      new Response(JSON.stringify({ error: "Unauthorized" }), {
+        status: 401,
+        headers: { "x-hindsight-session-required": "1" },
+      })
+    );
+
+    await expect(client.getBankConfig("bank-a")).rejects.toThrow("Unauthorized");
+    expect(window.location.href).toBe("/login?returnTo=%2Fen%2Fdashboard");
+  });
+
+  it("keeps a valid session on the page when the dataplane answers 401", async () => {
+    fetchSpy.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({ error: "Failed to fetch bank config", upstream: { status: 401 } }),
+        { status: 401 }
+      )
+    );
+
+    await expect(client.getBankConfig("bank-a")).rejects.toMatchObject({ status: 401 });
+    expect(window.location.href).toBe("");
+  });
+
   it("does not show upstream response details for 5xx failures", async () => {
     fetchSpy.mockResolvedValueOnce(
       new Response(
@@ -82,6 +106,62 @@ describe("ControlPlaneClient error handling", () => {
         description: "HTTP 500",
       })
     );
+  });
+});
+
+describe("ControlPlaneClient.cloneBank", () => {
+  let fetchSpy: ReturnType<typeof vi.spyOn>;
+  let client: ControlPlaneClient;
+
+  beforeEach(() => {
+    client = new ControlPlaneClient();
+    fetchSpy = vi.spyOn(globalThis, "fetch");
+    fetchSpy.mockResolvedValue(
+      new Response(JSON.stringify({ operation_id: "op-1", status: "pending" }), {
+        status: 202,
+        headers: { "Content-Type": "application/json" },
+      })
+    );
+  });
+
+  afterEach(() => {
+    fetchSpy.mockRestore();
+  });
+
+  it("posts the target bank id to the clone route", async () => {
+    const result = await client.cloneBank("source-bank", "source-bank-copy");
+
+    expect(result.operation_id).toBe("op-1");
+    const [url, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    expect(url).toContain("/api/banks/source-bank/clone");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(init.body as string)).toEqual({ target_bank_id: "source-bank-copy" });
+  });
+
+  it("forwards all three scope flags, matching the endpoint's own three", async () => {
+    await client.cloneBank("source-bank", "copy", {
+      includeData: true,
+      includeBankConfig: false,
+      includeHistory: true,
+    });
+
+    const [, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({
+      target_bank_id: "copy",
+      include_data: true,
+      include_bank_config: false,
+      include_history: true,
+    });
+  });
+
+  it("omits scope flags that were not set, so the server's defaults decide", async () => {
+    await client.cloneBank("source-bank", "copy", { includeBankConfig: false });
+
+    const [, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.include_bank_config).toBe(false);
+    expect(body).not.toHaveProperty("include_data");
+    expect(body).not.toHaveProperty("include_history");
   });
 });
 
