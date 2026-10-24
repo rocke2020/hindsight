@@ -47,12 +47,17 @@ import {
   type ObservationsEdits,
   type ConsolidationSettings,
   type ConsolidationStrategy,
+  type ObservationScopes,
+  type ObservationScopesMode,
   type ScopePattern,
   type StrategyTagsMatch,
+  OBSERVATION_SCOPES_MODES,
   compactStrategy,
   scopesLabel,
+  scopesToText,
   strategyOverridesSomething,
   suggestedTags,
+  textToScopes,
 } from "@/lib/observations-config";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -139,11 +144,12 @@ type MentalModelsEdits = {
 };
 
 // The bank's default reflect options (reflect_default_options). Stored as one
-// object, edited as two fields; null means "not set", so reflect falls back to
+// object, edited as three fields; null means "not set", so reflect falls back to
 // the shipped default.
 type ReflectOptionsEdits = {
   reflect_search_observations_max_tokens: number | null;
   reflect_search_observations_include_entities: boolean | null;
+  reflect_search_mental_models_max_tokens: number | null;
 };
 
 // The server's built-in knowledge-page trigger (MemoryEngine.KNOWLEDGE_PAGE_DEFAULT_TRIGGER).
@@ -403,6 +409,11 @@ function ReflectOptionsSummary({ options }: { options: ReflectOptionsEdits }) {
     options.reflect_search_observations_include_entities === false
       ? t("reflectObservationsEntitiesOff")
       : t("reflectObservationsEntitiesOn"),
+    options.reflect_search_mental_models_max_tokens != null
+      ? t("reflectMentalModelsMaxTokensChip", {
+          tokens: options.reflect_search_mental_models_max_tokens,
+        })
+      : t("reflectMentalModelsMaxTokensChipDefault"),
   ];
   return (
     <div className="flex flex-wrap gap-1.5">
@@ -424,6 +435,7 @@ function reflectOptionsSlice(overrides: Record<string, any>): ReflectOptionsEdit
     reflect_search_observations_max_tokens: opts.reflect_search_observations_max_tokens ?? null,
     reflect_search_observations_include_entities:
       opts.reflect_search_observations_include_entities ?? null,
+    reflect_search_mental_models_max_tokens: opts.reflect_search_mental_models_max_tokens ?? null,
   };
 }
 
@@ -964,6 +976,12 @@ export function BankConfigView() {
               placeholder={t("serverDefault")}
             />
           </FieldRow>
+          <DefaultObservationScopesRow
+            value={observationsEdits.default_observation_scopes}
+            onChange={(next) =>
+              setObservationsEdits((prev) => ({ ...prev, default_observation_scopes: next }))
+            }
+          />
           <ConsolidationStrategiesPanel
             defaults={observationsEdits}
             onDefaultChange={(patch) => setObservationsEdits((prev) => ({ ...prev, ...patch }))}
@@ -1083,6 +1101,28 @@ export function BankConfigView() {
                       <SelectItem value="false">{t("reflectObservationsEntitiesOff")}</SelectItem>
                     </SelectContent>
                   </Select>
+                </div>
+                <div className="space-y-2">
+                  <div>
+                    <p className="text-sm font-medium">{t("reflectMentalModelsMaxTokensLabel")}</p>
+                    <p className="text-xs text-muted-foreground mt-0.5">
+                      {t("reflectMentalModelsMaxTokensDescription")}
+                    </p>
+                  </div>
+                  <Input
+                    type="number"
+                    min={1}
+                    value={reflectOptionsForm.reflect_search_mental_models_max_tokens ?? ""}
+                    onChange={(e) =>
+                      setReflectOptionsForm((prev) => ({
+                        ...prev,
+                        reflect_search_mental_models_max_tokens: e.target.value
+                          ? parseInt(e.target.value, 10)
+                          : null,
+                      }))
+                    }
+                    placeholder={t("serverDefault")}
+                  />
                 </div>
               </div>
               {reflectOptionsError && (
@@ -2196,6 +2236,77 @@ function TextareaRow({
         />
       </div>
     </div>
+  );
+}
+
+// ─── DefaultObservationScopesRow ───────────────────────────────────────────────
+
+const CUSTOM_SCOPES = "custom";
+
+/** The bank's `default_observation_scopes`: a mode, or custom scopes typed one per line.
+ *  Applied at retain to items that send no `observation_scopes` of their own. */
+function DefaultObservationScopesRow({
+  value,
+  onChange,
+}: {
+  value: ObservationScopes | null;
+  onChange: (next: ObservationScopes | null) => void;
+}) {
+  const t = useTranslations("bankConfig");
+  // The text is kept as typed: re-deriving it from the parsed scopes on every keystroke
+  // would eat the comma or newline the user is about to follow with a tag.
+  const [customText, setCustomText] = useState(() =>
+    Array.isArray(value) ? scopesToText(value) : ""
+  );
+  useEffect(() => {
+    if (Array.isArray(value) && JSON.stringify(textToScopes(customText)) !== JSON.stringify(value))
+      setCustomText(scopesToText(value));
+  }, [value]);
+
+  const selected = value === null ? INHERIT_SENTINEL : Array.isArray(value) ? CUSTOM_SCOPES : value;
+  return (
+    <>
+      <FieldRow
+        label={t("defaultObservationScopesLabel")}
+        description={t("defaultObservationScopesDescription")}
+      >
+        <Select
+          value={selected}
+          onValueChange={(v) => {
+            if (v === INHERIT_SENTINEL) onChange(null);
+            else if (v === CUSTOM_SCOPES) onChange(textToScopes(customText));
+            else onChange(v as ObservationScopesMode);
+          }}
+        >
+          <SelectTrigger>
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value={INHERIT_SENTINEL}>{t("serverDefault")}</SelectItem>
+            {OBSERVATION_SCOPES_MODES.map((mode) => (
+              <SelectItem key={mode} value={mode}>
+                {mode}
+              </SelectItem>
+            ))}
+            <SelectItem value={CUSTOM_SCOPES}>{t("observationScopesCustom")}</SelectItem>
+          </SelectContent>
+        </Select>
+      </FieldRow>
+      {selected === CUSTOM_SCOPES && (
+        <div className="px-6 pb-4">
+          <Textarea
+            value={customText}
+            onChange={(e) => {
+              setCustomText(e.target.value);
+              onChange(textToScopes(e.target.value));
+            }}
+            placeholder={t("observationScopesCustomPlaceholder")}
+            rows={3}
+            className="font-mono text-sm"
+          />
+        </div>
+      )}
+    </>
   );
 }
 

@@ -8,8 +8,9 @@ import pytest
 import pytest_asyncio
 
 from hindsight_api.api import create_app
-from hindsight_api.engine.memory_engine import MemoryEngine, fq_table
+from hindsight_api.engine.memory_engine import MemoryEngine
 from hindsight_api.engine.retain import embedding_utils
+from hindsight_api.engine.schema import fq_table
 from tests.llm_judge import assert_meets_criteria
 
 
@@ -197,6 +198,9 @@ class TestMentalModelsCRUD:
         await memory.delete_bank(bank_id, request_context=request_context)
 
     @pytest.mark.asyncio
+    # Reads the mental_models.embedding column, which a store-owned bank leaves empty: its page
+    # vectors live in the store's index.
+    @pytest.mark.memory_backend_incompatible
     async def test_partial_update_embeds_the_whole_stored_document(
         self, memory: MemoryEngine, request_context, monkeypatch
     ):

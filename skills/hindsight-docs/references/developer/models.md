@@ -299,6 +299,8 @@ export HINDSIGHT_API_LLM_MODEL=your-local-model
 export HINDSIGHT_API_LLM_PROVIDER=minimax
 export HINDSIGHT_API_LLM_API_KEY=your-minimax-api-key
 export HINDSIGHT_API_LLM_MODEL=MiniMax-M3  # or MiniMax-M2.7 for the previous generation
+# MiniMax-M3.1-* always thinks (Hindsight sends thinking=adaptive) and defaults to max effort;
+# lower it with: export HINDSIGHT_API_LLM_REASONING_EFFORT=low
 
 # DeepSeek (https://api.deepseek.com)
 export HINDSIGHT_API_LLM_PROVIDER=deepseek
@@ -357,6 +359,54 @@ export HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=your-gcp-project-id
 ```
 
 **Note:** The LLM is the primary bottleneck for retain operations. See [Performance](./performance.md) for optimization strategies.
+
+---
+
+### Cheap Memory Model with Failover
+
+Hindsight calls its own LLM, with its own credentials, only to process memory: extracting facts on retain, consolidating observations, refreshing mental models, and answering reflect. Your agent keeps calling whatever model it already uses — Hindsight never sees or changes that. So the memory model can be a cheap, high-throughput one, picked for volume rather than for the agent's reasoning.
+
+A typical production setup puts the cheap model first and stronger, pricier models behind it, used only when the cheap one fails. The building blocks are documented in [Multi-LLM Strategies](./configuration.md#multi-llm-strategies-failover--round-robin) and [Per-Operation LLM Configuration](./configuration.md#per-operation-llm-configuration):
+
+```bash
+# Member 0 (primary): cheap workhorse, serves almost every call
+export HINDSIGHT_API_LLM_PROVIDER=groq
+export HINDSIGHT_API_LLM_API_KEY=<groq-key>
+export HINDSIGHT_API_LLM_MODEL=<cheap-model>
+
+# Member 1: mid-tier fallback
+export HINDSIGHT_API_LLM_1_PROVIDER=openai
+export HINDSIGHT_API_LLM_1_API_KEY=<openai-key>
+export HINDSIGHT_API_LLM_1_MODEL=<mid-model>
+
+# Member 2: top-tier last resort, with its own retry budget
+export HINDSIGHT_API_LLM_2_PROVIDER=anthropic
+export HINDSIGHT_API_LLM_2_API_KEY=<anthropic-key>
+export HINDSIGHT_API_LLM_2_MODEL=<top-model>
+export HINDSIGHT_API_LLM_2_MAX_RETRIES=3
+
+export HINDSIGHT_API_LLM_MAX_RETRIES=0   # fail over at once instead of retrying the same member
+export HINDSIGHT_API_LLM_STRATEGY='{"mode": "failover"}'
+# Or spread load instead: '{"mode": "round-robin", "weights": [4, 1, 1]}'
+```
+
+To give one operation a stronger model, override only that operation's primary. Its chain still falls back to the global members above:
+
+```bash
+# Consolidation starts on the mid-tier model; retain and reflect stay on the cheap one
+export HINDSIGHT_API_CONSOLIDATION_LLM_PROVIDER=openai
+export HINDSIGHT_API_CONSOLIDATION_LLM_API_KEY=<openai-key>
+export HINDSIGHT_API_CONSOLIDATION_LLM_MODEL=<mid-model>
+```
+
+Give an operation a fully separate chain with its own indexed members and strategy (`HINDSIGHT_API_RETAIN_LLM_1_PROVIDER`, `HINDSIGHT_API_RETAIN_LLM_STRATEGY`, ...).
+
+Things to know:
+
+- **Number members from 1 with no gaps.** Hindsight stops reading at the first missing `HINDSIGHT_API_LLM_<n>_PROVIDER`: with `_1_` and `_3_` set, member 3 is ignored.
+- **An operation with no members or no strategy of its own uses the global ones.** Mental-model refresh uses the reflect chain first, then the global one.
+- **Batch retain does not fail over.** With `HINDSIGHT_API_RETAIN_BATCH_ENABLED=true`, the whole batch runs on the first member whose provider has a batch API. Put a reliable provider there.
+- **Startup sends a test call to each configured model.** A model that is down only logs a warning; the server still starts. Set `HINDSIGHT_API_SKIP_LLM_VERIFICATION=true` to skip these checks, for example when fallbacks are paid per call or slow to answer.
 
 ---
 
@@ -1216,6 +1266,7 @@ Reranks initial search results to improve precision.
 | `google` | Google Discovery Engine ranking API (REST + Google auth) | Production, GCP integration |
 | `tei` | HuggingFace Text Embeddings Inference | Production, self-hosted |
 | `flashrank` | FlashRank (lightweight, fast) | Resource-constrained environments |
+| `onnx` | Any cross-encoder exported to ONNX, in-process via ONNX Runtime | Custom models without PyTorch or a TEI server |
 | `litellm` | LiteLLM proxy (unified gateway) | Multi-provider setups |
 | `litellm-sdk` | LiteLLM SDK (direct API, no proxy) | Multi-provider, simpler setup |
 | `jina-mlx` | Jina rerank v3 via Apple Silicon MLX (local, no API key) | Apple Silicon (M1+) local inference |

@@ -9,9 +9,8 @@ from typing import TYPE_CHECKING, Literal
 from hindsight_api.extensions.base import Extension
 
 if TYPE_CHECKING:
-    from hindsight_api.engine.memory_engine import Budget
+    from hindsight_api.engine.response_models import Budget, ReflectResult
     from hindsight_api.engine.response_models import RecallResult as RecallResultModel
-    from hindsight_api.engine.response_models import ReflectResult
     from hindsight_api.engine.search.tags import TagGroup, TagsMatch
     from hindsight_api.models import RequestContext
 
@@ -385,6 +384,7 @@ class BankReadOperation(StrEnum):
     GET_CHUNK = "get_chunk"
     GET_DIRECTIVE = "get_directive"
     GET_DOCUMENT = "get_document"
+    GET_DOCUMENT_HISTORY = "get_document_history"
     GET_ENTITY = "get_entity"
     GET_ENTITY_GRAPH = "get_entity_graph"
     GET_ENTITY_STATE = "get_entity_state"

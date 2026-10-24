@@ -205,6 +205,23 @@ class TestWorkerOperationMetrics:
         return collector
 
     @pytest.mark.asyncio
+    async def test_task_runs_marked_as_background_even_without_stage_holder(self):
+        """Every task the poller runs is marked background, so its LLM calls yield to
+        live requests. Run with no stage holder: the mark must not depend on one."""
+        from hindsight_api.worker.background import in_background_task
+
+        seen: list[bool] = []
+
+        async def executor(_task_dict):
+            seen.append(in_background_task())
+
+        # Own task, as the poller runs it, so the mark stays in that task's scope.
+        await asyncio.create_task(self._run(executor))
+
+        assert seen == [True]
+        assert not in_background_task(), "the mark must not leak out of the task"
+
+    @pytest.mark.asyncio
     async def test_executor_returning_normally_records_success(self):
         """Success is inferred from the executor returning without raising to the
         poller. This deliberately includes deterministic failures that
@@ -528,6 +545,8 @@ class TestWorkerPoller:
         for task in my_claims:
             assert task.operation_id is not None
             assert task.task_dict is not None
+            # When it was queued: the operation runs it executes report their wait from it.
+            assert task.queued_at is not None and task.queued_at.tzinfo is not None
 
         # Verify tasks are marked as processing with worker_id
         rows = await pool.fetch(
@@ -537,6 +556,28 @@ class TestWorkerPoller:
         for row in rows:
             assert row["status"] == "processing"
             assert row["worker_id"] == "test-worker-1"
+
+        # Runs opened by the executor carry the task's id and queue time.
+        from hindsight_api import operation_runs
+
+        runs = []
+        operation_runs.set_sink(runs.append)
+
+        async def run_one(task_dict):
+            with operation_runs.timed_operation("retain", bank_id):
+                pass
+
+        poller._executor = run_one
+        try:
+            await poller.execute_task(my_claims[0])  # runs in the background
+            for _ in range(100):
+                if runs:
+                    break
+                await asyncio.sleep(0.05)
+        finally:
+            operation_runs.set_sink(None)
+        [run] = runs
+        assert run.task_id == my_claims[0].operation_id and run.queued_at == my_claims[0].queued_at
 
     @pytest.mark.asyncio
     async def test_claim_batch_cannot_see_rows_outside_this_files_schema(self, pool, clean_operations):
@@ -2407,6 +2448,54 @@ class TestTaskReleaseOnStop:
         assert row["worker_id"] == "other-worker"
 
     @pytest.mark.asyncio
+    async def test_shutdown_release_visits_only_schemas_it_claimed_in(self, pool, backend, clean_operations):
+        """With many tenant schemas, shutdown must not walk them all.
+
+        One reclaim per schema across thousands of tenants outlasts a typical
+        termination grace period, so the process is killed before the release
+        (and the rest of the teardown) finishes. The worker can only own rows
+        where it claimed, so those schemas are the only ones it visits.
+        """
+        from hindsight_api.worker import WorkerPoller
+
+        bank_id = f"test-worker-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(pool, bank_id)
+        op_id = await self._insert_pending(pool, bank_id)
+
+        started = asyncio.Event()
+        block = asyncio.Event()
+
+        async def blocking_executor(task_dict):
+            started.set()
+            await block.wait()
+
+        poller = WorkerPoller(backend=backend, worker_id="release-worker", executor=blocking_executor)
+        task = await self._claim_ours(poller, op_id)
+        await poller.execute_task(task)
+        await asyncio.wait_for(started.wait(), timeout=5)
+
+        # From here on the deployment has thousands of tenants.
+        async def many_schemas():
+            return [None] + [f"tenant_{i}" for i in range(5000)]
+
+        poller._get_schemas = many_schemas
+        visited: list[str | None] = []
+        real_reclaim = poller._reclaim_own_processing_tasks
+
+        async def spy_reclaim(schema, **kwargs):
+            visited.append(schema)
+            return await real_reclaim(schema, **kwargs)
+
+        poller._reclaim_own_processing_tasks = spy_reclaim
+
+        await poller.shutdown_graceful(timeout=0.1)
+
+        assert visited == [task.schema], "shutdown must visit only the schemas this worker claimed in"
+        row = await pool.fetchrow("SELECT status, worker_id FROM async_operations WHERE operation_id = $1", op_id)
+        assert row["status"] == "pending", "the claimed row must still be handed back"
+        assert row["worker_id"] is None
+
+    @pytest.mark.asyncio
     async def test_failed_terminal_write_is_retried_until_it_lands(self, pool, backend, clean_operations):
         """A 'failed' write that hits a dropped connection is retried, not abandoned (#3228, #5377)."""
         from hindsight_api.worker import WorkerPoller
@@ -2504,6 +2593,97 @@ class TestTaskReleaseOnStop:
         row = await pool.fetchrow("SELECT status FROM async_operations WHERE operation_id = $1", op_id)
         assert row["status"] == "processing", "finished work must not be marked failed or requeued here"
         assert await poller.recover_own_tasks() == 1
+
+
+class TestTerminalWriteToADroppedSchema:
+    """A task whose schema is dropped while it runs must not take the worker down.
+
+    Deleting a tenant drops its schema, ``async_operations`` included. A task
+    still in flight then fails every terminal write with "relation does not
+    exist", which used to run out ``TERMINAL_WRITE_DEADLINE_S`` and SIGTERM the
+    worker, dropping every other task on it. The row is gone, so there is
+    nothing to mark and nothing for restart recovery to hand back.
+    """
+
+    @staticmethod
+    def _task(schema):
+        from hindsight_api.worker.poller import ClaimedTask
+
+        return ClaimedTask(operation_id=str(uuid.uuid4()), task_dict={}, schema=schema)
+
+    @staticmethod
+    def _poller(backend, exited):
+        from hindsight_api.worker import WorkerPoller
+
+        async def executor(task_dict):
+            return None
+
+        poller = WorkerPoller(backend=backend, worker_id="dropped-schema-worker", executor=executor)
+        poller._exit_process = exited.set
+        return poller
+
+    @pytest.mark.asyncio
+    async def test_a_dropped_schema_drops_the_task_and_keeps_the_worker(self, backend, monkeypatch):
+        import asyncpg
+
+        from hindsight_api.worker import poller as poller_module
+
+        monkeypatch.setattr(poller_module, "TERMINAL_WRITE_DEADLINE_S", 0.0)
+        exited = asyncio.Event()
+        poller = self._poller(backend, exited)
+        gone = f"tenant_gone_{uuid.uuid4().hex[:8]}"
+
+        async def write():
+            raise asyncpg.exceptions.UndefinedTableError(f'relation "{gone}.async_operations" does not exist')
+
+        assert await poller._write_terminal(self._task(gone), "completed", write) is False
+        assert not exited.is_set(), "a dropped schema must not shut the worker down"
+
+    @pytest.mark.asyncio
+    async def test_a_missing_table_elsewhere_still_shuts_down(self, backend, isolated_ops_schema, monkeypatch):
+        """The operations table exists, so the row is still there to be recovered: keep the old path."""
+        import asyncpg
+
+        from hindsight_api.worker import poller as poller_module
+
+        monkeypatch.setattr(poller_module, "TERMINAL_WRITE_DEADLINE_S", 0.0)
+        exited = asyncio.Event()
+        poller = self._poller(backend, exited)
+
+        async def write():
+            raise asyncpg.exceptions.UndefinedTableError('relation "some_other_table" does not exist')
+
+        assert await poller._write_terminal(self._task(isolated_ops_schema), "completed", write) is False
+        assert exited.is_set()
+
+    @pytest.mark.asyncio
+    async def test_an_unreachable_db_still_shuts_down(self, backend, monkeypatch):
+        from hindsight_api.worker import poller as poller_module
+
+        monkeypatch.setattr(poller_module, "TERMINAL_WRITE_DEADLINE_S", 0.0)
+        exited = asyncio.Event()
+        poller = self._poller(backend, exited)
+
+        async def write():
+            raise ConnectionResetError("connection lost")
+
+        assert await poller._write_terminal(self._task(f"tenant_gone_{uuid.uuid4().hex[:8]}"), "failed", write) is False
+        assert exited.is_set()
+
+    def test_missing_relation_is_found_through_wrapping(self):
+        import asyncpg
+
+        from hindsight_api.worker.poller import _is_missing_relation
+
+        try:
+            try:
+                raise asyncpg.exceptions.InvalidSchemaNameError('schema "tenant_x" does not exist')
+            except Exception as inner:
+                raise RuntimeError("mark failed") from inner
+        except RuntimeError as outer:
+            assert _is_missing_relation(outer)
+        assert _is_missing_relation(Exception("ORA-00942: table or view does not exist"))
+        assert not _is_missing_relation(ConnectionResetError("connection lost"))
 
 
 class TestConcurrentWorkers:
@@ -5613,7 +5793,7 @@ class TestTerminalOperationRetention:
     @pytest.mark.asyncio
     async def test_oracle_backend_resets_default_schema_on_pooled_connection(self):
         from hindsight_api.engine.db.oracle import OracleBackend
-        from hindsight_api.engine.memory_engine import _current_schema
+        from hindsight_api.schema_context import _current_schema
 
         backend = OracleBackend()
         backend._default_schema = "APP_USER"
@@ -5641,7 +5821,7 @@ class TestTerminalOperationRetention:
     @pytest.mark.asyncio
     async def test_oracle_backend_discovers_session_user_before_first_schema_switch(self):
         from hindsight_api.engine.db.oracle import OracleBackend
-        from hindsight_api.engine.memory_engine import _current_schema
+        from hindsight_api.schema_context import _current_schema
 
         backend = OracleBackend()
         cursor = MagicMock()
@@ -5772,3 +5952,79 @@ class TestCancelledStatusIsFinal:
 
         row = await pool.fetchrow("SELECT status FROM async_operations WHERE operation_id = $1", op_id)
         assert row["status"] == "cancelled", "a cancelled operation must not be resurrected by the failure path"
+
+    @pytest.mark.asyncio
+    async def test_task_that_cancels_itself_and_defers_ends_cancelled_and_uncounted(
+        self, pool, backend, clean_operations
+    ):
+        """A hook that decides its operation should not run (using
+        RequestContext.operation_id) can cancel it and raise DeferOperation: the
+        guarded deferral leaves the row cancelled, and since a deferral is not a
+        terminal outcome no completion is recorded, success or failure.
+        """
+        from hindsight_api.worker import WorkerPoller
+        from hindsight_api.worker.exceptions import DeferOperation
+        from hindsight_api.worker.poller import ClaimedTask
+
+        bank_id = f"test-worker-{uuid.uuid4().hex[:8]}"
+        op_id = uuid.uuid4()
+        payload = json.dumps({"type": "batch_retain", "operation_id": str(op_id), "bank_id": bank_id})
+        await _ensure_bank(pool, bank_id)
+        await pool.execute(
+            """
+            INSERT INTO async_operations (operation_id, bank_id, operation_type, status, task_payload, worker_id)
+            VALUES ($1, $2, 'retain', 'processing', $3::jsonb, 'test-worker-1')
+            """,
+            op_id,
+            bank_id,
+            payload,
+        )
+
+        async def cancel_then_defer(task_dict):
+            await pool.execute(
+                "UPDATE async_operations SET status = 'cancelled', error_message = 'not run', updated_at = now() "
+                "WHERE operation_id = $1",
+                op_id,
+            )
+            raise DeferOperation(exec_date=datetime.now(UTC), reason="not run")
+
+        poller = WorkerPoller(backend=backend, worker_id="test-worker-1", executor=cancel_then_defer)
+        collector = MagicMock()
+        with patch("hindsight_api.worker.poller.get_metrics_collector", return_value=collector):
+            await poller._execute_task_inner(
+                ClaimedTask(operation_id=str(op_id), task_dict=json.loads(payload), schema=None)
+            )
+
+        row = await pool.fetchrow("SELECT status, error_message FROM async_operations WHERE operation_id = $1", op_id)
+        assert row["status"] == "cancelled"
+        assert row["error_message"] == "not run"
+        collector.record_operation_result.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_finished_task_wakes_the_idle_poll_at_once():
+    """A slot freed mid-wait is refilled now, not after the rest of the poll interval (#5650)."""
+    from hindsight_api.worker import WorkerPoller
+
+    poller = WorkerPoller(backend=MagicMock(), worker_id="w-wake", executor=AsyncMock(), poll_interval_ms=60_000)
+    poller.claim_batch = AsyncMock(return_value=[])
+    poller._log_progress_if_due = AsyncMock()
+    poller._active_tasks["op-1"] = MagicMock()
+    poller._in_flight_count = 1
+    poller._in_flight_by_type["retain"] = 1
+
+    async def claims_reach(n: int) -> None:
+        while poller.claim_batch.await_count < n:
+            await asyncio.sleep(0.01)
+
+    polling = asyncio.create_task(poller._poll_loop())
+    await asyncio.wait_for(claims_reach(1), timeout=5)
+    await asyncio.sleep(0.05)
+    assert poller.claim_batch.await_count == 1  # idle: nothing wakes it before the 60 s interval
+
+    await poller._cleanup_task("op-1", "retain")
+    # Well under the 60 s interval, so only the wake can produce the second claim.
+    await asyncio.wait_for(claims_reach(2), timeout=5)
+
+    poller._shutdown.set()
+    await asyncio.wait_for(polling, timeout=1)
